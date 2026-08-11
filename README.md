@@ -513,6 +513,7 @@ For detailed installation instructions for different GPU generations:
 
 - **[Changelog](docs/CHANGELOG.md)** - Latest updates and version history
 - **[Troubleshooting](docs/TROUBLESHOOTING.md)** - Common issues and solutions
+- **[Testing](docs/TESTING.md)** - Running the test suite and adding new tests
 
 ## 📚 Video Guides
 - Nice Video that explain how to use Vace:\
