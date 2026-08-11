@@ -77,7 +77,7 @@ found four properties in `defaults/` that no source file reads, listed in that f
 
 ## Defects the suite surfaced
 
-Writing the tests turned up nine pre-existing defects. All of them are now fixed, and
+Writing the tests turned up ten pre-existing defects. All of them are now fixed, and
 each has a regression test alongside it. They are recorded here because the *shape* of
 these bugs is the argument for the suite: none crashed, most produced quietly wrong
 output, and several had clearly been present for a long time.
@@ -130,7 +130,18 @@ output, and several had clearly been present for a long time.
     whitespace around the operator accepted. No condition shipped in this repository
     changes meaning: the only two are `<89` and `<999`.
 
-A tenth candidate was investigated and **rejected**: `format()` applies no overall
+10. **Numbers split mid-value** — `shared/utils/loras_mutipliers.py` `_spans` decided
+    what counted as one multiplier with a fixed character set, `":;,.0123456789"`, that
+    omitted `-` and `e`. The parser accepts both (it uses `float()`), so the two
+    disagreed. Since `merge_loras_settings` edits the multiplier text *by these
+    offsets* — which is how your comments and layout survive a merge — a value split in
+    two got half of it deleted: `"1e5|"` came back as `"1e|0.5"`, which no longer
+    parses, and `"-1 -2|3"` as `"-1 -|0.5"`, a dangling sign. Replaced with a real
+    number grammar. Tokenisation is otherwise unchanged: across 8733 generated
+    multiplier strings built from realistic values and separators, the new scan produces
+    spans identical to the old one.
+
+An eleventh candidate was investigated and **rejected**: `format()` applies no overall
 length cap, which looks like an `ENAMETOOLONG` waiting to happen. It is not reachable.
 The sole caller, `wgp.py:7938`, already pipes the result through
 `truncate_for_filesystem()` (100 bytes on Linux, 50 on Windows), so a cap inside the

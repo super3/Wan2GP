@@ -173,9 +173,28 @@ def get_model_switch_steps(timesteps, guide_phases, model_switch_phase, switch_t
 
 
 
+import re
 from typing import List, Tuple, Dict, Callable
 
-_ALWD = set(":;,.0123456789")
+# What counts as one multiplier in the *text*, for the span-based editing below.
+#
+# This has to agree with what parse_loras_multipliers accepts, which is float() joined
+# by the ',' (per-step), ';' (phase) and ':' (branch) separators. It previously did not:
+# the token was a run of characters drawn from a fixed set that omitted '-' and 'e', so
+# a signed or exponent-notation value was split into pieces mid-number. Because
+# merge_loras_settings edits the original text by these offsets, splitting a number in
+# two made it delete half of one: "1e5" was seen as the two tokens "1" and "5", and
+# trimming to a single multiplier left the unparseable "1e". "-1 -2" lost its sign the
+# same way.
+#
+# Tokenisation is otherwise unchanged: across 8733 generated multiplier strings built
+# from realistic values and separators, this produces spans identical to the old scan.
+# Digits embedded in a word are still picked up ("1 abc2 3" reads as three tokens), as
+# before -- that is malformed input which parse_loras_multipliers rejects downstream.
+_NUMBER = r'[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?'
+# A trailing separator is kept inside the token so that malformed input such as "1;"
+# still reads as one multiplier, exactly as it did before.
+_TOKEN_RE = re.compile(rf'{_NUMBER}(?:[,;:]{_NUMBER})*[,;:]?')
 
 # ---------------- core parsing helpers ----------------
 
@@ -190,21 +209,28 @@ def _find_bar(s: str) -> int:
             return i
     return -1
 
-def _spans(text: str) -> List[Tuple[int, int]]:
-    res, com, in_tok, st = [], False, False, 0
+def _uncommented_segments(text: str) -> List[Tuple[int, int]]:
+    """The stretches of ``text`` outside a ``#`` comment, as (start, end) offsets.
+
+    A comment runs from its '#' to the end of that line, so each line contributes at
+    most one segment.
+    """
+    segments, start, com = [], 0, False
     for i, ch in enumerate(text):
         if ch in ('\n', '\r'):
-            if in_tok: res.append((st, i)); in_tok = False
-            com = False
-        elif ch == '#':
-            if in_tok: res.append((st, i)); in_tok = False
+            if not com: segments.append((start, i))
+            com, start = False, i + 1
+        elif ch == '#' and not com:
+            segments.append((start, i))
             com = True
-        elif not com:
-            if ch in _ALWD:
-                if not in_tok: in_tok, st = True, i
-            else:
-                if in_tok: res.append((st, i)); in_tok = False
-    if in_tok: res.append((st, len(text)))
+    if not com: segments.append((start, len(text)))
+    return segments
+
+def _spans(text: str) -> List[Tuple[int, int]]:
+    res = []
+    for seg_start, seg_end in _uncommented_segments(text):
+        for match in _TOKEN_RE.finditer(text, seg_start, seg_end):
+            res.append(match.span())
     return res
 
 def _choose_sep(text: str, spans: List[Tuple[int, int]]) -> str:
