@@ -16,6 +16,9 @@ Covered here:
 
 Two tests deliberately pin behaviour that looks wrong; each one carries a
 comment saying so.
+
+Everything here is pure stdlib: no torch, numpy or gradio, no clock, network or
+cwd dependence, and the only files touched live under ``tmp_path``.
 """
 
 import hashlib
@@ -223,6 +226,20 @@ class TestMapKey:
         # already canonical under a namespace is returned verbatim.
         key = namespace + "blocks.0.q_proj.alpha"
         assert mapper.map_key(key) == key
+
+    def test_a_target_that_itself_starts_with_a_namespace_is_matched_whole(self):
+        # The exact-module-name check runs *before* the namespace is stripped.
+        # Here the target literally is "transformer.blocks.0.q_proj" while a
+        # second target makes the inner path "blocks.0.q_proj" an alias of
+        # "blocks.0.to_q"; matching the whole name first is what stops the key
+        # being rewritten to "transformer.blocks.0.to_q.alpha".
+        built = LoraKeyMapper(["transformer.blocks.0.q_proj", "blocks.0.to_q"])
+        assert built.aliases["blocks.0.q_proj"] == "blocks.0.to_q"
+        assert built.map_key("transformer.blocks.0.q_proj.alpha") == (
+            "transformer.blocks.0.q_proj.alpha"
+        )
+        # Without the namespace the same inner path *is* rewritten.
+        assert built.map_key("blocks.0.q_proj.alpha") == "blocks.0.to_q.alpha"
 
     def test_unknown_namespace_is_not_stripped(self, mapper):
         assert mapper.map_key("model.blocks.0.to_q.alpha") == "model.blocks.0.to_q.alpha"
@@ -476,14 +493,20 @@ class TestComputeSha256:
         path.write_bytes(b"")
         assert sha256_verify.compute_sha256(path) == hashlib.sha256(b"").hexdigest()
 
-    def test_zero_chunk_size_silently_hashes_nothing(self, sample_file):
+    def test_zero_chunk_size_silently_hashes_nothing(self, sample_file, capsys):
         # BUG (pinned, not fixed): ``f.read(0)`` returns b"" immediately, so the
         # walrus loop never runs and the digest of the *empty* string is
-        # returned for any file content.
+        # returned for any file content. Worse, feeding that digest back in as
+        # expected_hash makes the integrity check *pass* -- a silent false
+        # positive. A `if chunk_size <= 0: raise ValueError(...)` guard would
+        # fix it; when it lands, this test should flip to pytest.raises.
         path, _payload, digest = sample_file
+        empty_digest = hashlib.sha256(b"").hexdigest()
         result = sha256_verify.compute_sha256(path, chunk_size=0)
-        assert result == hashlib.sha256(b"").hexdigest()
+        assert result == empty_digest
         assert result != digest
+        assert sha256_verify.compute_sha256(path, empty_digest, chunk_size=0) == empty_digest
+        assert "verified successfully" in capsys.readouterr().out
 
     def test_no_output_when_no_expected_hash_is_given(self, sample_file, capsys):
         path, _payload, _digest = sample_file
@@ -522,6 +545,9 @@ class TestComputeSha256:
             sha256_verify.compute_sha256(missing)
 
     def test_missing_file_is_checked_before_the_expected_hash(self, tmp_path):
+        # The match= matters: without the explicit exists() guard, open() would
+        # raise its own FileNotFoundError ("No such file or directory") and a
+        # bare pytest.raises would not notice the guard had gone.
         missing = tmp_path / "nope.safetensors"
-        with pytest.raises(FileNotFoundError):
+        with pytest.raises(FileNotFoundError, match="File not found"):
             sha256_verify.compute_sha256(missing, "0" * 64)
