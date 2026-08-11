@@ -19,9 +19,8 @@ from __future__ import annotations
 
 import pytest
 
-from conftest import import_pure_module
 
-fs = import_pure_module("shared.utils.frame_scheduler")
+import shared.utils.frame_scheduler as fs
 
 
 # A realistic Wan-style grid: windows of 81 frames on a 4n+1 latent grid.

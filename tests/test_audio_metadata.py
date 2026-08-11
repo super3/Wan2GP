@@ -41,9 +41,8 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from conftest import import_pure_module
 
-am = import_pure_module("shared.utils.audio_metadata")
+import shared.utils.audio_metadata as am
 
 
 # --------------------------------------------------------------------------- #

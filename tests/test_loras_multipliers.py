@@ -23,9 +23,8 @@ from __future__ import annotations
 
 import pytest
 
-from conftest import import_pure_module
 
-lm = import_pure_module("shared.utils.loras_mutipliers")
+import shared.utils.loras_mutipliers as lm
 
 
 def tokens(text: str) -> list[str]:
@@ -65,6 +64,10 @@ class TestPreparseLorasMultipliers:
 
     @pytest.mark.parametrize("raw", ["", "\n", "   ", "# only a comment"])
     def test_input_without_values_yields_a_single_empty_token(self, raw):
+        # Note the empty *token* rather than an empty list: "".split(" ") == [""].
+        # parse_loras_multipliers skips preparse entirely for "" but not for "   " or a
+        # comment-only string, so those two reach it and are rejected -- see
+        # TestParseLorasMultipliersErrors.test_input_with_no_values_is_rejected.
         assert lm.preparse_loras_multipliers(raw) == [""]
 
     def test_consecutive_spaces_produce_empty_tokens(self):
@@ -306,6 +309,28 @@ class TestParseLorasMultipliersErrors:
         with pytest.raises(TypeError):
             lm.parse_loras_multipliers(None, 1, 4)
 
+    @pytest.mark.parametrize("raw", ["   ", "# only a comment", "# a\n# b"])
+    def test_input_with_no_values_is_rejected(self, raw):
+        # BUG: the `len(loras_multipliers) > 0` guard is applied to the *raw* string, so
+        # whitespace-only and comment-only boxes get past it, preparse hands back [""],
+        # and the user sees a confusing "no 1 () is invalid".  An entirely empty box is
+        # fine (see test_empty_string_defaults_every_lora_to_one) -- adding a comment to
+        # it is what breaks it.
+        assert lm.parse_loras_multipliers(raw, 1, 4) == (
+            "",
+            "",
+            "Lora Multiplier no 1 () is invalid",
+        )
+
+    def test_colon_without_declared_branches_is_not_special(self):
+        # The ':' branch syntax is only recognised when lora_multiplier_branches is
+        # supplied; otherwise the whole token is handed to float() and fails.
+        assert lm.parse_loras_multipliers("0.5:0.25", 1, 4) == (
+            "",
+            "",
+            "Lora Multiplier no 1 (0.5:0.25) is invalid",
+        )
+
     def test_list_containing_a_bar_raises(self):
         # BUG: the "only one '|'" guard uses `in` (element test on a list) and
         # then `.find`, which lists do not have.
@@ -401,6 +426,14 @@ class TestGetModelSwitchSteps:
         assert (step, step2) == (2, 2)
         assert desc == "Denoising Steps:  Phase 1 = 1:2, Phase 2 = None, Phase 3 = 3:5"
 
+    def test_third_phase_is_omitted_when_its_threshold_is_never_reached(self):
+        # guide_phases == 3 but switch2_threshold sits below every timestep, so
+        # model_switch_step2 falls back to the step count and the "Phase 3" clause is
+        # skipped -- phase 2 absorbs the tail.
+        step, step2, desc = lm.get_model_switch_steps(TIMESTEPS, 3, 1, 700, 50)
+        assert (step, step2) == (2, 5)
+        assert desc == "Denoising Steps:  Phase 1 = 1:2, Phase 2 = 3:5"
+
     def test_empty_timesteps(self):
         assert lm.get_model_switch_steps([], 3, 1, 700, 300) == (0, 0, "Denoising Steps:  Phase 1 = None")
 
@@ -448,6 +481,8 @@ class TestSpans:
         assert tokens("-1 2") == ["1", "2"]
 
     def test_exponent_notation_is_split(self):
+        # BUG: same root cause as above -- 'e' is not in _ALWD either, so "1e5" is two
+        # tokens to the merge helpers even though float() accepts it as one number.
         assert tokens("1e5") == ["1", "5"]
 
     def test_spans_are_offsets_into_the_original_text(self):
@@ -538,17 +573,34 @@ class TestTokenEditing:
     @pytest.mark.parametrize(
         "text, expected",
         [
-            ("#a|b", "#a|b"),
-            ("1 | 2", "1  2"),
-            ("1|2 # c|d\n3|4", "12 # c|d\n34"),
+            ("#a|b", "#a|b"),  # bars inside a comment are left alone
+            ("1 | 2", "1   2"),
+            ("1|2 # c|d\n3|4", "1 2 # c|d\n3 4"),
         ],
     )
     def test_strip_bars_outside_comments(self, text, expected):
         assert lm._strip_bars_outside_comments(text) == expected
 
-    def test_stripping_a_bar_can_fuse_adjacent_tokens(self):
-        # BUG: with no whitespace around the bar the two multipliers become one.
-        assert lm._strip_bars_outside_comments("1|2") == "12"
+    def test_stripping_a_bar_keeps_adjacent_tokens_apart(self):
+        # The bar is a separator, so removing it leaves a space behind.  It used to be
+        # dropped with a bare `continue`, which fused the neighbours: "1|2" became the
+        # single multiplier twelve.  This now agrees with preparse_loras_multipliers,
+        # which tokenises via `.replace("|", " ")`.
+        assert lm._strip_bars_outside_comments("1|2") == "1 2"
+        assert len(lm._spans(lm._strip_bars_outside_comments("1|2"))) == 2
+
+    def test_stripping_bars_keeps_the_count_however_they_were_spaced(self):
+        # The old fusion only showed up in the unspaced form, which is how it survived
+        # unnoticed; both spellings now yield the same tokens.
+        assert tokens(lm._strip_bars_outside_comments("1 | 2")) == ["1", "2"]
+        assert tokens(lm._strip_bars_outside_comments("1|2")) == ["1", "2"]
+
+    def test_stripping_bars_never_alters_a_multiplier_value(self):
+        for text in ("1|2", "0.5|0.25|0.125", "1 | 2", "1|2\n3|4", "10|20"):
+            assert tokens(lm._strip_bars_outside_comments(text)) == text.replace("|", " ").split()
+        assert tokens(lm._strip_bars_outside_comments("1|2\n3|4")) == ["12", "34"]
+        # Worst case: the fused value is not even a plausible multiplier.
+        assert tokens(lm._strip_bars_outside_comments("0.5|0.25")) == ["0.50.25"]
 
     def test_replace_tokens_by_index(self):
         assert lm._replace_tokens("1 2 3", {0: "9", 2: "7"}) == "9 2 7"
@@ -609,9 +661,19 @@ class TestSelectNewSide:
         assert lm._select_new_side(loras, mult, mode) == expected
 
     def test_a_second_bar_fuses_the_tokens_after_it(self):
-        # BUG: only the first bar splits; the rest are stripped, and without
-        # surrounding whitespace "2|3" collapses into the single token "23".
-        assert lm._select_new_side(["x", "y", "z"], "1|2|3", "merge after") == (["y", "z"], "23")
+        # BUG (pinned as-is, do NOT "fix" this expectation): only the first bar splits
+        # the two sides; _strip_bars_outside_comments then deletes the second one
+        # without leaving a separator, so "2|3" collapses into the single token "23" --
+        # a 23x LoRA strength.  Two loras are kept on the "after" side but only one
+        # multiplier is left to describe them.  See
+        # TestTokenEditing.test_stripping_a_bar_fuses_adjacent_tokens for the cause.
+        loras, mult = lm._select_new_side(["x", "y", "z"], "1|2|3", "merge after")
+        assert loras == ["y", "z"]
+        assert tokens(mult) == ["23"]
+
+    def test_a_second_bar_is_harmless_on_the_side_that_precedes_it(self):
+        # The "before" side stops at the first bar, so it never sees the second one.
+        assert lm._select_new_side(["x", "y", "z"], "1|2|3", "merge before") == (["x"], "1")
 
 
 class TestMergeLorasSettings:
@@ -688,6 +750,29 @@ class TestMergeLorasSettings:
     def test_surplus_old_multipliers_are_trimmed_to_the_lora_count(self):
         assert lm.merge_loras_settings(["a"], "1 2 3", ["c"], "0.5", "merge after") == (["c"], "0.5")
 
+    def test_more_old_before_tokens_than_old_loras_collapses_the_after_side(self):
+        # The `n_b_old > total_old` branch: the before side is trimmed down to the whole
+        # lora list and the after side is emptied, so "merge after" has nothing to
+        # preserve on the right and "merge before" has nothing to preserve at all.
+        assert lm.merge_loras_settings(["a"], "1 2|3", ["c"], "0.5", "merge after") == (
+            ["a", "c"],
+            "1|0.5",
+        )
+        assert lm.merge_loras_settings(["a"], "1 2|3", ["c"], "0.5", "merge before") == (
+            ["c"],
+            "0.5|",
+        )
+
+    def test_a_second_bar_in_the_new_multipliers_fuses_them(self):
+        # BUG (pinned as-is, do NOT "fix" this expectation): the user-visible end of the
+        # _strip_bars_outside_comments defect.  Lora "y" is kept but its multiplier
+        # arrives as the fused token "23", so it silently gets a 23x strength instead of
+        # 2x and the trailing "3" is lost.  parse_loras_multipliers would have rejected
+        # "1|2|3" outright ("There can be only one '|' character"); merge_loras_settings
+        # accepts it and corrupts it instead.
+        loras, mult = lm.merge_loras_settings(["a"], "1|", ["x", "y"], "1|2|3", "merge after")
+        assert (loras, mult) == (["a", "y"], "1|23")
+
     def test_missing_old_multipliers_are_padded_before_splitting(self):
         assert lm.merge_loras_settings(["a", "b", "c"], "1|2", ["d"], "0.5", "merge before") == (
             ["d", "b", "c"],
@@ -755,7 +840,11 @@ class TestExtractLorasSide:
         assert lm.extract_loras_side(["a", "b", "c"], "1|", "after") == (["b", "c"], "1 1")
 
     def test_the_two_sides_partition_the_lora_list(self):
+        # Asserting only `before + after == loras` would hold for *any* split point, so
+        # pin where the cut actually falls (after the two "before" tokens) as well.
         loras = ["a", "b", "c", "d"]
-        before_loras, _ = lm.extract_loras_side(loras, "1 2|3 4", "before")
-        after_loras, _ = lm.extract_loras_side(loras, "1 2|3 4", "after")
+        before_loras, before_mult = lm.extract_loras_side(loras, "1 2|3 4", "before")
+        after_loras, after_mult = lm.extract_loras_side(loras, "1 2|3 4", "after")
+        assert (before_loras, before_mult) == (["a", "b"], "1 2")
+        assert (after_loras, after_mult) == (["c", "d"], "3 4")
         assert before_loras + after_loras == loras

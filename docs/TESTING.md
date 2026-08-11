@@ -51,8 +51,9 @@ This is where user-visible bugs are both most likely and cheapest to catch.
 | `tests/test_lora_mapper.py` | `shared/lora_mapper.py`, `shared/utils/gguf_mapping.py`, `shared/tools/sha256_verify.py` | Key remapping between checkpoint formats; checksum verification |
 | `tests/test_audio_metadata.py` | `shared/utils/audio_metadata.py` | Binary metadata chunk round-tripping, truncated and non-audio files |
 | `tests/test_model_configs.py` | `defaults/*.json`, `plugins.json`, `setup_config.json` | Every bundled model definition parses and has the shape the loader expects |
+| `tests/test_package_imports.py` | `shared/utils/__init__.py` and the pure modules | The pure logic stays importable without torch, so the suite keeps working |
 
-The suite is 1453 tests and runs in under two seconds.
+The suite is 1499 tests and runs in about two seconds.
 
 `tests/test_model_configs.py` is worth calling out: with ~212 model definitions in
 `defaults/`, a single typo breaks model discovery at startup for everyone. It is a
@@ -64,18 +65,9 @@ the UI. The valid set is recovered by parsing each module in `wgp.py`'s
 
 ## Behaviour these tests pin, that may be worth fixing
 
-Writing the suite surfaced a number of pre-existing defects. **None of them are fixed
-here** — this is a test-only change, so each is pinned as current behaviour with a
-comment, and the tests are green. They are listed so a maintainer can decide.
-
-The one that looks most serious:
-
-- `shared/utils/loras_mutipliers.py:254` `_strip_bars_outside_comments` removes phase
-  bars without inserting a separator, so adjacent multipliers fuse. Reached from
-  `merge_loras_settings`, `_select_new_side(["x","y","z"], "1|2|3", ...)` yields the
-  multiplier string `"23"` rather than `"2 3"` — silently applying a strength of 23.
-
-Others worth a look:
+Writing the suite surfaced a number of pre-existing defects. The most serious one has
+since been fixed (see below); the rest are pinned as current behaviour with a comment
+explaining them, so the suite stays green. They are listed so a maintainer can decide.
 
 - `shared/tools/sha256_verify.py:44` a `chunk_size` of 0 makes `f.read(0)` return
   immediately, so `compute_sha256` returns the hash of the empty string for *any* file.
@@ -96,27 +88,38 @@ Others worth a look:
 - `shared/match_archi.py:33` `eval_condition` uses `re.match` rather than `fullmatch`, so
   `">=89garbage"` parses as `">=89"` while `">= 89"` fails.
 
-## The `import_pure_module` helper
+### Fixed
 
-Several stdlib-only modules live inside packages whose `__init__` eagerly imports the
-heavy stack. `shared/utils/__init__.py`, for example, imports `fm_solvers`, which
-imports `torch` and `diffusers`. A plain `import shared.utils.prompt_parser` therefore
-fails even though `prompt_parser.py` itself only needs `re`.
+- `shared/utils/loras_mutipliers.py` `_strip_bars_outside_comments` removed phase bars
+  without leaving a separator behind, so adjacent multipliers fused. Reached through
+  `merge_loras_settings`, `_select_new_side(["x","y","z"], "1|2|3", "merge after")`
+  returned the multiplier string `"23"` — a single LoRA strength of twenty-three — where
+  `"2 3"` was meant. The bar is now replaced by a space, matching what
+  `preparse_loras_multipliers` already does when it tokenises.
 
-`tests/conftest.py` provides:
+## Keeping the pure modules importable
 
-```python
-from conftest import import_pure_module
+Every test uses a plain `import`. That is only possible because the packages holding
+this logic stay light at import time.
 
-prompt_parser = import_pure_module("shared.utils.prompt_parser")
-```
+`shared/utils/__init__.py` used to re-export the scheduler classes from `fm_solvers`
+eagerly, which imports `torch` and `diffusers`. That made `import
+shared.utils.prompt_parser` fail even though `prompt_parser.py` needs nothing but `re`,
+and it charged every CLI entry point the cost of loading torch just to reach a string
+helper. Nothing in the application actually imported those names from the package —
+every caller reaches for `shared.utils.fm_solvers` directly — so the cost bought
+nothing.
 
-It registers a lightweight stand-in for the parent package in `sys.modules` before
-importing the submodule, so the submodule loads normally (relative imports included)
-while the expensive `__init__` never runs.
+The package now re-exports them lazily via PEP 562 `__getattr__`, so the heavy import
+happens on first attribute access rather than at package import. The public names are
+unchanged and still show up in `__all__` and `dir()`.
 
-Modules that already import cleanly — `shared.resolutions`, `shared.lora_mapper`,
-`shared.match_archi`, `shared.tools.sha256_verify` — should just use a plain `import`.
+`tests/test_package_imports.py` guards this. It imports each pure module in a
+subprocess with `torch`, `diffusers`, `numpy`, `gradio` and `transformers` poisoned at
+the meta-path, so a reintroduced top-level import fails loudly instead of passing
+quietly on a developer machine that happens to have torch installed.
+
+If you add a module to the suite, add it to `PURE_MODULES` there too.
 
 ## Continuous integration
 
@@ -139,8 +142,9 @@ The whole workflow completes in well under a minute.
 ## Adding a test
 
 1. Check the module is importable without the heavy stack:
-   `python -c "import shared.your_module"`, or via `import_pure_module` if it lives
-   under `shared/utils/`.
+   `python -c "import shared.your_module"`. If it needs a heavy package `__init__`
+   to be made lazy first, do that rather than working around it, and add the module to
+   `PURE_MODULES` in `tests/test_package_imports.py`.
 2. Add `tests/test_<module>.py`. Plain `pytest` functions; `class Test<Area>:` for
    grouping; `@pytest.mark.parametrize` for table-driven cases.
 3. Assert **actual current behaviour**, derived from reading the source. If you find a
@@ -169,7 +173,7 @@ not gate every PR — the CPU wheel is a few hundred megabytes.
 frames from the smallest available model, on a schedule rather than per-PR, would catch
 the integration breakage that unit tests structurally cannot.
 
-**Refactor opportunity.** Making `shared/utils/__init__.py` import lazily would remove
-the need for `import_pure_module` and would also speed up every CLI entry point that
-currently pays for `torch` + `diffusers` just to reach a string helper. That is a source
-change rather than a test change, so it is deliberately out of scope here.
+**Other eager package `__init__` files.** `shared/utils` was the worst offender and is
+now lazy, but the same pattern may be hiding elsewhere. Any package whose `__init__`
+imports the runtime stack keeps otherwise-pure modules out of reach; making it lazy is
+usually a few lines and pays for itself in start-up time.

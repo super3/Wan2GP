@@ -22,9 +22,8 @@ a comment saying so.  See the accompanying report for the details.
 
 import pytest
 
-from conftest import import_pure_module
 
-prompt_parser = import_pure_module("shared.utils.prompt_parser")
+import shared.utils.prompt_parser as prompt_parser
 
 PREFIX = prompt_parser.PROMPT_UNIT_PREFIX
 ENHANCED = prompt_parser.ENHANCED_PROMPT_PREFIX
@@ -108,6 +107,10 @@ class TestGetMultiPromptsGenChoices:
         choices = prompt_parser.get_multi_prompts_gen_choices(include_sliding_window=False)
         assert [code for _, code in choices] == ["G", "PG", "FG"]
 
+    def test_the_default_medium_is_video(self):
+        labels = [label for label, _ in prompt_parser.get_multi_prompts_gen_choices()]
+        assert labels[0] == "Each New Line Will Add a new Video Request to the Generation Queue"
+
     def test_medium_is_interpolated_into_the_queue_labels(self):
         labels = [label for label, _ in prompt_parser.get_multi_prompts_gen_choices(medium="Image")]
         assert labels[0] == "Each New Line Will Add a new Image Request to the Generation Queue"
@@ -158,10 +161,17 @@ class TestSplitPromptUnits:
         assert prompt_parser.split_prompt_units("a\n\nb", "pg") == ["a", "b"]
         assert prompt_parser.split_prompt_units("a\nb", "fg") == ["a", "b"]
 
-    @pytest.mark.parametrize("mode", ["G", "PG", "FG"])
-    def test_crlf_and_lone_cr_are_normalized(self, mode):
-        crlf = prompt_parser.split_prompt_units("a\r\nb\rc", mode)
-        assert crlf == prompt_parser.split_prompt_units("a\nb\nc", mode)
+    @pytest.mark.parametrize(
+        "mode, expected",
+        [("G", ["a", "b", "c"]), ("PG", ["a\nb\nc"]), ("FG", ["a\nb\nc"])],
+    )
+    def test_crlf_and_lone_cr_are_normalized(self, mode, expected):
+        # Anchored on a literal first: asserting only that the CRLF and the LF
+        # spelling agree would also hold if the splitter returned [] for both.
+        assert prompt_parser.split_prompt_units("a\r\nb\rc", mode) == expected
+        assert prompt_parser.split_prompt_units("a\r\nb\rc", mode) == (
+            prompt_parser.split_prompt_units("a\nb\nc", mode)
+        )
 
     def test_comment_lines_are_dropped(self):
         text = "# leading note\n  #  indented note\nkeep me\n#\nalso keep"
@@ -217,16 +227,18 @@ class TestSerializePromptUnits:
         # discarded instead of being joined back together.
         assert prompt_parser.serialize_prompt_units("", ["a", "b"], "FG") == "a"
 
-    @pytest.mark.parametrize("prompt_text", ["", "unrelated", ENHANCED + "x\r\ny", None])
+    @pytest.mark.parametrize("prompt_text", ["", "unrelated", ENHANCED + "x\r\ny"])
     def test_prompt_text_argument_is_ignored(self, prompt_text):
-        # BUG (pinned): `prompt_text` is normalized then never used, so even
-        # None -- which would crash a real use -- has no effect... except that
-        # None.replace() does raise, so guard the None case separately.
-        if prompt_text is None:
-            with pytest.raises(AttributeError):
-                prompt_parser.serialize_prompt_units(prompt_text, ["a"], "G")
-        else:
-            assert prompt_parser.serialize_prompt_units(prompt_text, ["a"], "G") == "a"
+        # BUG (pinned): `prompt_text` is normalized (CRLF, "!enhanced!", strip)
+        # and then never read again -- the result depends only on `prompts` and
+        # the mode -- so every value here produces the same output.
+        assert prompt_parser.serialize_prompt_units(prompt_text, ["a"], "G") == "a"
+
+    def test_none_prompt_text_still_raises_even_though_it_is_unused(self):
+        # The unused argument is normalized before it is discarded, so None
+        # crashes rather than being quietly ignored like every other value.
+        with pytest.raises(AttributeError):
+            prompt_parser.serialize_prompt_units(None, ["a"], "G")
 
     def test_none_mode_raises_unlike_the_splitter(self):
         # BUG (pinned): split_prompt_units() guards with `or ""` but this one
@@ -235,23 +247,46 @@ class TestSerializePromptUnits:
         with pytest.raises(TypeError):
             prompt_parser.serialize_prompt_units("", ["a"], None)
 
-    @pytest.mark.parametrize("mode", ["G", "PG", "W", "PW"])
-    def test_round_trip_split_then_serialize(self, mode):
+    @pytest.mark.parametrize(
+        "mode, expected_units, expected_text",
+        [
+            ("G", ["first prompt", "second prompt"], "first prompt\nsecond prompt"),
+            ("W", ["first prompt", "second prompt"], "first prompt\nsecond prompt"),
+            ("PG", ["first prompt", "second prompt"], "first prompt\n\nsecond prompt"),
+            ("PW", ["first prompt", "second prompt"], "first prompt\n\nsecond prompt"),
+        ],
+    )
+    def test_round_trip_split_then_serialize(self, mode, expected_units, expected_text):
+        # Both intermediate values are pinned to literals: a bare
+        # split(serialize(split(x))) == split(x) round trip would also pass if
+        # the splitter always returned [] and the serializer always returned "".
         text = "first prompt\n\nsecond prompt"
         units = prompt_parser.split_prompt_units(text, mode)
-        again = prompt_parser.split_prompt_units(
-            prompt_parser.serialize_prompt_units("", units, mode), mode
-        )
-        assert again == units
+        assert units == expected_units
+        serialized = prompt_parser.serialize_prompt_units("", units, mode)
+        assert serialized == expected_text
+        assert prompt_parser.split_prompt_units(serialized, mode) == units
 
 
 class TestSplitPromptOriginalUnits:
-    def test_without_markers_it_matches_the_visible_split(self):
+    @pytest.mark.parametrize(
+        "mode, expected",
+        [
+            ("G", ["a", "b"]),
+            ("W", ["a", "b"]),
+            ("PG", ["a", "b"]),
+            ("PW", ["a", "b"]),
+            ("FG", ["a\n\nb"]),
+        ],
+    )
+    def test_without_markers_it_matches_the_visible_split(self, mode, expected):
+        # The literal comes first so this cannot degenerate into "both
+        # functions are equally broken".
         text = "a\n\n# note\nb"
-        for mode in ("G", "W", "PG", "PW", "FG"):
-            assert prompt_parser.split_prompt_original_units(text, mode) == (
-                prompt_parser.split_prompt_units(text, mode)
-            )
+        assert prompt_parser.split_prompt_original_units(text, mode) == expected
+        assert prompt_parser.split_prompt_original_units(text, mode) == (
+            prompt_parser.split_prompt_units(text, mode)
+        )
 
     def test_line_mode_marker_replaces_the_following_line(self):
         text = f"{PREFIX} original one\nenhanced one\n{PREFIX} original two\nenhanced two"
@@ -318,6 +353,18 @@ class TestSplitPromptOriginalUnits:
         text = f"{PREFIX} A\nvisible"
         assert prompt_parser.split_prompt_original_units(text, "W", single_prompt=True) == ["A"]
 
+    def test_single_prompt_joins_every_original_unlike_line_mode(self):
+        # The one-marker case above cannot tell the `single_prompt` branch from
+        # plain line mode -- both yield ["A"].  With two markers they diverge:
+        # the full-prompt branch joins the originals into a single unit.
+        text = f"{PREFIX} A\nv1\n{PREFIX} B\nv2"
+        assert prompt_parser.split_prompt_original_units(text, "G") == ["A", "B"]
+        assert prompt_parser.split_prompt_original_units(text, "G", single_prompt=True) == ["A\nB"]
+        # ...and split_prompt_units forwards the flag to the original splitter.
+        assert prompt_parser.split_prompt_units(
+            text, "G", single_prompt=True, originals=True
+        ) == ["A\nB"]
+
     def test_enhanced_prefix_and_crlf_are_normalized(self):
         text = f"{ENHANCED}{PREFIX} A\r\nvisible\r"
         assert prompt_parser.split_prompt_original_units(text, "G") == ["A"]
@@ -358,6 +405,11 @@ class TestSerializePromptBlocksWithPrefix:
     @pytest.mark.parametrize("prompts", [[], ["", "   "]])
     def test_no_usable_prompt_gives_an_empty_string(self, prompts):
         assert prompt_parser.serialize_prompt_blocks_with_prefix(prompts) == ""
+
+    def test_surplus_originals_are_ignored(self):
+        assert prompt_parser.serialize_prompt_blocks_with_prefix(["a"], ["O1", "O2"]) == (
+            f"{PREFIX} O1\na"
+        )
 
     def test_blank_prompts_do_not_consume_an_original(self):
         assert prompt_parser.serialize_prompt_blocks_with_prefix(["", "b"], ["O1"]) == (
@@ -448,6 +500,19 @@ class TestProcessTemplate:
     def test_comments_can_be_kept_and_are_substituted(self):
         out, err = prompt_parser.process_template('!{a}="1"\n# {a} note\nx {a}', keep_comments=True)
         assert (out, err) == ("# 1 note\nx 1", "")
+
+    def test_kept_comments_skip_the_unknown_variable_check(self):
+        # A kept comment is exempt from the unknown-variable check (the
+        # `not line.startswith('#')` guard), so it passes through with the
+        # braces intact instead of erroring...
+        assert prompt_parser.process_template("# {b} note\nhello", keep_comments=True) == (
+            "# {b} note\nhello",
+            "",
+        )
+        # ...while the identical reference on a normal line is an error.
+        out, err = prompt_parser.process_template("{b} note\nhello", keep_comments=True)
+        assert out == ""
+        assert err.startswith("Unknown variable '{b}' in template")
 
     def test_empty_lines_are_dropped_by_default(self):
         assert prompt_parser.process_template("a\n\nb") == ("a\nb", "")

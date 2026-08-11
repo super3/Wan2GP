@@ -25,9 +25,8 @@ import pytest
 
 import shared.lora_mapper as lora_mapper
 import shared.tools.sha256_verify as sha256_verify
-from conftest import import_pure_module
 
-gguf_mapping = import_pure_module("shared.utils.gguf_mapping")
+import shared.utils.gguf_mapping as gguf_mapping
 
 LoraKeyMapper = lora_mapper.LoraKeyMapper
 

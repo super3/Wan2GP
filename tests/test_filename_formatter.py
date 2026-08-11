@@ -27,9 +27,8 @@ from datetime import datetime
 
 import pytest
 
-from conftest import import_pure_module
 
-ff = import_pure_module("shared.utils.filename_formatter")
+import shared.utils.filename_formatter as ff
 FilenameFormatter = ff.FilenameFormatter
 
 # 2025-01-15 14:30:45 local time -- the exact epoch value is irrelevant because

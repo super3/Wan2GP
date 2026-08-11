@@ -256,7 +256,7 @@ def _strip_bars_outside_comments(s: str) -> str:
     for ch in s:
         if ch in ('\n', '\r'): com = False; out.append(ch)
         elif ch == '#':        com = True;  out.append(ch)
-        elif ch == '|' and not com: continue
+        elif ch == '|' and not com: out.append(' ')
         else: out.append(ch)
     return ''.join(out)
 
