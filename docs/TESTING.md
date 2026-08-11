@@ -96,8 +96,11 @@ output, and several had clearly been present for a long time.
 
 3. **Forged checksums** — `shared/tools/sha256_verify.py` a `chunk_size` of 0 made
    `f.read(0)` return immediately, so `compute_sha256` returned the empty-string digest
-   for *any* file — and that digest then "verified successfully" against it. A
-   non-positive `chunk_size` is now rejected.
+   for *any* file — and that digest then "verified successfully" against it, defeating
+   the only purpose of a verification helper. A non-positive `chunk_size` is now
+   rejected. Nothing imports this module, but `shared/tools/` holds hand-run developer
+   utilities rather than library code — `validate_outputs.py` beside it is an argparse
+   script — so it is reached by running it, not by importing it.
 
 4. **Doubled spaces** — `shared/utils/loras_mutipliers.py` `preparse_loras_multipliers`
    split on `" "` rather than whitespace, so `"1.0  0.5"` produced an empty token and
