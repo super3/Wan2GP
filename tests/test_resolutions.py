@@ -21,9 +21,9 @@ alignment family, ``builtin_resolution_choices`` and friends,
 ``keep_resolution_on_model_switch_enabled`` and ``match_nvidia_architecture``.
 
 Expectations were derived by reading the source. A few surprising-but-real
-behaviours (division by zero on a zero-height resolution, the sticky custom
-resolution cache, ``""`` as a category expression rejecting everything) are pinned
-explicitly and flagged with a comment.
+behaviours (division by zero on a zero-height resolution, the custom-resolution
+cache never noticing an edited file, ``""`` as a category expression rejecting
+everything) are pinned explicitly and flagged with a comment.
 """
 
 from __future__ import annotations
@@ -36,24 +36,32 @@ import shared.resolutions as res
 from shared.match_archi import match_nvidia_architecture
 
 
+_REAL_LOADER = res.load_custom_resolution_choices
+
+
 @pytest.fixture(autouse=True)
 def no_custom_resolutions(monkeypatch):
-    """Pre-seed the custom-resolution cache so nothing ever touches the disk.
+    """Stub the custom-resolution loader so nothing ever touches the disk.
 
-    ``load_custom_resolution_choices`` defaults to reading ``resolutions.json``
-    *relative to the current working directory*; seeding the cache with an empty
-    list short-circuits that and keeps every test independent of where pytest was
-    started from.  ``monkeypatch`` restores the module global afterwards.
+    ``load_custom_resolution_choices`` reads ``resolutions.json`` *relative to the
+    current working directory* and memoises the result in module globals, so left
+    alone it would make the suite depend on where pytest was started from and let
+    one test's file leak into the next.  Replacing the function itself (rather than
+    seeding its cache) keeps the stub independent of how that cache is keyed.
+    ``monkeypatch`` puts the real function back afterwards.
     """
 
-    monkeypatch.setattr(res, "_custom_resolutions", [])
+    monkeypatch.setattr(res, "load_custom_resolution_choices", lambda *args, **kwargs: [])
 
 
 @pytest.fixture
 def cleared_resolution_cache(monkeypatch):
-    """Undo the autouse seeding for the tests that exercise the loader itself."""
+    """Restore the real loader, with an empty cache before *and* after the test."""
 
-    monkeypatch.setattr(res, "_custom_resolutions", None)
+    monkeypatch.setattr(res, "load_custom_resolution_choices", _REAL_LOADER)
+    res.reset_custom_resolution_cache()
+    yield
+    res.reset_custom_resolution_cache()
 
 
 @pytest.fixture
@@ -100,6 +108,15 @@ class TestIsResolutionValue:
     )
     def test_rejects_malformed_values(self, value):
         assert res.is_resolution_value(value) is False
+
+    def test_rejects_objects_that_merely_stringify_to_a_resolution(self):
+        # The gate is isinstance(str), not str()-ability, so a path-like or any
+        # other object with a convenient __str__ is still rejected.
+        class Stringy:
+            def __str__(self):
+                return "1280x720"
+
+        assert res.is_resolution_value(Stringy()) is False
 
 
 class TestParseResolution:
@@ -369,12 +386,10 @@ class TestBuiltinChoices:
 
     def test_custom_choices_are_appended_and_deduped(self, monkeypatch):
         monkeypatch.setattr(
-            res, "_custom_resolutions", [("Mine", "1234x576"), ("Dup", "1280x720")]
+            res,
+            "load_custom_resolution_choices",
+            lambda *args, **kwargs: [("Mine", "1234x576"), ("Dup", "1280x720")],
         )
-        # The cache is keyed on the file it came from, so the source has to match the
-        # path load_custom_resolution_choices() will be called with for the seeded
-        # value to be used instead of a reload.
-        monkeypatch.setattr(res, "_custom_resolutions_source", res.RESOLUTION_FILE)
         choices = res.default_global_resolution_choices(False)
         # Custom entries are appended after the builtins, in file order.
         assert choices[: len(BUILTIN)] == list(BUILTIN)
@@ -634,6 +649,18 @@ class TestResolveResolutionChoices:
         assert {res.categorize_resolution(r) for _, r in choices[1:]} == {"256p"}
         assert current == "1280x720"
 
+    def test_an_empty_category_list_merges_the_whole_global_list(self):
+        # [] is "not None", so the merge still happens; it just allows every group.
+        model_def = {"resolutions": [["Native", "1280x720"]], "resolutions_categories": []}
+        choices, current = res.resolve_resolution_choices(None, model_def)
+        assert choices[0] == ("Native", "1280x720")
+        # The merge draws on the global list, 4K included ...
+        assert ("3840x2176 (16:9)", "3840x2176") in choices
+        # ... and the model's own entry wins the dedupe against the builtin label.
+        assert ("1280x720 (16:9)", "1280x720") not in choices
+        assert len(choices) == 1 + len(res.DEFAULT_RESOLUTION_CHOICES_4K) + len(BUILTIN) - 1
+        assert current == "1280x720"
+
     def test_vae_block_size_aligns_the_list(self):
         choices, current = res.resolve_resolution_choices("1280x720", {"vae_block_size": 32})
         assert all(
@@ -849,6 +876,8 @@ class TestMatchNvidiaArchitecture:
             (">=70&<90", ADA, True),
             (">=70&<90", HOPPER, False),
             (">=80&<=86", AMPERE_DATACENTER, True),
+            (">=70 & <90", AMPERE_CONSUMER, True),  # spaces around the separators
+            ("<=61 + >=89", ADA, True),
             # combined
             ("<70+>=90", PASCAL, True),
             ("<70+>=90", AMPERE_DATACENTER, False),
