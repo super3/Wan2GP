@@ -91,13 +91,6 @@ class FilenameFormatter:
     # Characters not allowed in filenames (covers Windows, macOS, Linux)
     UNSAFE_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f\n\r\t/]')
 
-    # Overall cap on the produced name. Common filesystems allow 255 bytes (ext4) or
-    # 255 UTF-16 units (NTFS) for a single path component, and callers still have to
-    # append an extension and any de-duplication suffix. Without a cap here an
-    # untruncated {prompt} produces a name that fails with ENAMETOOLONG.
-    MAX_FILENAME_LENGTH = 200
-    MAX_FILENAME_BYTES = 240
-
     def __init__(self, template: str):
         """
         Initialize with a template string.
@@ -131,8 +124,11 @@ class FilenameFormatter:
         """
         # Single pass, so a strftime code emitted for one token can never be re-matched
         # by a later one. Replacing sequentially meant "MM" became "%m" and the later
-        # "mm" token then matched the "m" just written, compiling "MMmm" to "%%Mm" --
-        # a literal '%' and 'm' around the minutes, with the month lost.
+        # "mm" token then matched the "m" just written, compiling "MMmm" to "%%Mm",
+        # which strftime renders as the literal text "%Mm" -- neither the month nor
+        # the minute survives. "YYYY" followed by "YY" broke the same way
+        # ("YYYYYY" -> "%%yY" -> the literal "%yY"); between them the two families
+        # account for every format whose output this change alters.
         #
         # DATE_TOKENS is ordered longest-first (YYYY before YY) and regex alternation is
         # first-match-wins, so that precedence is preserved.
@@ -254,28 +250,11 @@ class FilenameFormatter:
         # Sanitize any literal text in template that might be unsafe
         result = self._sanitize_for_filename(result)
 
-        # Cap the whole name, not just individual {prompt(N)} placeholders
-        result = self._enforce_max_length(result)
-
         # Ensure result is not empty
         if not result:
             result = self._format_date()
 
         return result
-
-    def _enforce_max_length(self, value: str) -> str:
-        """Trim the finished name to something every common filesystem accepts.
-
-        Trimming by characters first keeps the usual ASCII case exact; the byte loop
-        then handles multi-byte text, where 200 characters can still exceed the
-        255-byte component limit.
-        """
-        if len(value) > self.MAX_FILENAME_LENGTH:
-            value = value[:self.MAX_FILENAME_LENGTH]
-        while value and len(value.encode('utf-8')) > self.MAX_FILENAME_BYTES:
-            value = value[:-1]
-        # Do not leave the separator dangling where the cut landed.
-        return value.rstrip('_ .')
 
     @classmethod
     def format_filename(cls, template: str, settings: dict) -> str:

@@ -37,9 +37,11 @@ def compute_sha256(file_path, expected_hash=None, chunk_size=8192):
     if not file_path.exists():
         raise FileNotFoundError(f"File not found: {file_path}")
 
-    # f.read(0) returns b"" immediately, so a non-positive chunk size would end the
-    # read loop before it started and yield the digest of the empty string for any
-    # file -- which then "verifies successfully" against that digest.
+    # f.read(0) returns b"" immediately, so a chunk size of 0 ended the read loop
+    # before it started and yielded the digest of the empty string for any file --
+    # which then "verified successfully" against that digest. Negative sizes read the
+    # whole file in one go and were already correct; they are refused too because
+    # "read everything" is not what a chunk size means, not because they were broken.
     if chunk_size <= 0:
         raise ValueError(f"chunk_size must be positive, got {chunk_size}")
 

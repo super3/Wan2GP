@@ -104,8 +104,10 @@ CATEGORY_ALIASES = {
 }
 
 _custom_resolutions = None
-# The file the cached value came from. Without it the cache answers for whatever file
-# was loaded first and silently ignores the resolution_file argument thereafter.
+# The resolution_file argument the cached value was loaded for. Without it the cache
+# answers for whatever file was loaded first and silently ignores the argument
+# thereafter. Note this keys on the path *string*, not the resolved file: two spellings
+# of one path reload, and a relative path after a cwd change still hits the old entry.
 _custom_resolutions_source = None
 
 
