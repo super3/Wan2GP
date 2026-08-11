@@ -29,8 +29,11 @@ def match_nvidia_architecture(conditions_dict, architecture):
         if not cond:
             return False
             
-        # Parse operator and value using regex
-        match = re.match(r'(>=|<=|>|<|=?)(\d+)', cond)
+        # fullmatch, not match: re.match anchors only at the start, so it was lax at
+        # the end and strict in the middle -- '>=89garbage' silently parsed as '>=89'
+        # while a natural '>= 89' failed. Optional inner whitespace is now allowed and
+        # trailing junk is rejected.
+        match = re.fullmatch(r'\s*(>=|<=|>|<|=?)\s*(\d+)\s*', cond)
         if not match:
             return False
             

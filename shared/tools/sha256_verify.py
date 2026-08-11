@@ -16,7 +16,8 @@ def compute_sha256(file_path, expected_hash=None, chunk_size=8192):
     
     Raises:
         FileNotFoundError: If the file doesn't exist
-        ValueError: If expected_hash is provided and doesn't match
+        ValueError: If chunk_size is not positive, or if expected_hash is
+            provided and doesn't match
     
     Example:
         >>> # Just compute the hash
@@ -32,10 +33,16 @@ def compute_sha256(file_path, expected_hash=None, chunk_size=8192):
         >>>     print(f"Verification failed: {e}")
     """
     file_path = Path(file_path)
-    
+
     if not file_path.exists():
         raise FileNotFoundError(f"File not found: {file_path}")
-    
+
+    # f.read(0) returns b"" immediately, so a non-positive chunk size would end the
+    # read loop before it started and yield the digest of the empty string for any
+    # file -- which then "verifies successfully" against that digest.
+    if chunk_size <= 0:
+        raise ValueError(f"chunk_size must be positive, got {chunk_size}")
+
     # Create SHA256 hash object
     sha256_hash = hashlib.sha256()
     

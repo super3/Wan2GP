@@ -185,19 +185,33 @@ class TestCustomResolutionFile:
         assert loaded == [("Wide", "1280x720"), ("Tall", "720x1280")]
         assert res._custom_resolutions == loaded
 
-    def test_cache_wins_over_the_file_argument(self, tmp_path, cleared_resolution_cache):
+    def test_the_cache_is_keyed_on_the_file_argument(self, tmp_path, cleared_resolution_cache):
         first = tmp_path / "first.json"
         first.write_text(json.dumps([["Wide", "1280x720"]]), encoding="utf-8")
         second = tmp_path / "second.json"
         second.write_text(json.dumps([["Square", "512x512"]]), encoding="utf-8")
 
         assert res.load_custom_resolution_choices(str(first)) == [("Wide", "1280x720")]
-        # The cache is global and keyed on nothing: the second path is ignored.
-        assert res.load_custom_resolution_choices(str(second)) == [("Wide", "1280x720")]
+        # A different path reloads instead of answering from the first file's cache.
+        assert res.load_custom_resolution_choices(str(second)) == [("Square", "512x512")]
+        # ...and switching back works too, rather than sticking on the latest.
+        assert res.load_custom_resolution_choices(str(first)) == [("Wide", "1280x720")]
 
         res.reset_custom_resolution_cache()
         assert res._custom_resolutions is None
+        assert res._custom_resolutions_source is None
         assert res.load_custom_resolution_choices(str(second)) == [("Square", "512x512")]
+
+    def test_repeated_calls_with_the_same_file_are_served_from_cache(
+        self, tmp_path, cleared_resolution_cache
+    ):
+        path = tmp_path / "res.json"
+        path.write_text(json.dumps([["Wide", "1280x720"]]), encoding="utf-8")
+        assert res.load_custom_resolution_choices(str(path)) == [("Wide", "1280x720")]
+        # Editing the file behind the cache is not picked up without a reset -- that is
+        # the caching behaviour the keying change preserves.
+        path.write_text(json.dumps([["Square", "512x512"]]), encoding="utf-8")
+        assert res.load_custom_resolution_choices(str(path)) == [("Wide", "1280x720")]
 
     def test_unparseable_json_is_reported_and_yields_empty(self, tmp_path, cleared_resolution_cache, printed):
         path = tmp_path / "broken.json"
@@ -250,6 +264,8 @@ class TestBlockAlignment:
             (0, 16, 16),
             (-5, 16, 16),
             (1000, 1, 1000),  # block sizes <= 1 disable alignment entirely
+            (0, 1, 0),  # ... including the round-up: 1 is a short circuit, not a divisor
+            (-5, 1, -5),
             (1000, 0, 1000),
         ],
     )
@@ -355,8 +371,14 @@ class TestBuiltinChoices:
         monkeypatch.setattr(
             res, "_custom_resolutions", [("Mine", "1234x576"), ("Dup", "1280x720")]
         )
+        # The cache is keyed on the file it came from, so the source has to match the
+        # path load_custom_resolution_choices() will be called with for the seeded
+        # value to be used instead of a reload.
+        monkeypatch.setattr(res, "_custom_resolutions_source", res.RESOLUTION_FILE)
         choices = res.default_global_resolution_choices(False)
-        assert ("Mine", "1234x576") in choices
+        # Custom entries are appended after the builtins, in file order.
+        assert choices[: len(BUILTIN)] == list(BUILTIN)
+        assert choices[len(BUILTIN) :] == [("Mine", "1234x576")]
         # "1280x720" is already builtin, so the custom label loses.
         assert ("Dup", "1280x720") not in choices
         assert ("1280x720 (16:9)", "1280x720") in choices
@@ -464,10 +486,16 @@ class TestCategoryExpressions:
             ("720p", ["<=480p", ">=1080p"], False),
             ("720p", ["<=480p", "720p"], True),
             ("720p", "hd", False),  # an unparseable expression matches nothing
-            ("720p", "", False),  # ... and so does the empty string
+            ("720p", "", False),  # BUG (pinned): see the note below
         ],
     )
     def test_category_allowed(self, category, expressions, allowed):
+        # BUG (pinned) for the ("720p", "", False) case: None and [] short-circuit
+        # to "no constraint", but normalize_category_expressions("") returns [""],
+        # which is truthy, so the escape hatch is skipped and the empty expression
+        # matches no tier at all.  An empty "resolutions_categories" string in a
+        # model definition therefore forbids every resolution rather than allowing
+        # them all -- see test_empty_category_string_forbids_everything.
         assert res.category_allowed(category, expressions) is allowed
 
     def test_category_allowed_requires_a_known_group_name(self):
@@ -528,6 +556,17 @@ class TestClosestResolution:
         choices = [("square", "1024x1024"), ("wide", "640x360")]
         assert res.closest_resolution("1920x1080", choices) == "1024x1024"
 
+    def test_equidistant_groups_are_broken_by_pixel_threshold_distance(self):
+        # "800x600" is 480p (index 3).  "672x384" is 384p (index 2) and "960x544"
+        # is 540p (index 4), so both are one group away and the index part of the
+        # key ties.  The tie-break is the distance between the group *thresholds*:
+        # 540p (522240) is far closer to 480p (519168) than 384p (262144) is, so
+        # the 540p candidate wins even though the 384p one is listed first.
+        choices = [("small", "672x384"), ("mid", "960x544")]
+        assert res.closest_resolution("800x600", choices) == "960x544"
+        # ... and the answer does not depend on the order the groups are seen in.
+        assert res.closest_resolution("800x600", list(reversed(choices))) == "960x544"
+
     def test_pixel_count_breaks_ties_between_equal_ratios(self):
         choices = [("small", "1440x810"), ("big", "1920x1080")]
         assert res.closest_resolution("1760x990", choices) == "1920x1080"
@@ -571,7 +610,22 @@ class TestResolveResolutionChoices:
         choices, current = res.resolve_resolution_choices(None, {"resolutions_categories": "<=480p"})
         groups = {res.categorize_resolution(resolution) for _, resolution in choices}
         assert groups == {"256p", "320p", "384p", "480p"}
-        assert current == choices[0][1]
+        # The filter keeps the global order, so the first surviving entry is the
+        # largest allowed one; a null current choice snaps to it.
+        assert choices[0] == ("832x624 (4:3)", "832x624")
+        assert current == "832x624"
+
+    def test_invalid_model_resolutions_still_honour_the_categories(self):
+        # normalize_resolution_choices returns None for a malformed "resolutions",
+        # the `or []` swallows it, and the category list is still applied.
+        model_def = {"resolutions": "garbage", "resolutions_categories": "256p"}
+        choices, current = res.resolve_resolution_choices(None, model_def)
+        assert choices == [
+            ("448x256 (7:4)", "448x256"),
+            ("256x448 (4:7)", "256x448"),
+            ("320x320 (1:1)", "320x320"),
+        ]
+        assert current == "448x256"
 
     def test_model_resolutions_and_categories_are_merged(self):
         model_def = {"resolutions": [["Native", "1280x720"]], "resolutions_categories": "256p"}
@@ -595,11 +649,40 @@ class TestResolveResolutionChoices:
         assert current == "1280x704"
 
     def test_default_block_size_is_sixteen(self):
+        # Every builtin resolution is already a multiple of 16, so the builtin list
+        # cannot tell 16 apart from 8 or 4: use a model list that is 8-aligned but
+        # not 16-aligned to pin the default down.
+        model_def = {"resolutions": [["1000x1000 (1:1)", "1000x1000"]]}
+        assert res.resolve_resolution_choices(None, model_def) == (
+            [("992x992 (1:1)", "992x992")],
+            "992x992",
+        )
+        assert res.resolve_resolution_choices(None, dict(model_def, vae_block_size=8)) == (
+            [("1000x1000 (1:1)", "1000x1000")],
+            "1000x1000",
+        )
+
+    def test_the_builtin_table_is_already_block_aligned(self):
         choices, _ = res.resolve_resolution_choices(None, {})
         assert all(
             w % 16 == 0 and h % 16 == 0
             for w, h in (res.parse_resolution(r) for _, r in choices)
         )
+
+    def test_empty_category_string_forbids_everything(self):
+        # BUG (pinned): an empty "resolutions_categories" is treated as a real
+        # constraint that no tier satisfies, so the model ends up with no
+        # resolutions at all.  None and [] correctly mean "no constraint".
+        assert res.resolve_resolution_choices(None, {"resolutions_categories": ""}) == ([], None)
+        # None falls through to the plain default list ...
+        assert res.resolve_resolution_choices(None, {"resolutions_categories": None})[0] == list(
+            BUILTIN
+        )
+        # ... while [] takes the filtering branch but keeps every group, and that
+        # branch always draws from the global list, 4K entries included.
+        assert res.resolve_resolution_choices(None, {"resolutions_categories": []})[0] == list(
+            res.DEFAULT_RESOLUTION_CHOICES_4K
+        ) + list(BUILTIN)
 
     def test_zero_block_size_is_rejected(self):
         with pytest.raises(ValueError):
@@ -649,7 +732,13 @@ class TestGrouping:
     def test_selected_resolution_picks_its_own_group(self):
         _, choices, selected = res.group_resolution_choices(BUILTIN, "832x480")
         assert selected == "480p"
-        assert choices == res.group_choices(BUILTIN, "480p")
+        assert choices == [
+            ("832x624 (4:3)", "832x624"),
+            ("624x832 (3:4)", "624x832"),
+            ("720x720 (1:1)", "720x720"),
+            ("832x480 (16:9)", "832x480"),
+            ("480x832 (9:16)", "480x832"),
+        ]
 
     def test_selection_outside_the_available_groups_falls_back_to_the_largest(self):
         subset = [("a", "832x480"), ("b", "480x832"), ("c", "1280x720")]
@@ -778,7 +867,6 @@ class TestMatchNvidiaArchitecture:
             "   ",
             "abc",  # no number at all
             "-5",  # a leading minus is not part of the grammar
-            ">= 89",  # the operator may not be separated from the value
             "+",  # nothing but a separator
             ">=70&",  # a dangling AND term is false, so the whole AND is false
         ],
@@ -789,10 +877,17 @@ class TestMatchNvidiaArchitecture:
     def test_surrounding_whitespace_is_stripped(self):
         assert match_nvidia_architecture({"  >=89  ": "sage"}, 90) == ["sage"]
 
-    def test_trailing_garbage_after_the_number_is_ignored(self):
-        # The parser uses re.match, not fullmatch, so anything after the digits is
-        # silently dropped rather than rejected.
-        assert match_nvidia_architecture({">=89nonsense": "sage"}, 90) == ["sage"]
+    @pytest.mark.parametrize("condition", [">=89nonsense", "89x", "89 89", ">=89.5"])
+    def test_trailing_garbage_after_the_number_is_rejected(self, condition):
+        # The parser uses fullmatch, so anything after the digits is refused rather
+        # than silently dropped -- ">=89nonsense" used to parse as ">=89".
+        assert match_nvidia_architecture({condition: "sage"}, 90) == []
+
+    @pytest.mark.parametrize("condition", [">= 89", "> 88", "<  90", " >=89 ", "= 89"])
+    def test_whitespace_around_the_operator_is_allowed(self, condition):
+        # A space between operator and value is the natural way to write these and
+        # used to fail outright.
+        assert match_nvidia_architecture({condition: "sage"}, 89) == ["sage"]
 
     def test_empty_condition_dict(self):
         assert match_nvidia_architecture({}, 89) == []

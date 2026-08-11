@@ -14,8 +14,8 @@ Covered here:
   created under ``tmp_path``: chunking, verification success/failure and the
   missing-file error.
 
-Two tests deliberately pin behaviour that looks wrong; each one carries a
-comment saying so.
+One test deliberately pins behaviour that looks wrong -- see the NOTE in
+``TestRemapStateDictTriplet::test_keep_unmapped_applies_to_every_member``.
 
 Everything here is pure stdlib: no torch, numpy or gradio, no clock, network or
 cwd dependence, and the only files touched live under ``tmp_path``.
@@ -483,6 +483,8 @@ class TestComputeSha256:
         path, _payload, digest = sample_file
         assert sha256_verify.compute_sha256(str(path)) == digest
 
+    # 7 is not a divisor of the payload length and 1 MiB is larger than the whole
+    # file, so both the ragged-final-chunk and single-chunk paths are exercised.
     @pytest.mark.parametrize("chunk_size", [1, 7, 8192, 1 << 20])
     def test_chunk_size_does_not_change_the_digest(self, sample_file, chunk_size):
         path, _payload, digest = sample_file
@@ -493,20 +495,23 @@ class TestComputeSha256:
         path.write_bytes(b"")
         assert sha256_verify.compute_sha256(path) == hashlib.sha256(b"").hexdigest()
 
-    def test_zero_chunk_size_silently_hashes_nothing(self, sample_file, capsys):
-        # BUG (pinned, not fixed): ``f.read(0)`` returns b"" immediately, so the
-        # walrus loop never runs and the digest of the *empty* string is
-        # returned for any file content. Worse, feeding that digest back in as
-        # expected_hash makes the integrity check *pass* -- a silent false
-        # positive. A `if chunk_size <= 0: raise ValueError(...)` guard would
-        # fix it; when it lands, this test should flip to pytest.raises.
-        path, _payload, digest = sample_file
+    @pytest.mark.parametrize("chunk_size", [0, -1, -8192])
+    def test_non_positive_chunk_size_is_rejected(self, sample_file, chunk_size):
+        # ``f.read(0)`` returns b"" immediately, so the walrus loop used to end
+        # before it started and hand back the digest of the *empty* string for any
+        # file content -- which then "verified successfully" against that digest,
+        # a silent false positive on arbitrary content. It is now refused outright.
+        path, _payload, _digest = sample_file
+        with pytest.raises(ValueError, match="chunk_size must be positive"):
+            sha256_verify.compute_sha256(path, chunk_size=chunk_size)
+
+    def test_the_empty_digest_can_no_longer_be_forced(self, sample_file):
+        # The regression that mattered: passing the empty-string digest as the
+        # expected hash must not be satisfiable by a non-empty file.
+        path, _payload, _digest = sample_file
         empty_digest = hashlib.sha256(b"").hexdigest()
-        result = sha256_verify.compute_sha256(path, chunk_size=0)
-        assert result == empty_digest
-        assert result != digest
-        assert sha256_verify.compute_sha256(path, empty_digest, chunk_size=0) == empty_digest
-        assert "verified successfully" in capsys.readouterr().out
+        with pytest.raises(ValueError):
+            sha256_verify.compute_sha256(path, empty_digest, chunk_size=0)
 
     def test_no_output_when_no_expected_hash_is_given(self, sample_file, capsys):
         path, _payload, _digest = sample_file

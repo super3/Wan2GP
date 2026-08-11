@@ -9,7 +9,11 @@ def preparse_loras_multipliers(loras_multipliers):
     loras_mult_choices_list = loras_multipliers.replace("\r", "").split("\n")
     loras_mult_choices_list = [multi.strip() for multi in loras_mult_choices_list if len(multi)>0 and not multi.startswith("#")]
     loras_multipliers = " ".join(loras_mult_choices_list)
-    return loras_multipliers.replace("|"," ").strip().split(" ")
+    # split() rather than split(" "): the latter turns any run of two or more spaces
+    # into empty tokens, which parse_loras_multipliers then rejects as invalid
+    # multipliers. It also makes whitespace-only and comment-only input behave like
+    # the empty string -- no multipliers given -- instead of erroring.
+    return loras_multipliers.replace("|"," ").split()
 
 def expand_slist(slists_dict, mult_no, num_inference_steps, model_switch_step, model_switch_step2 ):
     def expand_one(slist, num_inference_steps):

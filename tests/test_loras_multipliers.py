@@ -63,18 +63,25 @@ class TestPreparseLorasMultipliers:
         assert lm.preparse_loras_multipliers("1 # trailing") == ["1", "#", "trailing"]
 
     @pytest.mark.parametrize("raw", ["", "\n", "   ", "# only a comment"])
-    def test_input_without_values_yields_a_single_empty_token(self, raw):
-        # Note the empty *token* rather than an empty list: "".split(" ") == [""].
-        # parse_loras_multipliers skips preparse entirely for "" but not for "   " or a
-        # comment-only string, so those two reach it and are rejected -- see
-        # TestParseLorasMultipliersErrors.test_input_with_no_values_is_rejected.
-        assert lm.preparse_loras_multipliers(raw) == [""]
+    def test_input_without_values_yields_no_tokens(self, raw):
+        # Whitespace-only and comment-only input mean "no multipliers given", the same
+        # as the empty string.  These used to yield [""] -- a single empty token that
+        # parse_loras_multipliers then rejected as an invalid multiplier.
+        assert lm.preparse_loras_multipliers(raw) == []
 
-    def test_consecutive_spaces_produce_empty_tokens(self):
-        # BUG: the split is `.split(" ")` rather than `.split()`, so a double
-        # space leaves an empty token behind which parse_loras_multipliers
-        # later reports as an invalid multiplier.
-        assert lm.preparse_loras_multipliers("1.0  0.5") == ["1.0", "", "0.5"]
+    def test_input_without_values_is_accepted_downstream(self):
+        for raw in ("", "   ", "# only a comment"):
+            nums, _slists, error = lm.parse_loras_multipliers(raw, 2, 4)
+            assert error == "", f"{raw!r} was rejected: {error}"
+            assert nums == [1.0, 1.0]
+
+    def test_consecutive_spaces_do_not_produce_empty_tokens(self):
+        # The split is `.split()` rather than `.split(" ")`; the latter left an empty
+        # token behind for every doubled space, which parse_loras_multipliers reported
+        # as "Lora Multiplier no 2 () is invalid".
+        assert lm.preparse_loras_multipliers("1.0  0.5") == ["1.0", "0.5"]
+        assert lm.preparse_loras_multipliers("1.0 \t 0.5\n\n0.25") == ["1.0", "0.5", "0.25"]
+        assert lm.parse_loras_multipliers("1.0  0.5", 2, 4)[2] == ""
 
     def test_non_numeric_tokens_are_passed_through_untouched(self):
         assert lm.preparse_loras_multipliers("a b") == ["a", "b"]
@@ -288,14 +295,12 @@ class TestParseLorasMultipliersErrors:
             "Lora sub value no 1 (abc) in Multiplier definition '['0.1', 'abc']' is invalid in Phase 1",
         )
 
-    def test_double_space_is_reported_as_an_invalid_multiplier(self):
-        # BUG: consequence of preparse splitting on a single space -- "1.0  0.5"
-        # is a reasonable thing for a user to type but is rejected.
-        assert lm.parse_loras_multipliers("1.0  0.5", 2, 4) == (
-            "",
-            "",
-            "Lora Multiplier no 2 () is invalid",
-        )
+    def test_double_space_is_accepted(self):
+        # "1.0  0.5" is a reasonable thing for a user to type.  It used to be rejected
+        # because preparse split on a single space, leaving an empty token behind.
+        nums, _slists, error = lm.parse_loras_multipliers("1.0  0.5", 2, 4)
+        assert error == ""
+        assert nums == [1.0, 0.5]
 
     @pytest.mark.parametrize("nb_phases", [1, 2])
     def test_more_phases_than_nb_phases(self, nb_phases):
@@ -310,17 +315,14 @@ class TestParseLorasMultipliersErrors:
             lm.parse_loras_multipliers(None, 1, 4)
 
     @pytest.mark.parametrize("raw", ["   ", "# only a comment", "# a\n# b"])
-    def test_input_with_no_values_is_rejected(self, raw):
-        # BUG: the `len(loras_multipliers) > 0` guard is applied to the *raw* string, so
-        # whitespace-only and comment-only boxes get past it, preparse hands back [""],
-        # and the user sees a confusing "no 1 () is invalid".  An entirely empty box is
-        # fine (see test_empty_string_defaults_every_lora_to_one) -- adding a comment to
-        # it is what breaks it.
-        assert lm.parse_loras_multipliers(raw, 1, 4) == (
-            "",
-            "",
-            "Lora Multiplier no 1 () is invalid",
-        )
+    def test_input_with_no_values_is_accepted(self, raw):
+        # A box holding only whitespace or only comments means "no multipliers given",
+        # exactly like an empty box (see test_empty_string_defaults_every_lora_to_one).
+        # These used to reach preparse, come back as [""], and produce a confusing
+        # "Lora Multiplier no 1 () is invalid".
+        nums, _slists, error = lm.parse_loras_multipliers(raw, 1, 4)
+        assert error == ""
+        assert nums == [1.0]
 
     def test_colon_without_declared_branches_is_not_special(self):
         # The ':' branch syntax is only recognised when lora_multiplier_branches is

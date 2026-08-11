@@ -197,12 +197,26 @@ class TestDatePlaceholder:
         # raises, and the retry with the default pattern is what we see.
         assert fmt("{date(YYYY-MM-DD)}") == DEFAULT_DATE
 
-    def test_adjacent_month_and_minute_tokens_are_mangled(self, frozen_clock):
-        # BUG (pinned, not fixed): ``_parse_date_format`` rewrites tokens
-        # sequentially over its own output, so ``MMmm`` becomes ``%m`` + ``mm``,
-        # whose trailing ``mm`` is then rewritten to ``%M`` -- producing ``%%Mm``,
-        # i.e. the literal text ``%Mm`` instead of month+minute.
-        assert fmt("{date(MMmm)}") == "%Mm"
+    def test_adjacent_month_and_minute_tokens_both_survive(self, frozen_clock):
+        # ``_parse_date_format`` substitutes in a single pass. Rewriting tokens
+        # sequentially over its own output turned ``MMmm`` into ``%m`` + ``mm``, whose
+        # trailing ``mm`` was then rewritten to ``%M`` -- yielding the literal ``%Mm``
+        # with the month lost.
+        assert fmt("{date(MMmm)}") == "0130"  # January, 30 minutes past
+
+    @pytest.mark.parametrize(
+        "date_format, expected",
+        [
+            ("MMmm", "0130"),   # month then minute
+            ("mmMM", "3001"),   # minute then month
+            ("MMMM", "0101"),   # the same token twice
+            ("HHhh", "1402"),   # 24h then 12h
+        ],
+    )
+    def test_a_token_never_rematches_what_an_earlier_one_wrote(
+        self, frozen_clock, date_format, expected
+    ):
+        assert fmt("{date(%s)}" % date_format) == expected
 
     @pytest.mark.parametrize(
         "date_format, expected_valid",
@@ -331,9 +345,31 @@ class TestTruncation:
     def test_truncate_helper(self, value, max_len, expected):
         assert FilenameFormatter("{prompt}")._truncate(value, max_len) == expected
 
-    def test_no_overall_filename_length_cap(self, frozen_clock):
-        long_prompt = "x" * 5000
-        assert fmt("{prompt}", {"prompt": long_prompt}) == long_prompt
+    def test_the_whole_name_is_capped_not_just_each_placeholder(self, frozen_clock):
+        # Without a cap a 5000-character prompt produced a 5000-character name, which
+        # fails with ENAMETOOLONG on every common filesystem.
+        result = fmt("{prompt}", {"prompt": "x" * 5000})
+        assert result == "x" * FilenameFormatter.MAX_FILENAME_LENGTH
+        assert len(result) == FilenameFormatter.MAX_FILENAME_LENGTH
+
+    def test_the_cap_counts_bytes_for_multi_byte_text(self, frozen_clock):
+        # 200 characters of multi-byte text still overruns the 255-*byte* component
+        # limit on ext4, so the byte budget is enforced as well.
+        result = fmt("{prompt}", {"prompt": "é" * 5000})
+        assert len(result.encode("utf-8")) <= FilenameFormatter.MAX_FILENAME_BYTES
+        assert len(result) <= FilenameFormatter.MAX_FILENAME_LENGTH
+        assert set(result) == {"é"}
+
+    def test_a_name_under_the_cap_is_untouched(self, frozen_clock):
+        assert fmt("{seed}", {"seed": 12345}) == "12345"
+        short = "y" * (FilenameFormatter.MAX_FILENAME_LENGTH - 1)
+        assert fmt("{prompt}", {"prompt": short}) == short
+
+    def test_the_cut_does_not_leave_a_dangling_separator(self, frozen_clock):
+        # The prompt is sanitised to underscore-separated words, so an unlucky cut
+        # would otherwise end the filename on "_".
+        result = fmt("{prompt}", {"prompt": "ab " * 5000})
+        assert not result.endswith("_")
 
 
 class TestSanitisation:
@@ -351,12 +387,19 @@ class TestSanitisation:
     def test_backslash_traversal_in_literal_template_text_is_neutralised(self, frozen_clock):
         assert fmt("..\\..\\{seed}") == ".._.._12345"
 
-    def test_dots_are_not_sanitised(self, frozen_clock):
-        # Pinned current behaviour: a template of "." or ".." produces those exact
-        # names, which are not usable filenames on any OS. The formatter has no
-        # collision/reserved-name handling of any kind.
-        assert fmt(".") == "."
-        assert fmt("..") == ".."
+    def test_a_name_of_only_dots_falls_back_to_the_date(self, frozen_clock):
+        # "." and ".." used to come back verbatim, which is not a usable filename on
+        # any OS. The trailing-separator trim in _enforce_max_length empties them, and
+        # the existing non-empty fallback then supplies a timestamp.
+        assert fmt(".") == DEFAULT_DATE
+        assert fmt("..") == DEFAULT_DATE
+
+    def test_a_trailing_dot_is_trimmed(self, frozen_clock):
+        # Windows rejects a name ending in '.', and it is invisible to the user.
+        assert fmt("{prompt}", {"prompt": "report."}) == "report"
+
+    def test_dots_inside_a_name_are_preserved(self, frozen_clock):
+        assert fmt("{prompt}", {"prompt": "v1.2.3"}) == "v1.2.3"
 
     @pytest.mark.parametrize(
         "value, expected",

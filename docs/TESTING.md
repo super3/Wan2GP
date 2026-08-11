@@ -63,48 +63,67 @@ crash, `init_model_def` sets `visible = False` and the model silently disappears
 the UI. The valid set is recovered by parsing each module in `wgp.py`'s
 `family_handlers` with `ast`, because importing a handler would pull in torch.
 
-## Behaviour these tests pin, that may be worth fixing
+## Defects the suite surfaced
 
-Writing the suite surfaced a number of pre-existing defects. The most serious one has
-since been fixed (see below); the rest are pinned as current behaviour with a comment
-explaining them, so the suite stays green. They are listed so a maintainer can decide.
+Writing the tests turned up eleven pre-existing defects. All of them are now fixed, and
+each has a regression test alongside it. They are recorded here because the *shape* of
+these bugs is the argument for the suite: none crashed, most produced quietly wrong
+output, and several had clearly been present for a long time.
 
-- `shared/tools/sha256_verify.py:44` a `chunk_size` of 0 makes `f.read(0)` return
-  immediately, so `compute_sha256` returns the hash of the empty string for *any* file.
-- `shared/utils/loras_mutipliers.py:12` `preparse_loras_multipliers` splits on `" "`
-  rather than whitespace, so any double space produces empty tokens and a parse error.
-- `shared/utils/prompt_parser.py:68` `serialize_prompt_units` does not guard
-  `multi_prompts_gen_type` with `or ""` the way `split_prompt_units` does, so `None`
-  raises `TypeError`.
-- `shared/utils/filename_formatter.py:115` `_parse_date_format` substitutes date tokens
-  sequentially over the already-substituted string, so a strftime code emitted by one
-  token can be re-matched by a later one. `MM` becomes `%m`, and the later `mm` token
-  then matches the `m` it just wrote: the format `MMmm` passes `_is_valid_date_format`
-  but compiles to `%%Mm`, a literal `%` and `m` around the minutes, with the month lost.
-- `shared/utils/filename_formatter.py:205` `format()` applies no overall length cap, so a
-  long `{prompt}` produces a filename that fails with `ENAMETOOLONG`.
-- `shared/utils/audio_metadata.py:81` `open(path, 'rb').read()` never closes the handle
-  (visible as `ResourceWarning` when the suite runs).
-- `shared/resolutions.py:137` the `_custom_resolutions` cache is keyed on nothing, so the
-  `resolution_file` argument is ignored on every call after the first.
-- `shared/match_archi.py:33` `eval_condition` uses `re.match` rather than `fullmatch`, so
-  `">=89garbage"` parses as `">=89"` while `">= 89"` fails.
+1. **Multiplier fusion** — `shared/utils/loras_mutipliers.py` `_strip_bars_outside_comments`
+   removed phase bars without leaving a separator, so adjacent multipliers fused.
+   Through `merge_loras_settings`, `"1|2|3"` yielded the multiplier string `"23"`,
+   silently applying a LoRA strength of twenty-three. The bar now becomes a space,
+   matching `preparse_loras_multipliers`. It survived because the spaced spelling
+   `1 | 2` always worked — only `1|2` fused.
 
-### Fixed
+2. **Eager package import** — `shared/utils/__init__.py` re-exported the scheduler
+   classes from `fm_solvers` eagerly, pulling in torch and diffusers and making every
+   module in the package unreachable without the CUDA stack. Now lazy via PEP 562
+   `__getattr__`; see the next section.
 
-**Fix 1 — multiplier fusion.** `shared/utils/loras_mutipliers.py`
-`_strip_bars_outside_comments` removed phase bars without leaving a separator behind, so
-adjacent multipliers fused. Reached through `merge_loras_settings`,
-`_select_new_side(["x","y","z"], "1|2|3", "merge after")` returned the multiplier string
-`"23"` — a single LoRA strength of twenty-three — where `"2 3"` was meant. The bar is now
-replaced by a space, matching what `preparse_loras_multipliers` already does when it
-tokenises. It survived because the spaced spelling `1 | 2` always worked; only `1|2`
-fused.
+3. **Forged checksums** — `shared/tools/sha256_verify.py` a `chunk_size` of 0 made
+   `f.read(0)` return immediately, so `compute_sha256` returned the empty-string digest
+   for *any* file — and that digest then "verified successfully" against it. A
+   non-positive `chunk_size` is now rejected.
 
-**Fix 2 — eager package import.** `shared/utils/__init__.py` re-exported the scheduler
-classes from `fm_solvers` eagerly, pulling in torch and diffusers and making every module
-in the package unreachable without the CUDA stack. It is now lazy — see the next section
-for the details and the regression guard.
+4. **Doubled spaces** — `shared/utils/loras_mutipliers.py` `preparse_loras_multipliers`
+   split on `" "` rather than whitespace, so `"1.0  0.5"` produced an empty token and
+   failed with *"Lora Multiplier no 2 () is invalid"*. Whitespace-only and comment-only
+   input now mean "no multipliers given", like an empty box.
+
+5. **`None` prompt mode** — `shared/utils/prompt_parser.py` `serialize_prompt_units`
+   lacked the `or ""` guard its sibling splitters have, so a `None` mode raised
+   `TypeError`.
+
+6. **Date tokens eating each other** — `shared/utils/filename_formatter.py`
+   `_parse_date_format` substituted tokens sequentially over its own output. `MM`
+   became `%m`, and the later `mm` token matched the `m` just written: `MMmm` passed
+   validation and compiled to `%%Mm`, losing the month. Substitution is now a single
+   pass.
+
+7. **Unbounded filenames** — `shared/utils/filename_formatter.py` `format()` applied no
+   overall length cap, so an untruncated `{prompt}` produced a name that fails with
+   `ENAMETOOLONG`. Capped at `MAX_FILENAME_LENGTH` characters and `MAX_FILENAME_BYTES`
+   bytes, the latter for multi-byte text.
+
+8. **Unusable dot names** — a template of `.` or `..` came back verbatim. The
+   trailing-separator trim empties them and the existing fallback supplies a timestamp.
+
+9. **Leaked file handles** — `shared/utils/audio_metadata.py` read files with
+   `open(path, 'rb').read()` in two places, never closing them. The suite runs clean
+   under `-W error::ResourceWarning`.
+
+10. **Stale resolution cache** — `shared/resolutions.py` `_custom_resolutions` was not
+    keyed on the filename, so the `resolution_file` argument was ignored after the
+    first call and a second file returned the first one's contents. The cache now
+    records which file it came from.
+
+11. **Lax architecture conditions** — `shared/match_archi.py` `eval_condition` used
+    `re.match` rather than `fullmatch`, which anchors only at the start. That made it
+    lax at the end and strict in the middle: `">=89garbage"` silently parsed as
+    `">=89"`, while the natural `">= 89"` failed outright. Now a full match, with
+    whitespace around the operator accepted.
 
 ## Keeping the pure modules importable
 
