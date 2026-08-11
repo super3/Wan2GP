@@ -644,7 +644,7 @@ class TestIterTagValues:
 
 class TestMp3TextTag:
     def test_write_then_read_round_trip(self, monkeypatch):
-        fake = install_fake_mutagen(monkeypatch)
+        install_fake_mutagen(monkeypatch)
         am._write_mp3_text_tag("/song.mp3", '{"seed": 1}')
 
         assert am._read_mp3_text_tag("/song.mp3") == '{"seed": 1}'
@@ -741,13 +741,11 @@ class TestExtractNativeAudioDatetime:
         assert am._extract_native_audio_datetime("/song.mp3") is None
 
     def _id3_audio(self, monkeypatch, frames):
-        """An audio object whose ``tags`` is an ID3-like mapping of frames."""
+        """Install a fake mutagen whose ``File`` yields ID3-like ``tags``."""
 
         fake = install_fake_mutagen(monkeypatch)
         tags = fake.ID3()
         tags.update(frames)
-        monkeypatch.setitem(sys.modules, "mutagen",
-                            sys.modules["mutagen"])  # keep the same fake in place
         sys.modules["mutagen"].File = lambda path, easy=False: types.SimpleNamespace(tags=tags)
         return fake
 
@@ -822,8 +820,6 @@ def wav_with_mtime(tmp_path, monkeypatch):
 
     def _make(name="sound.wav", **kwargs):
         path = write_wav(tmp_path, name=name, **kwargs)
-        import os
-
         os.utime(path, (MTIME, MTIME))
         return path
 
@@ -837,8 +833,6 @@ class TestResolveAudioCreationDatetime:
             datetime(2024, 1, 2)
 
     def test_embedded_metadata_is_read_from_the_file(self, wav_with_mtime):
-        import os
-
         path = wav_with_mtime()
         am.save_audio_metadata(path, {"creation_date": "2023-06-07 08:09:10"})
         os.utime(path, (MTIME, MTIME))  # the write refreshed mtime
@@ -853,12 +847,9 @@ class TestResolveAudioCreationDatetime:
         path = wav_with_mtime()
         assert am.resolve_audio_creation_datetime(path, {"seed": 1}) == datetime.fromtimestamp(MTIME)
 
-    def test_passing_metadata_explicitly_suppresses_the_file_read(self, wav_with_mtime):
-        # the on-disk chunk says 2020 but the caller-supplied dict has priority
+    def test_caller_metadata_takes_priority_over_the_embedded_chunk(self, wav_with_mtime):
         path = wav_with_mtime()
         am.save_audio_metadata(path, {"creation_date": "2020-01-01"})
-        import os
-
         os.utime(path, (MTIME, MTIME))
 
         assert am.resolve_audio_creation_datetime(path, {"creation_date": "2024-01-02"}) == \
@@ -869,8 +860,6 @@ class TestResolveAudioCreationDatetime:
         assert am.resolve_audio_creation_datetime(path) == datetime.fromtimestamp(MTIME)
 
     def test_non_riff_file_degrades_to_mtime(self, tmp_path, monkeypatch):
-        import os
-
         install_no_mutagen(monkeypatch)
         path = tmp_path / "fake.wav"
         path.write_bytes(b"this is not audio")
@@ -879,8 +868,6 @@ class TestResolveAudioCreationDatetime:
         assert am.resolve_audio_creation_datetime(str(path)) == datetime.fromtimestamp(MTIME)
 
     def test_unsupported_extension_degrades_to_mtime(self, tmp_path, monkeypatch):
-        import os
-
         install_no_mutagen(monkeypatch)
         path = tmp_path / "clip.ogg"
         path.write_bytes(b"OggS")
@@ -895,8 +882,6 @@ class TestResolveAudioCreationDatetime:
             am.resolve_audio_creation_datetime(str(tmp_path / "gone.wav"))
 
     def test_native_tags_are_tried_before_the_mtime(self, tmp_path, monkeypatch):
-        import os
-
         tags = {"ICRD": ["2022-02-02"]}
         install_fake_mutagen(monkeypatch,
                              file_factory=lambda path, easy=False: types.SimpleNamespace(tags=tags))
@@ -919,8 +904,6 @@ class TestResolveAudioCreationDatetime:
 
 class TestFileCreationDatetime:
     def test_uses_the_modification_time(self, tmp_path):
-        import os
-
         path = tmp_path / "any.bin"
         path.write_bytes(b"x")
         os.utime(path, (123456789, 987654321))  # (atime, mtime) -- mtime is the one used
