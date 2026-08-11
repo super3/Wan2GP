@@ -596,9 +596,23 @@ class TestTokenEditing:
         assert tokens(lm._strip_bars_outside_comments("1|2")) == ["1", "2"]
         assert tokens(lm._strip_bars_outside_comments("1|2\n3|4")) == ["1", "2", "3", "4"]
 
-    def test_stripping_bars_never_alters_a_multiplier_value(self):
-        for text in ("1|2", "0.5|0.25|0.125", "1 | 2", "1|2\n3|4", "10|20"):
-            assert tokens(lm._strip_bars_outside_comments(text)) == text.replace("|", " ").split()
+    @pytest.mark.parametrize(
+        "text, expected",
+        [
+            ("1|2", ["1", "2"]),
+            ("0.5|0.25|0.125", ["0.5", "0.25", "0.125"]),
+            ("1 | 2", ["1", "2"]),
+            ("1|2\n3|4", ["1", "2", "3", "4"]),
+            ("10|20", ["10", "20"]),
+            # A bar inside a comment is not a separator and must not split anything.
+            ("1|2 # a|b", ["1", "2"]),
+        ],
+    )
+    def test_stripping_bars_never_alters_a_multiplier_value(self, text, expected):
+        # Expectations are written out literally rather than derived from the input:
+        # computing them as `text.replace("|", " ").split()` would just re-implement the
+        # function under test and assert it against itself.
+        assert tokens(lm._strip_bars_outside_comments(text)) == expected
 
     def test_replace_tokens_by_index(self):
         assert lm._replace_tokens("1 2 3", {0: "9", 2: "7"}) == "9 2 7"
