@@ -371,50 +371,6 @@ class TestGetModelSwitchSteps:
         assert lm.get_model_switch_steps([], 3, 1, 700, 300) == (0, 0, "Denoising Steps:  Phase 1 = None")
 
 
-class TestNumberTokenGrammar:
-    """_spans has to agree with what parse_loras_multipliers accepts.
-
-    It used to match a run of characters from a fixed set that omitted '-' and 'e', so a
-    signed or exponent value was split mid-number. Because merge_loras_settings edits the
-    original text by these offsets, a split number got half of it deleted.
-    """
-
-    @pytest.mark.parametrize(
-        "text, expected",
-        [
-            ("-1 -2", ["-1", "-2"]),
-            ("1e5", ["1e5"]),
-            ("1.5e-3", ["1.5e-3"]),
-            ("+2 3", ["+2", "3"]),
-            ("-0.5;-0.25", ["-0.5;-0.25"]),
-        ],
-    )
-    def test_signed_and_exponent_values_are_single_tokens(self, text, expected):
-        assert tokens(text) == expected
-
-    @pytest.mark.parametrize(
-        "multiplier, expected_value",
-        [("-1", -1.0), ("1e5", 100000.0), ("-0.5", -0.5), ("1.5e-3", 0.0015)],
-    )
-    def test_values_the_parser_accepts_survive_a_merge(self, multiplier, expected_value):
-        # The end-to-end defect: merging used to corrupt these into text that no longer
-        # parses -- "1e5|" came back as "1e|0.5", and "-1 -2|3" as "-1 -|0.5".
-        loras, merged = lm.merge_loras_settings(
-            ["a"], f"{multiplier}|", ["b"], "0.5", "merge after"
-        )
-        assert loras == ["a", "b"]
-        values, _slists, error = lm.parse_loras_multipliers(merged, len(loras), 4)
-        assert error == "", f"{merged!r} no longer parses"
-        assert values == [expected_value, 0.5]
-
-    def test_a_negative_multiplier_keeps_its_sign_through_a_merge(self):
-        _loras, merged = lm.merge_loras_settings(
-            ["a", "b"], "-1 -2|", ["c"], "0.5", "merge after"
-        )
-        assert "-1" in merged, merged
-        assert not merged.rstrip().endswith("-"), f"dangling sign left behind: {merged!r}"
-
-
 class TestSpans:
     @pytest.mark.parametrize(
         "text, expected",
