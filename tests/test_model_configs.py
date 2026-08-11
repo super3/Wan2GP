@@ -23,13 +23,19 @@ Covered here:
 * ``URLs``/``URLs2``/``text_encoder_URLs``/``preload_URLs``/``loras``/``modules``
   hold either downloadable ``https://`` entries or a reference to another model
   definition, and those references resolve and terminate;
+* no definition declares a property that no python source ever reads -- the typo that
+  costs nothing at startup and simply never takes effect;
 * ``plugins.json`` and ``setup_config.json`` parse and cross-reference correctly.
 
 These are pure data checks: no project module is imported and **no network request is
 made** -- URLs are inspected as text only. The architecture whitelist, the family
 whitelist, the plugin type whitelist and the GPU profile keys are recovered by parsing
 the relevant sources with ``ast`` rather than importing them, since importing a handler
-or ``wgp.py`` would pull in torch.
+or ``wgp.py`` would pull in torch. Where a whitelist is not enough and real behaviour is
+needed -- the plugin id and plugin type normalisers -- ``_load_functions`` lifts those
+function definitions out of the parsed tree and executes them alone, so the assertion
+runs the shipped code instead of a paraphrase of it while the module (which imports
+gradio) still never loads.
 """
 
 from __future__ import annotations
@@ -51,10 +57,15 @@ def _parse(path: Path) -> ast.Module:
 
 
 def _module_level_constants(tree: ast.Module) -> dict[str, object]:
-    """Literal-valued assignments in a module, used to resolve names in a return."""
+    """Literal-valued assignments in a module, used to resolve names in a return.
+
+    Only ``tree.body`` is scanned, not ``ast.walk(tree)``: a name bound inside some
+    unrelated function is not a module constant, and folding those in would quietly
+    widen every whitelist recovered through this helper.
+    """
 
     constants: dict[str, object] = {}
-    for node in ast.walk(tree):
+    for node in tree.body:
         if not isinstance(node, ast.Assign):
             continue
         try:
@@ -148,6 +159,39 @@ def _returned_string_constants(tree: ast.Module, function_name: str) -> set[str]
     return found
 
 
+def _load_functions(path: Path, names, extra_globals: dict | None = None) -> dict:
+    """Execute a few named top-level functions of a module we are not allowed to import.
+
+    ``shared/utils/plugins.py`` imports gradio, git and requests at module level, so it
+    cannot be imported from this suite. Paraphrasing its logic in the test instead would
+    be worthless -- a hand-rolled copy only ever agrees with itself, and the copy this
+    replaces already disagreed with the original on ``git@github.com:`` URLs and on
+    GitHub URLs with no repository segment. So lift the real function bodies out of the
+    parsed tree and execute those definitions on their own.
+
+    ``from __future__ import annotations`` is prepended so the type hints are never
+    evaluated and ``typing`` does not have to be supplied; anything else the functions
+    close over is passed in through ``extra_globals``.
+    """
+
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    wanted = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in set(names)]
+    missing = set(names) - {node.name for node in wanted}
+    assert not missing, f"{path.name} no longer defines {sorted(missing)}"
+
+    module = ast.Module(
+        body=[
+            ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0),
+            ast.Import(names=[ast.alias(name="re")]),
+            *wanted,
+        ],
+        type_ignores=[],
+    )
+    namespace: dict = dict(extra_globals or {})
+    exec(compile(ast.fix_missing_locations(module), str(path), "exec"), namespace)  # noqa: S102
+    return namespace
+
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -211,6 +255,43 @@ def plugin_catalog(repo_root: Path) -> list:
     return json.loads((repo_root / "plugins.json").read_text(encoding="utf-8"))
 
 
+@pytest.fixture(scope="session")
+def plugin_helpers(repo_root: Path) -> dict:
+    """The real plugin id/type helpers, executed without importing the module."""
+
+    path = repo_root / "shared" / "utils" / "plugins.py"
+    choices = _module_level_constants(_parse(path)).get("PLUGIN_TYPE_CHOICES")
+    assert choices, "could not recover PLUGIN_TYPE_CHOICES from shared/utils/plugins.py"
+    namespace = _load_functions(
+        path,
+        ["_split_github_repo", "normalize_plugin_url", "plugin_id_from_url", "normalize_plugin_types"],
+        {"PLUGIN_TYPE_CHOICES": choices},
+    )
+    namespace["PLUGIN_TYPE_CHOICES"] = choices
+    return namespace
+
+
+@pytest.fixture(scope="session")
+def source_string_literals(repo_root: Path) -> set[str]:
+    """Every identifier-shaped quoted literal in the project's python sources.
+
+    A model definition key is only ever reachable through a literal lookup
+    (``model_def.get("architecture")``, ``config['components']['python']``), so a key
+    that appears nowhere in this set is read by nobody.
+    """
+
+    skip = {".git", "__pycache__", "tests", "node_modules"}
+    chunks = []
+    for path in sorted(repo_root.rglob("*.py")):
+        if skip.intersection(path.relative_to(repo_root).parts):
+            continue
+        chunks.append(path.read_text(encoding="utf-8", errors="ignore"))
+    assert len(chunks) > 100, "found almost no python sources -- the walk is broken"
+    literals = set(re.findall(r"""['"]([A-Za-z_][A-Za-z0-9_]*)['"]""", "\n".join(chunks)))
+    assert "architecture" in literals, "the literal scan missed a key known to be read"
+    return literals
+
+
 # ---------------------------------------------------------------------------
 # Shape helpers for the model definitions
 # ---------------------------------------------------------------------------
@@ -229,15 +310,37 @@ def _url_props(model: dict):
             yield key, value
 
 
-def _flatten_urls(value):
-    """Yield every ``https://`` entry reachable from a property value."""
+# get_model_recursive_prop() resolves the string form of a property as the name of
+# another model definition, whatever the property is. "loras_multipliers" takes that
+# form too, and a dangling name there raises `Unknown model type` at download time
+# exactly like a dangling "loras".
+def _reference_props(model: dict):
+    """Yield the (key, value) pairs of every property whose string form is a reference."""
 
-    stack = [value]
+    yield from _url_props(model)
+    if "loras_multipliers" in model:
+        yield "loras_multipliers", model["loras_multipliers"]
+
+
+def _url_entries(value):
+    """Yield every string entry held *inside* a download list.
+
+    The top-level string form of a URL property is a reference to another model
+    definition rather than a URL, so it is deliberately not yielded here; it is checked
+    by the reference tests instead. Nested lists and dict values are descended into so
+    an entry cannot dodge the scheme check by hiding one level down.
+    """
+
+    if not isinstance(value, list):
+        return
+    stack = list(value)
     while stack:
         current = stack.pop()
         if isinstance(current, list):
             stack.extend(current)
-        elif isinstance(current, str) and current.startswith("https://"):
+        elif isinstance(current, dict):
+            stack.extend(current.values())
+        elif isinstance(current, str):
             yield current
 
 
@@ -326,6 +429,65 @@ class TestDefaultsParse:
             by_lowercase.setdefault(path.stem.lower(), []).append(path.name)
         clashes = {stem: names for stem, names in by_lowercase.items() if len(names) > 1}
         assert not clashes, f"model definition filenames differing only in case: {clashes}"
+
+
+class TestNoDeadProperties:
+    """A misspelled property name is the quietest failure mode this directory has.
+
+    Nothing validates the schema at load time: ``refresh_model_defs`` keeps whatever
+    keys the file happens to carry, so an unrecognised one is not rejected, it is simply
+    never read, and the setting its author wrote does nothing at all. Every property
+    that *is* honoured is dereferenced through a string literal somewhere in the python
+    sources (``model_def.get("architecture")``, ``config['components']['python']``), so
+    a key that occurs in no source file is dead weight.
+
+    The four entries below are defects this check found in the repository as it stands.
+    They are pinned rather than ignored so the rest of the directory is still guarded;
+    delete an entry once the JSON is fixed:
+
+    * ``model.profile_dirs`` (3 files) -- the property read at wgp.py:8735 is
+      ``profiles_dir``. All three declare ``[""]``, i.e. "offer no accelerator
+      profiles", and instead silently inherit whatever their handler declares.
+    * ``model.settings_dir`` (9 files) -- read nowhere, and `git log -S` finds no commit
+      where it ever was; the live properties are ``profiles_dir`` and
+      ``preset_profiles_dir``.
+    * ``model.xresolutions`` (qwen_image_20B.json) -- a well-formed ``resolutions`` list
+      disabled by prefixing an "x". Probably deliberate, but it is indistinguishable
+      from a typo without this note.
+    * top-level ``sampler_solver`` (2 files) -- the UI setting is ``sample_solver``,
+      which 17 other files spell correctly.
+    """
+
+    KNOWN_DEAD_PROPERTIES = frozenset(
+        {
+            ("model", "profile_dirs"),
+            ("model", "settings_dir"),
+            ("model", "xresolutions"),
+            ("settings", "sampler_solver"),
+        }
+    )
+
+    def test_every_declared_property_is_read_somewhere(
+        self, default_model_configs, source_string_literals
+    ):
+        dead: dict[str, list[str]] = {}
+        for path, cfg in default_model_configs:
+            scopes = (
+                ("model", cfg["model"]),
+                ("settings", {key: value for key, value in cfg.items() if key != "model"}),
+            )
+            for scope, block in scopes:
+                for key in block:
+                    if key in source_string_literals:
+                        continue
+                    if (scope, key) in self.KNOWN_DEAD_PROPERTIES:
+                        continue
+                    dead.setdefault(f"{scope}.{key}", []).append(path.name)
+        assert not dead, (
+            "properties no python source ever reads -- a typo here does nothing at all "
+            "rather than failing:\n"
+            + "\n".join(f"  {prop}: {files}" for prop, files in sorted(dead.items()))
+        )
 
 
 class TestModelMetadata:
@@ -457,11 +619,13 @@ class TestModelMetadata:
                 bad.append(f"{path.name}: resolutions is {choices!r}")
                 continue
             for choice in choices:
+                # is_resolution_value() normalises before matching, so mirror it exactly
+                # rather than being gratuitously stricter than the code under test.
                 if (
                     not isinstance(choice, list)
                     or len(choice) != 2
                     or not all(isinstance(part, str) for part in choice)
-                    or not re.fullmatch(r"\d+x\d+", choice[1])
+                    or not re.fullmatch(r"\d+x\d+", choice[1].strip().lower())
                 ):
                     bad.append(f"{path.name}: {choice!r}")
         assert not bad, f"invalid model 'resolutions' entries: {bad}"
@@ -489,6 +653,10 @@ class TestModelUrls:
     """
 
     def test_every_model_declares_urls(self, default_model_configs):
+        # Not enforced by the loader -- get_model_filename() just returns "" -- but a
+        # bundled definition with no transformer weights has nothing to generate with,
+        # and every one of the 212 shipped files does declare them. A convention check,
+        # so a new file that forgets the key is caught here rather than at download time.
         missing = [p.name for p, cfg in default_model_configs if "URLs" not in cfg["model"]]
         assert not missing, f"model definitions with no URLs key: {missing}"
 
@@ -500,14 +668,21 @@ class TestModelUrls:
                     bad.append(f"{path.name}:{key} is {type(value).__name__}")
         assert not bad, f"URL entries must be a list or a string: {bad}"
 
-    def test_url_lists_hold_supported_entry_types(self, default_model_configs):
+    def test_url_lists_hold_only_strings(self, default_model_configs):
+        """Every consumer of these lists treats an entry as a string.
+
+        get_model_filename() does ``os.path.basename(name).lower()`` over the choices
+        and download_models() does ``url.startswith("http")`` on each one, so a list or
+        a dict in there is a TypeError, not a richer entry format.
+        """
+
         bad = []
         for path, cfg in default_model_configs:
             for key, value in _url_props(cfg["model"]):
                 if not isinstance(value, list):
                     continue
                 for entry in value:
-                    if not isinstance(entry, (str, list, dict)):
+                    if not isinstance(entry, str):
                         bad.append(f"{path.name}:{key} holds a {type(entry).__name__}")
         assert not bad, f"malformed URL lists: {bad}"
 
@@ -531,10 +706,8 @@ class TestModelUrls:
         bad = []
         for path, cfg in default_model_configs:
             for key, value in _url_props(cfg["model"]):
-                if not isinstance(value, list):
-                    continue
-                for entry in value:
-                    if isinstance(entry, str) and not entry.startswith("https://"):
+                for entry in _url_entries(value):
+                    if not entry.startswith("https://"):
                         bad.append(f"{path.name}:{key} -> {entry!r}")
         assert not bad, f"URLs that are not absolute https:// links: {bad}"
 
@@ -548,7 +721,7 @@ class TestModelUrls:
         bad = []
         for path, cfg in default_model_configs:
             for key, value in _url_props(cfg["model"]):
-                for url in _flatten_urls(value):
+                for url in _url_entries(value):
                     # download_file() drops everything after the '|' before resolving.
                     head = url.split("|")[0]
                     filename = head.rsplit("/", 1)[-1]
@@ -570,7 +743,7 @@ class TestModelUrls:
         bad = []
         for path, cfg in default_model_configs:
             for key, value in _url_props(cfg["model"]):
-                for url in _flatten_urls(value):
+                for url in _url_entries(value):
                     parts = url.split("|")
                     if len(parts) == 1:
                         continue
@@ -601,41 +774,48 @@ class TestModelUrls:
         for path, cfg in default_model_configs:
             for key, value in _url_props(cfg["model"]):
                 seen = set()
-                for url in _flatten_urls(value):
+                for url in _url_entries(value):
                     if url in seen and (path.name, key, url) not in _KNOWN_DUPLICATE_URLS:
                         duplicates.append(f"{path.name}:{key} -> {url}")
                     seen.add(url)
         assert not duplicates, f"URLs listed twice in the same property: {duplicates}"
 
     def test_model_references_point_at_an_existing_definition(self, default_model_configs):
+        # A string prop naming nothing is not silent: get_model_recursive_prop() ends up
+        # in its `raise Exception(f"Unknown model type '{model_type}'")` branch.
         known = {path.stem for path, _ in default_model_configs}
         dangling = []
         for path, cfg in default_model_configs:
-            for key, value in _url_props(cfg["model"]):
+            for key, value in _reference_props(cfg["model"]):
                 if isinstance(value, str) and value not in known:
                     dangling.append(f"{path.name}:{key} -> {value!r}")
         assert not dangling, (
-            f"URL references to model definitions that do not exist: {dangling}"
+            f"references to model definitions that do not exist: {dangling}"
         )
 
     def test_model_references_terminate(self, default_model_configs):
-        """get_model_recursive_prop() raises past a depth of 10; cycles never resolve."""
+        """Cycles never resolve, and get_model_recursive_prop() has a depth guard.
+
+        It recurses with ``stack + [prop_value]`` and raises once ``len(stack) > 10``,
+        so the twelfth hop is the one that blows up -- hence ``> 11`` below rather than
+        the ``> 10`` the guard's constant suggests.
+        """
 
         by_stem = {path.stem: cfg["model"] for path, cfg in default_model_configs}
         problems = []
         for path, cfg in default_model_configs:
-            for key, value in _url_props(cfg["model"]):
+            for key, value in _reference_props(cfg["model"]):
                 current, seen = value, [path.stem]
                 while isinstance(current, str):
                     if current in seen:
                         problems.append(f"{path.name}:{key} cycles through {seen + [current]}")
                         break
                     seen.append(current)
-                    if len(seen) > 10:
+                    if len(seen) - 1 > 11:
                         problems.append(f"{path.name}:{key} exceeds the depth guard: {seen}")
                         break
                     current = by_stem.get(current, {}).get(key)
-        assert not problems, f"unresolvable URL references: {problems}"
+        assert not problems, f"unresolvable references: {problems}"
 
     def test_lora_multipliers_line_up_with_the_lora_list(self, default_model_configs):
         """get_transformer_loras() pads with 1.0 and then truncates to len(loras).
@@ -749,50 +929,45 @@ class TestPluginCatalog:
         names = [p["name"] for p in plugin_catalog]
         assert len(names) == len(set(names)), f"duplicate plugin names in plugins.json: {names}"
 
-    def test_plugin_ids_are_unique(self, plugin_catalog):
+    def test_plugin_ids_are_unique(self, plugin_helpers, plugin_catalog):
         """The catalogue is keyed by plugin_id_from_url(url) -- the GitHub repo name.
 
         Two entries resolving to the same id silently overwrite one another in
-        _merge_catalog_entries().
+        _merge_catalog_entries(). The id is computed by the shipped function, not by a
+        paraphrase of it, so the test tracks the real key.
         """
 
-        def plugin_id(url: str) -> str:
-            cleaned = url.split("?", 1)[0].split("#", 1)[0].rstrip("/")
-            marker = "github.com/"
-            index = cleaned.lower().find(marker)
-            if index < 0:
-                return cleaned.rsplit("/", 1)[-1]
-            parts = [part for part in cleaned[index + len(marker):].split("/") if part]
-            repo = parts[1] if len(parts) > 1 else ""
-            return repo[:-4] if repo.endswith(".git") else repo
-
+        plugin_id = plugin_helpers["plugin_id_from_url"]
         ids: dict[str, list[str]] = {}
         for plugin in plugin_catalog:
             ids.setdefault(plugin_id(plugin["url"]), []).append(plugin["name"])
+        blank = ids.pop("", None)
+        assert not blank, f"plugins.json entries whose url yields no plugin id: {blank}"
         clashes = {i: names for i, names in ids.items() if len(names) > 1}
         assert not clashes, f"plugins.json entries sharing a plugin id: {clashes}"
 
-    def test_plugin_types_are_recognised(self, repo_root, plugin_catalog):
+    def test_plugin_types_are_recognised(self, plugin_helpers, plugin_catalog):
         """normalize_plugin_types() drops unknown types and falls back to ["app"].
 
-        A typo here silently reclassifies the plugin, so the whitelist is read straight
-        out of shared/utils/plugins.py rather than duplicated.
+        A typo here silently reclassifies the plugin. Running the real normaliser makes
+        the check exact: whatever it discards is a value the UI will never see.
         """
 
-        constants = _module_level_constants(_parse(repo_root / "shared" / "utils" / "plugins.py"))
-        choices = constants.get("PLUGIN_TYPE_CHOICES")
-        assert choices, "could not recover PLUGIN_TYPE_CHOICES from shared/utils/plugins.py"
+        normalize = plugin_helpers["normalize_plugin_types"]
+        choices = plugin_helpers["PLUGIN_TYPE_CHOICES"]
 
         bad = []
         for plugin in plugin_catalog:
             declared = plugin.get("type")
-            declared = [declared] if isinstance(declared, str) else declared or []
-            if not declared:
+            raw = [declared] if isinstance(declared, str) else list(declared or [])
+            if not raw:
                 bad.append(f"{plugin.get('name')!r}: no type")
-            for value in declared:
-                if not isinstance(value, str) or value.strip().lower() not in choices:
-                    bad.append(f"{plugin.get('name')!r}: {value!r}")
-        assert not bad, f"unknown plugin types (allowed: {sorted(choices)}): {bad}"
+                continue
+            kept = normalize(declared)
+            dropped = [v for v in raw if not isinstance(v, str) or v.strip().lower() not in kept]
+            if dropped:
+                bad.append(f"{plugin.get('name')!r}: {dropped} dropped, kept {kept}")
+        assert not bad, f"plugin types the normaliser discards (allowed: {sorted(choices)}): {bad}"
 
 
 class TestSetupConfig:
@@ -878,9 +1053,13 @@ class TestSetupConfig:
         assert not missing, f"gpu_profiles missing entries returned by get_profile_key: {missing}"
 
     def test_profiles_declare_every_component_they_are_asked_for(self, setup_config):
-        # do_install_interactive() reads base['python'], base['torch'], base['triton'],
-        # base['sage'] and base['flash'] with [] (sparge and kernels use .get).
-        required = ("python", "torch", "triton", "sage", "flash")
+        # Read with [] rather than .get, so a profile missing one of these is a KeyError
+        # part way through an install: do_install_interactive() takes base['python'],
+        # base['torch'], base['triton'], base['sage'], base['flash'] and base['kernels']
+        # (setup.py:453-460), do_install_auto() takes p['kernels'] (setup.py:498) and
+        # do_upgrade() takes rec['kernels'] (setup.py:855). Only 'sparge' is optional --
+        # every caller reaches it through .get.
+        required = ("python", "torch", "triton", "sage", "flash", "kernels")
         bad = []
         for key, profile in setup_config["gpu_profiles"].items():
             if not isinstance(profile, dict):
