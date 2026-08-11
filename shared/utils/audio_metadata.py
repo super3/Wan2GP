@@ -21,7 +21,8 @@ def write_wav_text_chunk(in_path: str, out_path: str, text: str,
       * Pads the chunk to even length per RIFF rules.
       * Supports standard little-endian RIFF/WAVE (not RF64 or RIFX).
     """
-    data = open(in_path, 'rb').read()
+    with open(in_path, 'rb') as f:
+        data = f.read()
     if len(data) < 12 or data[:4] not in (b'RIFF',) or data[8:12] != b'WAVE':
         raise ValueError("Not a standard little-endian RIFF/WAVE file (RF64/RIFX not supported).")
     if len(fourcc) != 4 or not all(32 <= b <= 126 for b in fourcc):
@@ -78,7 +79,8 @@ def read_wav_text_chunk(path: str, fourcc: bytes = b'json', encoding: str = 'utf
     - fourcc:   4-byte chunk ID to look for (default b'json')
     - encoding: decoding used for the stored bytes (default 'utf-8')
     """
-    data = open(path, 'rb').read()
+    with open(path, 'rb') as f:
+        data = f.read()
     if len(data) < 12 or data[:4] not in (b'RIFF',) or data[8:12] != b'WAVE':
         raise ValueError("Not a standard little-endian RIFF/WAVE file (RF64/RIFX not supported).")
     if len(fourcc) != 4:

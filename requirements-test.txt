@@ -1,0 +1,6 @@
+# Dependencies for the test suite only.
+#
+# The suite is intentionally kept free of the heavy runtime stack (torch,
+# diffusers, gradio, onnxruntime, ...) so that it installs in seconds and runs on
+# CPU-only CI runners.  Anything added here must stay lightweight and pure-python.
+pytest>=8.0

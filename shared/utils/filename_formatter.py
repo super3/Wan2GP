@@ -122,13 +122,19 @@ class FilenameFormatter:
         Returns:
             strftime format string like "%Y-%m-%d" or "%Y/%m/%d_%H-%M-%S"
         """
-        result = fmt
-
-        # Replace tokens with strftime codes (longer tokens first to avoid partial matches)
-        for token, strftime_code in self.DATE_TOKENS:
-            result = result.replace(token, strftime_code)
-
-        return result
+        # Single pass, so a strftime code emitted for one token can never be re-matched
+        # by a later one. Replacing sequentially meant "MM" became "%m" and the later
+        # "mm" token then matched the "m" just written, compiling "MMmm" to "%%Mm",
+        # which strftime renders as the literal text "%Mm" -- neither the month nor
+        # the minute survives. "YYYY" followed by "YY" broke the same way
+        # ("YYYYYY" -> "%%yY" -> the literal "%yY"); between them the two families
+        # account for every format whose output this change alters.
+        #
+        # DATE_TOKENS is ordered longest-first (YYYY before YY) and regex alternation is
+        # first-match-wins, so that precedence is preserved.
+        lookup = dict(self.DATE_TOKENS)
+        pattern = '|'.join(re.escape(token) for token, _ in self.DATE_TOKENS)
+        return re.sub(pattern, lambda match: lookup[match.group(0)], fmt)
 
     def _is_valid_date_format(self, fmt: str) -> bool:
         """
