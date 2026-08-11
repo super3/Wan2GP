@@ -52,9 +52,49 @@ This is where user-visible bugs are both most likely and cheapest to catch.
 | `tests/test_audio_metadata.py` | `shared/utils/audio_metadata.py` | Binary metadata chunk round-tripping, truncated and non-audio files |
 | `tests/test_model_configs.py` | `defaults/*.json`, `plugins.json`, `setup_config.json` | Every bundled model definition parses and has the shape the loader expects |
 
+The suite is 1453 tests and runs in under two seconds.
+
 `tests/test_model_configs.py` is worth calling out: with ~212 model definitions in
 `defaults/`, a single typo breaks model discovery at startup for everyone. It is a
-data-integrity check rather than a unit test, and it is cheap insurance.
+data-integrity check rather than a unit test, and it is cheap insurance. Its headline
+assertion is that every `architecture` is backed by a handler — a mistyped one does not
+crash, `init_model_def` sets `visible = False` and the model silently disappears from
+the UI. The valid set is recovered by parsing each module in `wgp.py`'s
+`family_handlers` with `ast`, because importing a handler would pull in torch.
+
+## Behaviour these tests pin, that may be worth fixing
+
+Writing the suite surfaced a number of pre-existing defects. **None of them are fixed
+here** — this is a test-only change, so each is pinned as current behaviour with a
+comment, and the tests are green. They are listed so a maintainer can decide.
+
+The one that looks most serious:
+
+- `shared/utils/loras_mutipliers.py:254` `_strip_bars_outside_comments` removes phase
+  bars without inserting a separator, so adjacent multipliers fuse. Reached from
+  `merge_loras_settings`, `_select_new_side(["x","y","z"], "1|2|3", ...)` yields the
+  multiplier string `"23"` rather than `"2 3"` — silently applying a strength of 23.
+
+Others worth a look:
+
+- `shared/tools/sha256_verify.py:44` a `chunk_size` of 0 makes `f.read(0)` return
+  immediately, so `compute_sha256` returns the hash of the empty string for *any* file.
+- `shared/utils/loras_mutipliers.py:12` `preparse_loras_multipliers` splits on `" "`
+  rather than whitespace, so any double space produces empty tokens and a parse error.
+- `shared/utils/prompt_parser.py:68` `serialize_prompt_units` does not guard
+  `multi_prompts_gen_type` with `or ""` the way `split_prompt_units` does, so `None`
+  raises `TypeError`.
+- `shared/utils/filename_formatter.py:115` date tokens are substituted sequentially over
+  the already-substituted string, so a strftime code emitted by one token can be
+  re-matched by a later one.
+- `shared/utils/filename_formatter.py:205` `format()` applies no overall length cap, so a
+  long `{prompt}` produces a filename that fails with `ENAMETOOLONG`.
+- `shared/utils/audio_metadata.py:81` `open(path, 'rb').read()` never closes the handle
+  (visible as `ResourceWarning` when the suite runs).
+- `shared/resolutions.py:137` the `_custom_resolutions` cache is keyed on nothing, so the
+  `resolution_file` argument is ignored on every call after the first.
+- `shared/match_archi.py:33` `eval_condition` uses `re.match` rather than `fullmatch`, so
+  `">=89garbage"` parses as `">=89"` while `">= 89"` fails.
 
 ## The `import_pure_module` helper
 
