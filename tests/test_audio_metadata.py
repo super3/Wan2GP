@@ -189,15 +189,37 @@ class TestWavTextChunkRoundTrip:
         # ...and the reader still only ever sees the first one
         assert am.read_wav_text_chunk(path) == "X"
 
-    def test_odd_length_payload_is_padded_so_later_chunks_stay_aligned(self, tmp_path):
-        path = write_wav(tmp_path, chunks=((b"json", b"odd"), (b"data", DATA_PAYLOAD)))
+    def test_odd_length_payload_is_padded_by_the_writer(self, tmp_path):
+        path = write_wav(tmp_path, chunks=((b"data", DATA_PAYLOAD),))
+        am.write_wav_text_chunk(path, path, "odd")  # 3 bytes -> one pad byte
         raw = (tmp_path / "sound.wav").read_bytes()
 
-        assert raw[12:12 + 8 + 4] == b"json" + struct.pack("<I", 3) + b"odd\x00"
+        # the declared size stays 3: the pad byte sits outside the payload
+        assert raw.endswith(b"json" + struct.pack("<I", 3) + b"odd\x00")
+        assert len(raw) % 2 == 0
         assert am.read_wav_text_chunk(path) == "odd"
-        # writing again re-emits the pad byte and keeps the file even-sized
+
+        # rewriting with another odd payload keeps both properties
         am.write_wav_text_chunk(path, path, "12345")
-        assert len((tmp_path / "sound.wav").read_bytes()) % 2 == 0
+        raw = (tmp_path / "sound.wav").read_bytes()
+        assert raw.endswith(b"json" + struct.pack("<I", 5) + b"12345\x00")
+        assert len(raw) % 2 == 0
+        assert parse_chunks(raw) == [(b"data", DATA_PAYLOAD), (b"json", b"12345")]
+
+    def test_reader_skips_the_pad_byte_of_an_earlier_odd_chunk(self, tmp_path):
+        # the trailing chunk is only reachable if the walker adds the pad byte
+        # of the odd-sized chunk in front of it to its cursor
+        path = write_wav(tmp_path, chunks=((b"junk", b"\xaa\xbb\xcc"), (b"json", b"payload")))
+
+        assert am.read_wav_text_chunk(path) == "payload"
+
+    def test_writer_skips_the_pad_byte_of_an_earlier_odd_chunk(self, tmp_path):
+        path = write_wav(tmp_path, chunks=((b"junk", b"\xaa\xbb\xcc"), (b"json", b"payload")))
+        am.write_wav_text_chunk(path, path, "new")
+
+        assert parse_chunks((tmp_path / "sound.wav").read_bytes()) == [
+            (b"junk", b"\xaa\xbb\xcc"), (b"json", b"new"),
+        ]
 
     def test_odd_length_source_chunk_survives_a_rewrite(self, tmp_path):
         path = write_wav(tmp_path, chunks=((b"data", b"\xaa\xbb\xcc"),))
@@ -339,9 +361,15 @@ class TestWavTextChunkErrors:
             am.read_wav_text_chunk(path, fourcc=fourcc)
 
     def test_read_accepts_non_printable_fourcc_unlike_write(self, tmp_path):
-        # asymmetric on purpose: only the writer enforces printability
-        path = write_wav(tmp_path)
-        assert am.read_wav_text_chunk(path, fourcc=b"\x00\x01\x02\x03") is None
+        # asymmetric on purpose: only the writer enforces printability, so a
+        # chunk the writer would refuse to create is still readable
+        fourcc = b"\x00\x01\x02\x03"
+        path = write_wav(tmp_path, chunks=((b"data", DATA_PAYLOAD), (fourcc, b"hidden")))
+
+        assert am.read_wav_text_chunk(path, fourcc=fourcc) == "hidden"
+        assert am.read_wav_text_chunk(path) is None  # the default b'json' is absent
+        with pytest.raises(ValueError, match="4 printable ASCII bytes"):
+            am.write_wav_text_chunk(path, path, "x", fourcc=fourcc)
 
     def test_header_check_runs_before_the_fourcc_check(self, tmp_path):
         path = tmp_path / "bad.wav"
@@ -402,6 +430,24 @@ class TestSaveReadAudioMetadata:
         am.save_audio_metadata(path, configs)
 
         assert am.read_audio_metadata(path) == configs
+
+    def test_none_is_stored_as_json_null(self, tmp_path):
+        # ``read_audio_metadata`` also returns None when nothing was written at
+        # all, so check the stored bytes rather than just the round-tripped value
+        path = write_wav(tmp_path)
+        am.save_audio_metadata(path, None)
+
+        assert dict(parse_chunks((tmp_path / "sound.wav").read_bytes()))[b"json"] == b"null"
+        assert am.read_audio_metadata(path) is None
+
+    def test_unserialisable_config_raises_before_the_file_is_touched(self, tmp_path):
+        # json.dumps runs first, so a datetime in the settings aborts the save
+        # instead of writing a half-baked chunk
+        path = write_wav(tmp_path)
+
+        with pytest.raises(TypeError):
+            am.save_audio_metadata(path, {"created_at": datetime(2024, 1, 2)})
+        assert (tmp_path / "sound.wav").read_bytes() == build_wav()
 
     def test_read_returns_none_when_no_metadata_chunk_present(self, tmp_path):
         assert am.read_audio_metadata(write_wav(tmp_path)) is None
@@ -558,6 +604,16 @@ class TestExtractCreationDatetimeFromMetadata:
         metadata = {"date": "2024-09-10", "extra_info": {"created_at": "2024-07-08"}}
         assert am.extract_creation_datetime_from_metadata(metadata) == datetime(2024, 7, 8)
 
+    def test_top_level_creation_keys_beat_extra_info_creation_keys(self):
+        # "creation_date" outranks "created_at" inside _CREATION_KEYS, so this only
+        # yields 2024-01-02 if the whole top-level pass runs before extra_info's
+        metadata = {"created_at": "2024-01-02", "extra_info": {"creation_date": "2000-01-01"}}
+        assert am.extract_creation_datetime_from_metadata(metadata) == datetime(2024, 1, 2)
+
+    def test_top_level_generic_keys_beat_extra_info_generic_keys(self):
+        metadata = {"date": "2024-01-02", "extra_info": {"date": "2000-01-01"}}
+        assert am.extract_creation_datetime_from_metadata(metadata) == datetime(2024, 1, 2)
+
     def test_non_dict_extra_info_is_ignored(self):
         metadata = {"extra_info": "2020-01-01", "date": "2024-01-02"}
         assert am.extract_creation_datetime_from_metadata(metadata) == datetime(2024, 1, 2)
@@ -566,9 +622,19 @@ class TestExtractCreationDatetimeFromMetadata:
     def test_generic_keys_matching_a_date_substring_are_used(self, key):
         assert am.extract_creation_datetime_from_metadata({key: "2024-01-02"}) == datetime(2024, 1, 2)
 
-    @pytest.mark.parametrize("key", list(am._DATE_KEY_EXCLUDE))
-    def test_excluded_keys_are_skipped(self, key):
-        assert am.extract_creation_datetime_from_metadata({key: "2024-01-02"}) is None
+    # Spelled out rather than read from ``am._DATE_KEY_EXCLUDE`` so that dropping
+    # an entry from the source fails a case instead of deleting it.  Each token is
+    # suffixed with "_date" so the key *would* match ``_DATE_KEY_PARTS``: three of
+    # the four ("pause_seconds", "duration_seconds", "video_length") contain no
+    # date word on their own, so a bare key would be skipped either way.
+    @pytest.mark.parametrize("token", [
+        "generation_time", "pause_seconds", "duration_seconds", "video_length",
+    ])
+    def test_excluded_tokens_beat_the_date_substring_match(self, token):
+        assert am.extract_creation_datetime_from_metadata({f"{token}_date": "2024-01-02"}) is None
+        # control: the very same key without the excluded token is honoured
+        assert am.extract_creation_datetime_from_metadata({"clip_date": "2024-01-02"}) == \
+            datetime(2024, 1, 2)
 
     def test_exclusion_is_a_substring_match(self):
         metadata = {"total_generation_time_str": "2024-01-02", "date": "2024-05-06"}
@@ -611,6 +677,11 @@ class TestIterTagValues:
 
     def test_sequences_are_flattened_recursively(self):
         assert list(am._iter_tag_values(["a", ["b", ("c",)]])) == ["a", "b", "c"]
+
+    def test_sets_are_flattened_too(self):
+        # single element so the yielded order cannot depend on set iteration
+        assert list(am._iter_tag_values({"a"})) == ["a"]
+        assert list(am._iter_tag_values([{"a"}])) == ["a"]
 
     def test_nested_none_contributes_nothing(self):
         assert list(am._iter_tag_values(["a", None, ["b"]])) == ["a", "b"]
@@ -662,6 +733,18 @@ class TestMp3TextTag:
         assert len(fake.store["/song.mp3"]) == 1
         assert am._read_mp3_text_tag("/song.mp3") == "second"
 
+    def test_write_purges_a_stale_frame_carrying_the_same_desc(self, monkeypatch):
+        # real mutagen files TXXX frames under the hash key "TXXX:<desc>", so
+        # ``add`` alone already overwrites the common case; the explicit purge
+        # loop is what guarantees no frame with this desc survives whatever key
+        # it happens to sit under
+        fake = install_fake_mutagen(monkeypatch)
+        fake.store["/song.mp3"] = {"TXXX:stale": fake.TXXX(desc="WanGP", text=["old"])}
+        am._write_mp3_text_tag("/song.mp3", "new")
+
+        assert list(fake.store["/song.mp3"]) == ["TXXX:WanGP"]
+        assert am._read_mp3_text_tag("/song.mp3") == "new"
+
     def test_other_frames_are_left_alone(self, monkeypatch):
         fake = install_fake_mutagen(monkeypatch)
         fake.store["/song.mp3"] = {
@@ -701,6 +784,21 @@ class TestMp3TextTag:
     def test_read_returns_none_when_the_frame_text_is_empty(self, monkeypatch):
         fake = install_fake_mutagen(monkeypatch)
         fake.store["/song.mp3"] = {"TXXX:WanGP": fake.TXXX(desc="WanGP", text=[])}
+
+        assert am._read_mp3_text_tag("/song.mp3") is None
+
+    def test_an_empty_txxx_falls_through_to_the_comm_frame(self, monkeypatch):
+        fake = install_fake_mutagen(monkeypatch)
+        fake.store["/song.mp3"] = {
+            "TXXX:WanGP": fake.TXXX(desc="WanGP", text=[]),
+            "COMM:WanGP": fake.COMM(desc="WanGP", text=["from comm"]),
+        }
+
+        assert am._read_mp3_text_tag("/song.mp3") == "from comm"
+
+    def test_an_empty_comm_reads_as_none_rather_than_raising(self, monkeypatch):
+        fake = install_fake_mutagen(monkeypatch)
+        fake.store["/song.mp3"] = {"COMM:WanGP": fake.COMM(desc="WanGP", text=[])}
 
         assert am._read_mp3_text_tag("/song.mp3") is None
 
@@ -853,6 +951,15 @@ class TestResolveAudioCreationDatetime:
 
         assert am.resolve_audio_creation_datetime(path, {"creation_date": "2024-01-02"}) == \
             datetime(2024, 1, 2)
+
+    def test_falsy_caller_metadata_still_suppresses_the_embedded_read(self, wav_with_mtime):
+        # the embedded read is gated on ``metadata is None``, not on truthiness,
+        # so an empty dict is taken at face value and the chunk is never consulted
+        path = wav_with_mtime()
+        am.save_audio_metadata(path, {"creation_date": "2020-01-01"})
+        os.utime(path, (MTIME, MTIME))  # the write refreshed mtime
+
+        assert am.resolve_audio_creation_datetime(path, {}) == datetime.fromtimestamp(MTIME)
 
     def test_corrupt_json_chunk_degrades_to_mtime(self, wav_with_mtime):
         path = wav_with_mtime(chunks=((b"json", b"{not json"),))
