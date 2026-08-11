@@ -582,25 +582,23 @@ class TestTokenEditing:
         assert lm._strip_bars_outside_comments(text) == expected
 
     def test_stripping_a_bar_keeps_adjacent_tokens_apart(self):
-        # The bar is a separator, so removing it leaves a space behind.  It used to be
-        # dropped with a bare `continue`, which fused the neighbours: "1|2" became the
-        # single multiplier twelve.  This now agrees with preparse_loras_multipliers,
-        # which tokenises via `.replace("|", " ")`.
+        # A bar separates two multipliers, so removing it leaves a space behind.  It
+        # used to be dropped with a bare `continue`, which fused the neighbours: "1|2"
+        # became the single multiplier twelve.  This now agrees with
+        # preparse_loras_multipliers, which tokenises via `.replace("|", " ")`.
         assert lm._strip_bars_outside_comments("1|2") == "1 2"
         assert len(lm._spans(lm._strip_bars_outside_comments("1|2"))) == 2
 
     def test_stripping_bars_keeps_the_count_however_they_were_spaced(self):
-        # The old fusion only showed up in the unspaced form, which is how it survived
-        # unnoticed; both spellings now yield the same tokens.
+        # The old fusion only showed up in the unspaced spelling, which is how it
+        # survived unnoticed; both forms now yield the same tokens.
         assert tokens(lm._strip_bars_outside_comments("1 | 2")) == ["1", "2"]
         assert tokens(lm._strip_bars_outside_comments("1|2")) == ["1", "2"]
+        assert tokens(lm._strip_bars_outside_comments("1|2\n3|4")) == ["1", "2", "3", "4"]
 
     def test_stripping_bars_never_alters_a_multiplier_value(self):
         for text in ("1|2", "0.5|0.25|0.125", "1 | 2", "1|2\n3|4", "10|20"):
             assert tokens(lm._strip_bars_outside_comments(text)) == text.replace("|", " ").split()
-        assert tokens(lm._strip_bars_outside_comments("1|2\n3|4")) == ["12", "34"]
-        # Worst case: the fused value is not even a plausible multiplier.
-        assert tokens(lm._strip_bars_outside_comments("0.5|0.25")) == ["0.50.25"]
 
     def test_replace_tokens_by_index(self):
         assert lm._replace_tokens("1 2 3", {0: "9", 2: "7"}) == "9 2 7"
@@ -660,16 +658,14 @@ class TestSelectNewSide:
     def test_splits_new_set_on_the_bar(self, loras, mult, mode, expected):
         assert lm._select_new_side(loras, mult, mode) == expected
 
-    def test_a_second_bar_fuses_the_tokens_after_it(self):
-        # BUG (pinned as-is, do NOT "fix" this expectation): only the first bar splits
-        # the two sides; _strip_bars_outside_comments then deletes the second one
-        # without leaving a separator, so "2|3" collapses into the single token "23" --
-        # a 23x LoRA strength.  Two loras are kept on the "after" side but only one
-        # multiplier is left to describe them.  See
-        # TestTokenEditing.test_stripping_a_bar_fuses_adjacent_tokens for the cause.
+    def test_a_second_bar_becomes_a_separator_rather_than_fusing(self):
+        # Only the first bar splits the two sides; _strip_bars_outside_comments reduces
+        # any further one to a separator.  It used to delete it outright, collapsing
+        # "2|3" into the single token "23" -- a 23x LoRA strength -- leaving two loras
+        # on the "after" side with only one multiplier to describe them.
         loras, mult = lm._select_new_side(["x", "y", "z"], "1|2|3", "merge after")
         assert loras == ["y", "z"]
-        assert tokens(mult) == ["23"]
+        assert tokens(mult) == ["2", "3"]
 
     def test_a_second_bar_is_harmless_on_the_side_that_precedes_it(self):
         # The "before" side stops at the first bar, so it never sees the second one.
@@ -763,15 +759,15 @@ class TestMergeLorasSettings:
             "0.5|",
         )
 
-    def test_a_second_bar_in_the_new_multipliers_fuses_them(self):
-        # BUG (pinned as-is, do NOT "fix" this expectation): the user-visible end of the
-        # _strip_bars_outside_comments defect.  Lora "y" is kept but its multiplier
-        # arrives as the fused token "23", so it silently gets a 23x strength instead of
-        # 2x and the trailing "3" is lost.  parse_loras_multipliers would have rejected
-        # "1|2|3" outright ("There can be only one '|' character"); merge_loras_settings
-        # accepts it and corrupts it instead.
+    def test_a_second_bar_in_the_new_multipliers_keeps_its_value(self):
+        # The user-visible end of the _strip_bars_outside_comments fix.  Lora "y" keeps
+        # the 2x it was given; this used to return "1|23", silently applying a 23x
+        # strength.  parse_loras_multipliers rejects "1|2|3" outright ("There can be
+        # only one '|' character") -- merge_loras_settings accepts it, and now no
+        # longer corrupts it.
         loras, mult = lm.merge_loras_settings(["a"], "1|", ["x", "y"], "1|2|3", "merge after")
-        assert (loras, mult) == (["a", "y"], "1|23")
+        assert (loras, mult) == (["a", "y"], "1|2")
+        assert "23" not in mult
 
     def test_missing_old_multipliers_are_padded_before_splitting(self):
         assert lm.merge_loras_settings(["a", "b", "c"], "1|2", ["d"], "0.5", "merge before") == (
