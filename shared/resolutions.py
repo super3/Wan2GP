@@ -104,11 +104,6 @@ CATEGORY_ALIASES = {
 }
 
 _custom_resolutions = None
-# The resolution_file argument the cached value was loaded for. Without it the cache
-# answers for whatever file was loaded first and silently ignores the argument
-# thereafter. Note this keys on the path *string*, not the resolved file: two spellings
-# of one path reload, and a relative path after a cwd change still hits the old entry.
-_custom_resolutions_source = None
 
 
 def is_resolution_value(value):
@@ -140,8 +135,8 @@ def normalize_resolution_choices(resolution_choices, source_name, printer=print)
 
 
 def load_custom_resolution_choices(resolution_file=RESOLUTION_FILE, printer=print):
-    global _custom_resolutions, _custom_resolutions_source
-    if _custom_resolutions is not None and _custom_resolutions_source == resolution_file:
+    global _custom_resolutions
+    if _custom_resolutions is not None:
         return _custom_resolutions
     if not os.path.isfile(resolution_file):
         return []
@@ -156,14 +151,12 @@ def load_custom_resolution_choices(resolution_file=RESOLUTION_FILE, printer=prin
     if normalized is None:
         return []
     _custom_resolutions = normalized
-    _custom_resolutions_source = resolution_file
     return _custom_resolutions
 
 
 def reset_custom_resolution_cache():
-    global _custom_resolutions, _custom_resolutions_source
+    global _custom_resolutions
     _custom_resolutions = None
-    _custom_resolutions_source = None
 
 
 def dedupe_resolution_choices(resolution_choices):

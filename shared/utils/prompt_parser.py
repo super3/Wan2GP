@@ -58,9 +58,6 @@ def split_prompt_units(prompt_text, multi_prompts_gen_type, single_prompt=False,
     return [one_line.strip() for one_line in prompt_text.split("\n") if one_line.strip()]
 
 def serialize_prompt_units(prompt_text, prompts, multi_prompts_gen_type):
-    # Guarded like split_prompt_units and split_prompt_original_units: without it the
-    # `"P" in multi_prompts_gen_type` test below raises TypeError on None.
-    multi_prompts_gen_type = multi_prompts_gen_type or ""
     prompt_text = prompt_text.replace("\r\n", "\n").replace("\r", "\n")
     if prompt_text.startswith(ENHANCED_PROMPT_PREFIX):
         prompt_text = prompt_text[len(ENHANCED_PROMPT_PREFIX):]

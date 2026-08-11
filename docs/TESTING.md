@@ -77,7 +77,7 @@ found four properties in `defaults/` that no source file reads, listed in that f
 
 ## Defects the suite surfaced
 
-Writing the tests turned up nine pre-existing defects. All of them are now fixed, and
+Writing the tests turned up six pre-existing defects. All of them are now fixed, and
 each has a regression test alongside it. They are recorded here because the *shape* of
 these bugs is the argument for the suite: none crashed, most produced quietly wrong
 output, and several had clearly been present for a long time.
@@ -107,40 +107,16 @@ output, and several had clearly been present for a long time.
    failed with *"Lora Multiplier no 2 () is invalid"*. Whitespace-only and comment-only
    input now mean "no multipliers given", like an empty box.
 
-5. **`None` prompt mode** — `shared/utils/prompt_parser.py` `serialize_prompt_units`
-   lacked the `or ""` guard its sibling splitters have, so a `None` mode raised
-   `TypeError`.
-
-6. **Date tokens eating each other** — `shared/utils/filename_formatter.py`
+5. **Date tokens eating each other** — `shared/utils/filename_formatter.py`
    `_parse_date_format` substituted tokens sequentially over its own output. `MM`
    became `%m`, and the later `mm` token matched the `m` just written: `MMmm` passed
    validation and compiled to `%%Mm`, losing the month. Substitution is now a single
    pass.
 
-7. **Leaked file handles** — `shared/utils/audio_metadata.py` read files with
+6. **Leaked file handles** — `shared/utils/audio_metadata.py` read files with
    `open(path, 'rb').read()` in two places, never closing them. The suite runs clean
    under `-W error::ResourceWarning`.
 
-8. **Stale resolution cache** — `shared/resolutions.py` `_custom_resolutions` was not
-    keyed on the filename, so the `resolution_file` argument was ignored after the
-    first call and a second file returned the first one's contents. The cache now
-    records which file it came from.
-
-9. **Lax architecture conditions** — `shared/match_archi.py` `eval_condition` used
-    `re.match` rather than `fullmatch`, which anchors only at the start. That made it
-    lax at the end and strict in the middle: `">=89garbage"` silently parsed as
-    `">=89"`, while the natural `">= 89"` failed outright. Now a full match, with
-    whitespace around the operator accepted. No condition shipped in this repository
-    changes meaning: the only two are `<89` and `<999`.
-
-A tenth candidate was investigated and **rejected**: `format()` applies no overall
-length cap, which looks like an `ENAMETOOLONG` waiting to happen. It is not reachable.
-The sole caller, `wgp.py:7938`, already pipes the result through
-`truncate_for_filesystem()` (100 bytes on Linux, 50 on Windows), so a cap inside the
-formatter would be dead code. An earlier revision of this branch added one anyway and
-introduced a real crash with it — `value.encode('utf-8')` raised `UnicodeEncodeError`
-on the lone surrogates that reach filenames through `surrogateescape`. Both were
-removed.
 
 ## Keeping the pure modules importable
 

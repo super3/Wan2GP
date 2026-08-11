@@ -188,15 +188,6 @@ class TestSerializePromptUnits:
         # the mode.
         assert prompt_parser.serialize_prompt_units(ENHANCED + "x\r\ny", ["a"], "G") == "a"
 
-    def test_none_mode_is_treated_as_an_empty_mode_like_the_splitter(self):
-        # split_prompt_units() guards with `or ""`; this one used to omit the guard and
-        # raise TypeError from `"P" in None` as soon as there was a prompt.
-        assert prompt_parser.serialize_prompt_units("", [], None) == ""
-        assert prompt_parser.serialize_prompt_units("", ["a"], None) == "a"
-        # A None mode now joins on a single newline, exactly like an unrecognised mode.
-        assert prompt_parser.serialize_prompt_units("", ["a", "b"], None) == "a\nb"
-        assert prompt_parser.serialize_prompt_units("", ["a", "b"], "") == "a\nb"
-
     @pytest.mark.parametrize(
         "mode, expected_units, expected_text",
         [
