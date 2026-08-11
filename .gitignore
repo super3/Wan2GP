@@ -32,6 +32,9 @@ storage/
 samples/
 !.gitignore
 !requirements.txt
+# The leading `.*` rule above hides every dotted path, which would silently drop the
+# CI definitions. Un-ignore the directory so git descends into it.
+!.github/
 .DS_Store
 *DS_Store
 google/
