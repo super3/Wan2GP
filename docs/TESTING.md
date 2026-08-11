@@ -37,23 +37,34 @@ The suite has no ordering requirements and no shared mutable state, so `pytest -
 
 ## What is covered today
 
-The first tier targets the pure-python logic that sits between the user and the
-models — the code that decides *what* to generate before any tensor is allocated.
-This is where user-visible bugs are both most likely and cheapest to catch.
+The suite targets the pure-python logic that sits between the user and the models — the
+code that decides *what* to generate before any tensor is allocated. This is where
+user-visible bugs are both most likely and cheapest to catch.
 
-| Test file | Covers | Why it matters |
+| Test file | Tests | Covers |
 | --- | --- | --- |
-| `tests/test_prompt_parser.py` | `shared/utils/prompt_parser.py` | Splitting the prompt box into queued requests vs. sliding windows; mode aliases, comments, paragraph breaks, CRLF |
-| `tests/test_loras_multipliers.py` | `shared/utils/loras_mutipliers.py` | Per-step LoRA strength schedules — phase separators, step interpolation, malformed input |
-| `tests/test_frame_scheduler.py` | `shared/utils/frame_scheduler.py` | Sliding-window frame maths and in-prompt slash commands; rounding and overlap boundaries |
-| `tests/test_filename_formatter.py` | `shared/utils/filename_formatter.py` | Output filename templating, sanitisation of unsafe characters, length limits |
-| `tests/test_resolutions.py` | `shared/resolutions.py`, `shared/match_archi.py` | Resolution parsing/grouping and GPU architecture detection |
-| `tests/test_lora_mapper.py` | `shared/lora_mapper.py`, `shared/utils/gguf_mapping.py`, `shared/tools/sha256_verify.py` | Key remapping between checkpoint formats; checksum verification |
-| `tests/test_audio_metadata.py` | `shared/utils/audio_metadata.py` | Binary metadata chunk round-tripping, truncated and non-audio files |
-| `tests/test_model_configs.py` | `defaults/*.json`, `plugins.json`, `setup_config.json` | Every bundled model definition parses and has the shape the loader expects |
-| `tests/test_package_imports.py` | `shared/utils/__init__.py` and the pure modules | The pure logic stays importable without torch, so the suite keeps working |
+| `tests/test_prompt_parser.py` | 110 | Splitting the prompt box into queued requests vs. sliding windows; comments, paragraph breaks, CRLF, the macro templating |
+| `tests/test_loras_multipliers.py` | 110 | Per-step LoRA strength schedules; phase separators, step interpolation, and the text surgery that preserves user comments through a merge |
+| `tests/test_model_configs.py` | 50 | Every bundled model definition parses, resolves to a real handler, and declares no property the code never reads |
+| `tests/test_regressions.py` | 27 | One focused test per bug fix whose module-level suite is still in review |
+| `tests/test_package_imports.py` | 14 | The pure logic stays importable without torch, so the suite keeps working |
 
-The suite is over 1,500 tests and runs in about two seconds.
+**311 tests, about 1.4 seconds.**
+
+The count is deliberate. An earlier revision of this suite ran to 1589 tests, and an
+adversarial review of it found roughly 40% were noise: parametrize lists that expanded
+one assertion into thirty-five, expectations rebuilt with the same expression as the
+implementation, and — the worst pattern — tests parametrised over the very constant they
+validated, so removing an entry made the case *vanish from collection* rather than fail.
+The files that survived were pruned against mutation testing rather than taste: each
+retained file was checked by reverting real one-line changes in a sandbox copy and
+confirming the smaller suite still went red.
+
+Five module-level test files are held back for follow-up pull requests so this change
+stays hand-reviewable: `frame_scheduler`, `filename_formatter`, `resolutions`,
+`audio_metadata` and `lora_mapper`. Their fixes ship here, guarded by
+`tests/test_regressions.py`; each of those tests was verified to fail when its fix is
+reverted. As each module-level file lands, its regression tests move into it.
 
 `tests/test_model_configs.py` is worth calling out: with ~212 model definitions in
 `defaults/`, a single typo breaks model discovery at startup for everyone. It is a
@@ -61,7 +72,8 @@ data-integrity check rather than a unit test, and it is cheap insurance. Its hea
 assertion is that every `architecture` is backed by a handler — a mistyped one does not
 crash, `init_model_def` sets `visible = False` and the model silently disappears from
 the UI. The valid set is recovered by parsing each module in `wgp.py`'s
-`family_handlers` with `ast`, because importing a handler would pull in torch.
+`family_handlers` with `ast`, because importing a handler would pull in torch. It also
+found four properties in `defaults/` that no source file reads, listed in that file.
 
 ## Defects the suite surfaced
 

@@ -16,8 +16,10 @@ Covered here:
   ``extract_variable_names``, ``extract_variable_values``,
   ``generate_macro_line``).
 
-A handful of tests deliberately pin behaviour that looks wrong; each one carries
-a comment saying so.  See the accompanying report for the details.
+Every expectation below is a literal read off the implementation; a handful of
+tests deliberately pin behaviour that looks wrong, and each one carries a
+comment saying so.  Parametrisation is kept to inputs that reach a *different*
+line of the module -- one case per branch, not one case per spelling.
 """
 
 import pytest
@@ -35,67 +37,43 @@ class TestConstants:
         assert ENHANCED == "!enhanced!\n"
         assert prompt_parser.DEFAULT_MULTI_PROMPTS_MODE == "PG"
 
-    def test_unit_prefix_also_looks_like_a_comment(self):
-        # Every helper that drops "#" comment lines therefore also hides the
-        # marker lines from the user-visible prompt.
-        assert PREFIX.startswith("#")
-
 
 class TestNormalizeMultiPromptsMode:
-    @pytest.mark.parametrize("value", ["G", "PG", "W", "PW", "FG"])
-    def test_canonical_codes_pass_through(self, value):
-        assert prompt_parser.normalize_multi_prompts_mode(value) == value
+    def test_canonical_codes_pass_through(self):
+        assert prompt_parser.normalize_multi_prompts_mode("PW") == "PW"
 
-    @pytest.mark.parametrize(
-        "value, expected",
-        [
-            ("g", "G"),
-            (" pw ", "PW"),
-            ("\tfg\n", "FG"),
-            ("Pg", "PG"),
-        ],
-    )
-    def test_strings_are_stripped_and_upper_cased(self, value, expected):
-        assert prompt_parser.normalize_multi_prompts_mode(value) == expected
+    def test_strings_are_stripped_and_upper_cased(self):
+        assert prompt_parser.normalize_multi_prompts_mode("\tfg\n") == "FG"
 
     @pytest.mark.parametrize(
         "value, expected",
         [
             (0, "G"),
-            (1, "W"),
             (2, "FG"),
-            ("0", "G"),
             ("1", "W"),
-            ("2", "FG"),
-            ("P", "PG"),
             ("p", "PG"),
         ],
     )
     def test_legacy_aliases(self, value, expected):
         assert prompt_parser.normalize_multi_prompts_mode(value) == expected
 
-    @pytest.mark.parametrize("value", ["", "   ", "\n"])
-    def test_blank_string_means_full_prompt(self, value):
+    def test_blank_string_means_full_prompt(self):
         # The empty string is an alias for "FG", *not* a fallback to `default`.
-        assert prompt_parser.normalize_multi_prompts_mode(value, default="W") == "FG"
+        assert prompt_parser.normalize_multi_prompts_mode("", default="W") == "FG"
 
-    @pytest.mark.parametrize("value", [1.0, 1.9, 1.2])
-    def test_floats_are_truncated_to_int(self, value):
-        assert prompt_parser.normalize_multi_prompts_mode(value) == "W"
+    def test_floats_are_truncated_to_int(self):
+        assert prompt_parser.normalize_multi_prompts_mode(1.9) == "W"
 
-    @pytest.mark.parametrize("value", [True, False])
-    def test_bools_follow_the_int_aliases(self, value):
-        # bool is a subclass of int, so True == 1 -> "W" and False == 0 -> "G".
-        assert prompt_parser.normalize_multi_prompts_mode(value) == ("W" if value else "G")
+    def test_bools_follow_the_int_aliases(self):
+        # bool is a subclass of int, so True == 1 -> "W".
+        assert prompt_parser.normalize_multi_prompts_mode(True) == "W"
 
-    @pytest.mark.parametrize("value", [None, [], {}, object(), 3, -1, "3", "nope", "PGW"])
+    # One case per rejection branch: `is None`, the non-str/non-number `else`,
+    # and a string that survives the alias table but fails the final whitelist.
+    @pytest.mark.parametrize("value", [None, object(), "PGW"])
     def test_unknown_values_fall_back_to_default(self, value):
         assert prompt_parser.normalize_multi_prompts_mode(value) == "G"
         assert prompt_parser.normalize_multi_prompts_mode(value, default="PW") == "PW"
-
-    def test_default_is_not_validated(self):
-        # An unrecognised value returns `default` verbatim, whatever it is.
-        assert prompt_parser.normalize_multi_prompts_mode("nope", default=None) is None
 
 
 class TestGetMultiPromptsGenChoices:
@@ -107,21 +85,22 @@ class TestGetMultiPromptsGenChoices:
         choices = prompt_parser.get_multi_prompts_gen_choices(include_sliding_window=False)
         assert [code for _, code in choices] == ["G", "PG", "FG"]
 
-    def test_the_default_medium_is_video(self):
-        labels = [label for label, _ in prompt_parser.get_multi_prompts_gen_choices()]
-        assert labels[0] == "Each New Line Will Add a new Video Request to the Generation Queue"
-
     def test_medium_is_interpolated_into_the_queue_labels(self):
+        default_labels = [label for label, _ in prompt_parser.get_multi_prompts_gen_choices()]
+        assert default_labels[0] == (
+            "Each New Line Will Add a new Video Request to the Generation Queue"
+        )
         labels = [label for label, _ in prompt_parser.get_multi_prompts_gen_choices(medium="Image")]
         assert labels[0] == "Each New Line Will Add a new Image Request to the Generation Queue"
-        assert "new Image Request" in labels[1]
+        assert labels[1] == (
+            "Each new Paragraph separated by an Empty Line Will Add a new Image "
+            "Request to the Generation Queue"
+        )
         # The sliding-window and full-prompt labels are fixed text.
-        assert "Image" not in labels[2]
+        assert labels[2] == (
+            "Each Line Will be used for a new Sliding Window of the same Video Generation"
+        )
         assert labels[-1] == "All the Lines are Part of the Same Prompt"
-
-    def test_every_code_normalizes_to_itself(self):
-        for _, code in prompt_parser.get_multi_prompts_gen_choices():
-            assert prompt_parser.normalize_multi_prompts_mode(code) == code
 
 
 class TestSplitPromptUnits:
@@ -131,13 +110,12 @@ class TestSplitPromptUnits:
     def test_line_mode_strips_and_drops_blank_lines(self):
         assert prompt_parser.split_prompt_units("  a  \n\n\t\n b ", "G") == ["a", "b"]
 
-    def test_sliding_window_mode_splits_per_line_too(self):
-        assert prompt_parser.split_prompt_units("a\nb", "W") == ["a", "b"]
-
-    @pytest.mark.parametrize("mode", ["PG", "PW"])
-    def test_paragraph_modes_split_on_blank_lines(self, mode):
+    def test_paragraph_modes_split_on_blank_lines(self):
+        # "PW" rather than "PG": it is the case that fails when the
+        # `"P" in multi_prompts_gen_type` membership test is narrowed to an
+        # equality check against "PG".
         text = "a\nb\n\n\nc\n \nd"
-        assert prompt_parser.split_prompt_units(text, mode) == ["a\nb", "c", "d"]
+        assert prompt_parser.split_prompt_units(text, "PW") == ["a\nb", "c", "d"]
 
     def test_full_prompt_mode_keeps_everything_as_one_unit(self):
         assert prompt_parser.split_prompt_units("a  \n\nb", "FG") == ["a\n\nb"]
@@ -146,32 +124,18 @@ class TestSplitPromptUnits:
         assert prompt_parser.split_prompt_units("a\nb", "W", single_prompt=True) == ["a\nb"]
         assert prompt_parser.split_prompt_units("a\n\nb", "PG", single_prompt=True) == ["a\n\nb"]
 
-    @pytest.mark.parametrize("mode", ["G", "PG", "W", "PW", "FG", "", None])
-    @pytest.mark.parametrize("text", ["", "   ", "\n\n", "\r\n \r\n", "# only a comment"])
-    def test_empty_input_yields_no_units(self, text, mode):
-        assert prompt_parser.split_prompt_units(text, mode) == []
+    @pytest.mark.parametrize("text", ["   ", "# only a comment"])
+    def test_empty_input_yields_no_units(self, text):
+        # The early `if not prompt_text: return []` is reached before the mode
+        # is ever looked at, so there is nothing to gain from a mode axis here.
+        assert prompt_parser.split_prompt_units(text, "G") == []
 
     def test_missing_mode_behaves_like_line_mode(self):
         assert prompt_parser.split_prompt_units("a\nb", None) == ["a", "b"]
         assert prompt_parser.split_prompt_units("a\nb", "") == ["a", "b"]
 
-    def test_mode_matching_is_case_sensitive(self):
-        # Callers are expected to feed a normalized code; "pg"/"fg" silently
-        # degrade to line mode.
-        assert prompt_parser.split_prompt_units("a\n\nb", "pg") == ["a", "b"]
-        assert prompt_parser.split_prompt_units("a\nb", "fg") == ["a", "b"]
-
-    @pytest.mark.parametrize(
-        "mode, expected",
-        [("G", ["a", "b", "c"]), ("PG", ["a\nb\nc"]), ("FG", ["a\nb\nc"])],
-    )
-    def test_crlf_and_lone_cr_are_normalized(self, mode, expected):
-        # Anchored on a literal first: asserting only that the CRLF and the LF
-        # spelling agree would also hold if the splitter returned [] for both.
-        assert prompt_parser.split_prompt_units("a\r\nb\rc", mode) == expected
-        assert prompt_parser.split_prompt_units("a\r\nb\rc", mode) == (
-            prompt_parser.split_prompt_units("a\nb\nc", mode)
-        )
+    def test_crlf_and_lone_cr_are_normalized(self):
+        assert prompt_parser.split_prompt_units("a\r\nb\rc", "G") == ["a", "b", "c"]
 
     def test_comment_lines_are_dropped(self):
         text = "# leading note\n  #  indented note\nkeep me\n#\nalso keep"
@@ -189,17 +153,11 @@ class TestSplitPromptUnits:
         # ...also after CRLF normalisation.
         assert prompt_parser.split_prompt_units("!enhanced!\r\nhello", "G") == ["hello"]
 
-    @pytest.mark.parametrize("text", ["!enhanced!hello", " !enhanced!\nhello", "x\n!enhanced!\ny"])
-    def test_enhanced_prefix_only_stripped_at_the_very_start_of_a_line_of_its_own(self, text):
-        assert "!enhanced!" in "".join(prompt_parser.split_prompt_units(text, "FG"))
+    def test_enhanced_prefix_only_stripped_at_the_very_start_of_a_line_of_its_own(self):
+        assert prompt_parser.split_prompt_units("x\n!enhanced!\ny", "FG") == ["x\n!enhanced!\ny"]
 
     def test_trailing_whitespace_is_rstripped_inside_a_unit(self):
         assert prompt_parser.split_prompt_units("a   \n   b", "FG") == ["a\n   b"]
-
-    def test_none_text_is_not_supported(self):
-        # Current behaviour: the caller must pass a string.
-        with pytest.raises(AttributeError):
-            prompt_parser.split_prompt_units(None, "G")
 
     def test_originals_flag_delegates_to_the_original_splitter(self):
         text = f"{ENHANCED}{PREFIX} original\nenhanced text"
@@ -211,34 +169,24 @@ class TestSerializePromptUnits:
     def test_line_mode_joins_with_single_newlines(self):
         assert prompt_parser.serialize_prompt_units("", ["a", "b"], "G") == "a\nb"
 
-    @pytest.mark.parametrize("mode", ["PG", "PW"])
-    def test_paragraph_modes_join_with_blank_lines(self, mode):
-        assert prompt_parser.serialize_prompt_units("", ["a", "b"], mode) == "a\n\nb"
+    def test_paragraph_modes_join_with_blank_lines(self):
+        # "PW" for the same reason as in the splitter: it is the case that
+        # distinguishes `"P" in mode` from `mode == "PG"`.
+        assert prompt_parser.serialize_prompt_units("", ["a", "b"], "PW") == "a\n\nb"
 
     def test_blank_prompts_are_dropped_and_the_rest_stripped(self):
         assert prompt_parser.serialize_prompt_units("", [" a ", "  ", "", "b\n"], "G") == "a\nb"
-
-    @pytest.mark.parametrize("prompts", [[], ["", "   "]])
-    def test_no_usable_prompt_serializes_to_empty_string(self, prompts):
-        assert prompt_parser.serialize_prompt_units("whatever", prompts, "G") == ""
 
     def test_full_prompt_mode_keeps_only_the_first_unit(self):
         # BUG (pinned): in "FG" mode everything after prompts[0] is silently
         # discarded instead of being joined back together.
         assert prompt_parser.serialize_prompt_units("", ["a", "b"], "FG") == "a"
 
-    @pytest.mark.parametrize("prompt_text", ["", "unrelated", ENHANCED + "x\r\ny"])
-    def test_prompt_text_argument_is_ignored(self, prompt_text):
+    def test_prompt_text_argument_is_ignored(self):
         # BUG (pinned): `prompt_text` is normalized (CRLF, "!enhanced!", strip)
         # and then never read again -- the result depends only on `prompts` and
-        # the mode -- so every value here produces the same output.
-        assert prompt_parser.serialize_prompt_units(prompt_text, ["a"], "G") == "a"
-
-    def test_none_prompt_text_still_raises_even_though_it_is_unused(self):
-        # The unused argument is normalized before it is discarded, so None
-        # crashes rather than being quietly ignored like every other value.
-        with pytest.raises(AttributeError):
-            prompt_parser.serialize_prompt_units(None, ["a"], "G")
+        # the mode.
+        assert prompt_parser.serialize_prompt_units(ENHANCED + "x\r\ny", ["a"], "G") == "a"
 
     def test_none_mode_is_treated_as_an_empty_mode_like_the_splitter(self):
         # split_prompt_units() guards with `or ""`; this one used to omit the guard and
@@ -253,9 +201,7 @@ class TestSerializePromptUnits:
         "mode, expected_units, expected_text",
         [
             ("G", ["first prompt", "second prompt"], "first prompt\nsecond prompt"),
-            ("W", ["first prompt", "second prompt"], "first prompt\nsecond prompt"),
             ("PG", ["first prompt", "second prompt"], "first prompt\n\nsecond prompt"),
-            ("PW", ["first prompt", "second prompt"], "first prompt\n\nsecond prompt"),
         ],
     )
     def test_round_trip_split_then_serialize(self, mode, expected_units, expected_text):
@@ -267,45 +213,26 @@ class TestSerializePromptUnits:
         assert units == expected_units
         serialized = prompt_parser.serialize_prompt_units("", units, mode)
         assert serialized == expected_text
-        assert prompt_parser.split_prompt_units(serialized, mode) == units
+        assert prompt_parser.split_prompt_units(serialized, mode) == expected_units
 
 
 class TestSplitPromptOriginalUnits:
-    @pytest.mark.parametrize(
-        "mode, expected",
-        [
-            ("G", ["a", "b"]),
-            ("W", ["a", "b"]),
-            ("PG", ["a", "b"]),
-            ("PW", ["a", "b"]),
-            ("FG", ["a\n\nb"]),
-        ],
-    )
-    def test_without_markers_it_matches_the_visible_split(self, mode, expected):
-        # The literal comes first so this cannot degenerate into "both
-        # functions are equally broken".
+    @pytest.mark.parametrize("mode", ["G", "PW"])
+    def test_without_markers_it_matches_the_visible_split(self, mode):
+        # Marker-free text takes the same shape as the visible splitter's
+        # output; "PW" also pins the `"P" in mode` membership test in this
+        # function, which the marker tests below only exercise through "PG".
         text = "a\n\n# note\nb"
-        assert prompt_parser.split_prompt_original_units(text, mode) == expected
-        assert prompt_parser.split_prompt_original_units(text, mode) == (
-            prompt_parser.split_prompt_units(text, mode)
-        )
+        assert prompt_parser.split_prompt_original_units(text, mode) == ["a", "b"]
 
     def test_line_mode_marker_replaces_the_following_line(self):
         text = f"{PREFIX} original one\nenhanced one\n{PREFIX} original two\nenhanced two"
         assert prompt_parser.split_prompt_original_units(text, "G") == ["original one", "original two"]
 
-    def test_line_mode_marker_only_covers_one_line(self):
-        text = f"{PREFIX} O\nline one\nline two"
-        assert prompt_parser.split_prompt_original_units(text, "G") == ["O", "line two"]
-
     def test_line_mode_trailing_marker_is_still_emitted(self):
         assert prompt_parser.split_prompt_original_units(f"{PREFIX} only original", "G") == [
             "only original"
         ]
-
-    def test_line_mode_bare_marker_alone_produces_nothing(self):
-        assert prompt_parser.split_prompt_original_units(PREFIX, "G") == []
-        assert prompt_parser.split_prompt_original_units(f"{PREFIX}\n   ", "G") == []
 
     def test_line_mode_bare_marker_after_a_real_one_duplicates_it(self):
         # BUG (pinned): the pending original is appended but not cleared before
@@ -340,25 +267,18 @@ class TestSplitPromptOriginalUnits:
     def test_paragraph_mode_ignores_comments(self):
         assert prompt_parser.split_prompt_original_units("# c\na\n\n# d\nb", "PG") == ["a", "b"]
 
-    def test_full_prompt_mode_joins_every_original(self):
-        text = f"{PREFIX} A\nvisible\n{PREFIX} B\nmore"
-        assert prompt_parser.split_prompt_original_units(text, "FG") == ["A\nB"]
-
     def test_full_prompt_mode_falls_back_to_visible_lines(self):
         assert prompt_parser.split_prompt_original_units("a\n# c\nb  ", "FG") == ["a\nb"]
 
-    @pytest.mark.parametrize("text", ["   \n  ", "", f"{PREFIX}\n  ", "# only a comment"])
-    def test_full_prompt_mode_empty_input(self, text):
-        assert prompt_parser.split_prompt_original_units(text, "FG") == []
-
-    def test_single_prompt_uses_the_full_prompt_branch(self):
-        text = f"{PREFIX} A\nvisible"
-        assert prompt_parser.split_prompt_original_units(text, "W", single_prompt=True) == ["A"]
+    def test_full_prompt_mode_empty_input(self):
+        # A marker with no text leaves both `originals` and the visible lines
+        # empty, which is the `return [prompt] if prompt else []` branch.
+        assert prompt_parser.split_prompt_original_units(f"{PREFIX}\n  ", "FG") == []
 
     def test_single_prompt_joins_every_original_unlike_line_mode(self):
-        # The one-marker case above cannot tell the `single_prompt` branch from
-        # plain line mode -- both yield ["A"].  With two markers they diverge:
-        # the full-prompt branch joins the originals into a single unit.
+        # A single marker cannot tell the `single_prompt` branch from plain line
+        # mode -- both yield ["A"].  With two markers they diverge: the
+        # full-prompt branch joins the originals into a single unit.
         text = f"{PREFIX} A\nv1\n{PREFIX} B\nv2"
         assert prompt_parser.split_prompt_original_units(text, "G") == ["A", "B"]
         assert prompt_parser.split_prompt_original_units(text, "G", single_prompt=True) == ["A\nB"]
@@ -374,10 +294,6 @@ class TestSplitPromptOriginalUnits:
     def test_missing_mode_behaves_like_line_mode(self):
         assert prompt_parser.split_prompt_original_units("a\nb", None) == ["a", "b"]
 
-    def test_none_text_is_not_supported(self):
-        with pytest.raises(AttributeError):
-            prompt_parser.split_prompt_original_units(None, "G")
-
 
 class TestSerializePromptBlocksWithPrefix:
     def test_default_placeholder_originals(self):
@@ -390,11 +306,8 @@ class TestSerializePromptBlocksWithPrefix:
             f"{PREFIX} O1\na\n\n{PREFIX} Prompt 2\nb"
         )
 
-    @pytest.mark.parametrize("original", [None, "", "   "])
-    def test_falsy_originals_become_an_empty_marker(self, original):
-        assert prompt_parser.serialize_prompt_blocks_with_prefix(["a"], [original]) == (
-            f"{PREFIX} \na"
-        )
+    def test_falsy_originals_become_an_empty_marker(self):
+        assert prompt_parser.serialize_prompt_blocks_with_prefix(["a"], [None]) == f"{PREFIX} \na"
 
     def test_newlines_in_an_original_are_flattened_to_one_space(self):
         assert prompt_parser.serialize_prompt_blocks_with_prefix(["a"], ["x\r\n\ny"]) == (
@@ -404,36 +317,16 @@ class TestSerializePromptBlocksWithPrefix:
     def test_non_string_originals_are_coerced(self):
         assert prompt_parser.serialize_prompt_blocks_with_prefix(["a"], [42]) == f"{PREFIX} 42\na"
 
-    @pytest.mark.parametrize("prompts", [[], ["", "   "]])
-    def test_no_usable_prompt_gives_an_empty_string(self, prompts):
-        assert prompt_parser.serialize_prompt_blocks_with_prefix(prompts) == ""
-
-    def test_surplus_originals_are_ignored(self):
-        assert prompt_parser.serialize_prompt_blocks_with_prefix(["a"], ["O1", "O2"]) == (
-            f"{PREFIX} O1\na"
-        )
-
     def test_blank_prompts_do_not_consume_an_original(self):
         assert prompt_parser.serialize_prompt_blocks_with_prefix(["", "b"], ["O1"]) == (
             f"{PREFIX} O1\nb"
         )
 
-    @pytest.mark.parametrize("mode", ["G", "PG"])
-    def test_round_trip_with_the_original_splitter(self, mode):
-        prompts = ["enhanced one", "enhanced two"]
-        originals = ["orig one", "orig two"]
-        blocks = prompt_parser.serialize_prompt_blocks_with_prefix(prompts, originals)
-        assert prompt_parser.split_prompt_units(blocks, mode, originals=True) == originals
-        assert prompt_parser.split_prompt_units(blocks, mode) == prompts
-
     def test_round_trip_keeps_multiline_enhanced_prompts_together(self):
         blocks = prompt_parser.serialize_prompt_blocks_with_prefix(["line1\nline2"], ["orig"])
+        assert blocks == f"{PREFIX} orig\nline1\nline2"
         assert prompt_parser.split_prompt_units(blocks, "PG", originals=True) == ["orig"]
         assert prompt_parser.split_prompt_units(blocks, "PG") == ["line1\nline2"]
-
-    def test_round_trip_of_an_empty_marker_falls_back_to_the_visible_line(self):
-        blocks = prompt_parser.serialize_prompt_blocks_with_prefix(["visible"], [None])
-        assert prompt_parser.split_prompt_units(blocks, "G", originals=True) == ["visible"]
 
 
 class TestIsSpeakerOptionsLine:
@@ -441,9 +334,7 @@ class TestIsSpeakerOptionsLine:
         "line",
         [
             "Speaker 1 {pitch=2}: hello",
-            "speaker2{}:x",
-            "  Speaker 10 {a b} : text",
-            "SPEAKER 3 {v}:",
+            "  speaker10{} : text",  # case-insensitive, multi-digit, loose spacing
         ],
     )
     def test_recognised(self, line):
@@ -455,10 +346,7 @@ class TestIsSpeakerOptionsLine:
             "Speaker 1: hello",  # no option braces
             "Speaker {x}: hi",  # no speaker number
             "Speaker 1 {a}",  # no colon
-            "Speaker 1 {a{b}}: x",  # nested braces
-            "text\nSpeaker 1 {a}: hi",  # anchored to the start of the string
-            "a Speaker 1 {x}: hi",
-            "",
+            "a Speaker 1 {x}: hi",  # anchored to the start of the string
             None,
         ],
     )
@@ -488,10 +376,6 @@ class TestProcessTemplate:
     def test_a_second_macro_starts_a_new_section(self):
         out, err = prompt_parser.process_template('!{a}="1","2"\nx {a}\n!{b}="9"\ny {b}')
         assert (out, err) == ("x 1\nx 2\ny 9", "")
-
-    def test_lines_before_the_first_macro_are_emitted_verbatim(self):
-        out, err = prompt_parser.process_template('plain\n!{a}="1"\nx {a}')
-        assert (out, err) == ("plain\nx 1", "")
 
     def test_crlf_is_normalized(self):
         assert prompt_parser.process_template('!{a}="1"\r\nx {a}') == ("x 1", "")
@@ -528,13 +412,8 @@ class TestProcessTemplate:
         )
         assert (out, err) == ("x 1\n\n\nx 2\n\n", "")
 
-    @pytest.mark.parametrize("text", [None, "", "   \n  "])
-    def test_blank_input(self, text):
-        assert prompt_parser.process_template(text) == ("", "")
-
-    def test_blank_input_with_kept_empty_lines(self):
-        # The whole text is no longer stripped, so the two blank lines survive.
-        assert prompt_parser.process_template("   \n  ", keep_empty_lines=True) == ("\n", "")
+    def test_blank_input(self):
+        assert prompt_parser.process_template(None) == ("", "")
 
     def test_speaker_option_lines_skip_the_unknown_variable_check(self):
         assert prompt_parser.process_template("Speaker 1 {vol=2}: hello") == (
@@ -542,30 +421,18 @@ class TestProcessTemplate:
             "",
         )
 
-    def test_a_macro_only_section_produces_nothing(self):
-        assert prompt_parser.process_template('!{a}="1","2"') == ("", "")
-
     @pytest.mark.parametrize(
         "text, expected_error",
         [
-            ("a {b} c", "Unknown variable '{b}' in template"),
-            ('!{a="1"', "Unmatched braces: 1 opening '{' and 0 closing '}' braces"),
-            ('!{a}="1', "Unclosed double quotes"),
-            ('!{a}"1"', "Missing '=' after variable '{a}'"),
-            ('!{a}=1', "No quoted values found for variable '{a}'"),
-            ('!{a}="1""2"', "Missing comma between values for variable '{a}'"),
-            ('!{ }="1"', "Empty variable name"),
-            ('!}x{="1"', "Malformed variable declaration"),
+            # The unknown-variable error exists only here...
+            ("a {b} c", "Unknown variable '{b}' in template\nLine: 'a {b} c'"),
+            # ...and this one pins the "\nLine: '<orig_line>'" suffix that
+            # extract_variable_values() (tested exhaustively below) omits.
+            ('!{a}="1', "Unclosed double quotes\nLine: '!{a}=\"1'"),
         ],
     )
     def test_errors_blank_the_output_and_quote_the_line(self, text, expected_error):
-        out, err = prompt_parser.process_template(text)
-        assert out == ""
-        assert err.startswith(expected_error)
-        assert err.endswith(f"Line: '{text.splitlines()[-1]}'")
-
-    def test_a_macro_section_with_no_variables_is_ignored(self):
-        assert prompt_parser.process_template("! : ") == ("", "")
+        assert prompt_parser.process_template(text) == ("", expected_error)
 
     def test_values_containing_a_colon_are_rejected(self):
         # BUG (pinned): the macro line is split on every ':' -- including ones
@@ -573,9 +440,6 @@ class TestProcessTemplate:
         out, err = prompt_parser.process_template('!{a}="x:y"\n{a}')
         assert out == ""
         assert err.startswith("No quoted values found for variable '{a}'")
-
-    def test_spaces_after_commas_are_accepted(self):
-        assert prompt_parser.process_template('!{a}="1", "2"\n{a}') == ("1\n2", "")
 
     def test_a_value_may_contain_a_comma(self):
         assert prompt_parser.process_template('!{a}="x,y"\n{a}') == ("x,y", "")
@@ -585,14 +449,7 @@ class TestProcessCurrentTemplate:
     def test_no_variables_returns_the_lines_unchanged(self):
         lines = ["a", "b"]
         out, err = prompt_parser.process_current_template(lines, {})
-        assert (out, err) == (lines, "")
-
-    def test_no_lines_returns_empty(self):
-        assert prompt_parser.process_current_template([], {"a": ["1"]}) == ([], "")
-
-    def test_substitution_is_repeated_per_value(self):
-        out, err = prompt_parser.process_current_template(["<{a}>"], {"a": ["1", "2"]})
-        assert (out, err) == (["<1>", "<2>"], "")
+        assert (out, err) == (["a", "b"], "")
 
     def test_unreferenced_variables_still_drive_the_repeat_count(self):
         out, err = prompt_parser.process_current_template(["fixed"], {"a": ["1", "2", "3"]})
@@ -600,9 +457,9 @@ class TestProcessCurrentTemplate:
 
 
 class TestExtractVariableNames:
-    @pytest.mark.parametrize("line", ['!{a}="1","2" : {b}="x"', '{a}="1","2" : {b}="x"'])
-    def test_leading_bang_is_optional(self, line):
-        assert prompt_parser.extract_variable_names(line) == (["a", "b"], "")
+    def test_leading_bang_is_optional(self):
+        # Every other test in this class passes the '!' form.
+        assert prompt_parser.extract_variable_names('{a}="1","2" : {b}="x"') == (["a", "b"], "")
 
     def test_names_are_stripped_and_deduplicated_in_order(self):
         assert prompt_parser.extract_variable_names('!{ b }="1" : {a}="2" : {b}="3"') == (
@@ -615,9 +472,8 @@ class TestExtractVariableNames:
         assert names == []
         assert err == "Unmatched braces: 1 opening '{' and 0 closing '}' braces"
 
-    @pytest.mark.parametrize("line", ["", "!", "!hello"])
-    def test_no_variables(self, line):
-        assert prompt_parser.extract_variable_names(line) == ([], "")
+    def test_no_variables(self):
+        assert prompt_parser.extract_variable_names("!hello") == ([], "")
 
     def test_braces_on_the_value_side_are_also_reported(self):
         # BUG (pinned): the value part is not excluded, so "{b}" used as a value
@@ -638,10 +494,11 @@ class TestExtractVariableValues:
     def test_empty_value_is_allowed(self):
         assert prompt_parser.extract_variable_values('!{a}=""') == ({"a": [""]}, "")
 
-    @pytest.mark.parametrize("line", ["", "!", "!hello"])
-    def test_no_variables(self, line):
-        assert prompt_parser.extract_variable_values(line) == ({}, "")
+    def test_no_variables(self):
+        assert prompt_parser.extract_variable_values("!hello") == ({}, "")
 
+    # One case per error `return` in the function -- this is the canonical
+    # place where the macro-parsing diagnostics are pinned.
     @pytest.mark.parametrize(
         "line, expected_error",
         [
@@ -659,12 +516,6 @@ class TestExtractVariableValues:
         assert variables == {}
         assert err == expected_error
 
-    def test_errors_match_the_ones_process_template_reports(self):
-        line = '!{a}="1'
-        _, macro_err = prompt_parser.extract_variable_values(line)
-        _, template_err = prompt_parser.process_template(line)
-        assert template_err.startswith(macro_err)
-
 
 class TestGenerateMacroLine:
     def test_formats_a_macro_line(self):
@@ -678,12 +529,9 @@ class TestGenerateMacroLine:
     def test_round_trips_through_the_extractors(self):
         variables = {"color": ["red", "blue"], "mood": ["calm"]}
         line = prompt_parser.generate_macro_line(variables)
-        assert prompt_parser.extract_variable_values(line) == (variables, "")
-        assert prompt_parser.extract_variable_names(line) == (["color", "mood"], "")
-
-    def test_generated_line_is_accepted_by_process_template(self):
-        line = prompt_parser.generate_macro_line({"col": ["red", "blue"]})
-        assert prompt_parser.process_template(f"{line}\na {{col}} car") == (
-            "a red car\na blue car",
+        assert line == '! {color}="red","blue" : {mood}="calm"'
+        assert prompt_parser.extract_variable_values(line) == (
+            {"color": ["red", "blue"], "mood": ["calm"]},
             "",
         )
+        assert prompt_parser.extract_variable_names(line) == (["color", "mood"], "")

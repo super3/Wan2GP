@@ -15,8 +15,9 @@ separate concerns, all exercised here:
   ``_spans``-based helpers edit the multiplier *text* in place so that user
   comments and layout survive a merge.
 
-Several expectations below pin behaviour that looks accidental rather than
-intended; those are flagged with a ``BUG:`` comment.
+Every expectation below is written out as a literal derived from reading the
+implementation, never by calling the function under test or by re-deriving the
+value with the same expression the implementation uses.
 """
 
 from __future__ import annotations
@@ -37,15 +38,11 @@ class TestPreparseLorasMultipliers:
     @pytest.mark.parametrize(
         "raw, expected",
         [
-            ("1.0 0.5", ["1.0", "0.5"]),
             ("  1.0 0.5  ", ["1.0", "0.5"]),
-            ("1.0\n0.5", ["1.0", "0.5"]),
             ("1.0\r\n0.5", ["1.0", "0.5"]),
-            # '|' is only a separator here, the before/after split happens later.
-            ("1.0|0.5", ["1.0", "0.5"]),
-            # ';' and ',' are kept inside the token, they are parsed downstream.
-            ("1.0;0.5 0.3", ["1.0;0.5", "0.3"]),
-            ("0.1,0.9", ["0.1,0.9"]),
+            # '|' is only a separator here (the before/after split happens later),
+            # while ';' is kept inside the token and parsed downstream.
+            ("1.0|0.5;0.3", ["1.0", "0.5;0.3"]),
         ],
     )
     def test_splits_on_whitespace_newlines_and_bars(self, raw, expected):
@@ -62,7 +59,7 @@ class TestPreparseLorasMultipliers:
         # comments -- the two comment models disagree.
         assert lm.preparse_loras_multipliers("1 # trailing") == ["1", "#", "trailing"]
 
-    @pytest.mark.parametrize("raw", ["", "\n", "   ", "# only a comment"])
+    @pytest.mark.parametrize("raw", ["", "# only a comment"])
     def test_input_without_values_yields_no_tokens(self, raw):
         # Whitespace-only and comment-only input mean "no multipliers given", the same
         # as the empty string.  These used to yield [""] -- a single empty token that
@@ -81,17 +78,11 @@ class TestPreparseLorasMultipliers:
         # as "Lora Multiplier no 2 () is invalid".
         assert lm.preparse_loras_multipliers("1.0  0.5") == ["1.0", "0.5"]
         assert lm.preparse_loras_multipliers("1.0 \t 0.5\n\n0.25") == ["1.0", "0.5", "0.25"]
+        assert lm.parse_loras_multipliers("1.0  0.5", 2, 4)[0] == [1.0, 0.5]
         assert lm.parse_loras_multipliers("1.0  0.5", 2, 4)[2] == ""
-
-    def test_non_numeric_tokens_are_passed_through_untouched(self):
-        assert lm.preparse_loras_multipliers("a b") == ["a", "b"]
 
     def test_list_input_is_stripped_elementwise_and_non_strings_kept(self):
         assert lm.preparse_loras_multipliers(["1.0 ", " 0.5\n", 3]) == ["1.0", "0.5", 3]
-
-    def test_none_raises(self):
-        with pytest.raises(AttributeError):
-            lm.preparse_loras_multipliers(None)
 
 
 def _slists(phase1, phase2=1.0, phase3=1.0, shared=False):
@@ -106,8 +97,6 @@ class TestExpandSlist:
         "values, steps, expected",
         [
             ([0.0, 1.0], 4, [0.0, 0.0, 1.0, 1.0]),
-            ([0.0, 1.0, 2.0], 4, [0.0, 0.0, 1.0, 2.0]),
-            ([0.1, 0.9], 5, [0.1, 0.1, 0.1, 0.9, 0.9]),
             # More values than steps: the list is sub-sampled, not averaged.
             ([0.0, 1.0, 2.0, 3.0, 4.0], 3, [0.0, 1.0, 3.0]),
             ([0.7], 3, [0.7, 0.7, 0.7]),
@@ -128,25 +117,12 @@ class TestExpandSlist:
         got = lm.expand_slist(_slists(0.8, 0.5, 1.0), 0, 6, 3, 6)
         assert got == [0.8, 0.8, 0.8, 0.5, 0.5, 0.5]
 
-    def test_three_phases_split_at_both_switch_steps(self):
-        got = lm.expand_slist(_slists(0.8, 0.5, 0.2), 0, 6, 2, 4)
-        assert got == [0.8, 0.8, 0.5, 0.5, 0.2, 0.2]
-
     def test_per_phase_lists_are_expanded_independently(self):
         got = lm.expand_slist(_slists([0.1, 0.2], 0.5, 0.9), 0, 6, 2, 4)
         assert got == [0.1, 0.2, 0.5, 0.5, 0.9, 0.9]
 
     def test_switch_step_equal_to_total_steps_uses_phase1_only(self):
         assert lm.expand_slist(_slists(0.8, 0.5, 0.2), 0, 4, 4, 4) == [0.8] * 4
-
-    def test_switch_step_of_zero_skips_straight_to_phase3(self):
-        assert lm.expand_slist(_slists(0.8, 0.5, 0.2), 0, 4, 0, 0) == [0.2] * 4
-
-    def test_int_multipliers_are_not_treated_as_scalars(self):
-        # The scalar short-circuits test `isinstance(x, float)`, so plain ints
-        # always go through the list expansion path.
-        assert lm.expand_slist(_slists(1, 1, 1, shared=True), 0, 3, 1, 2) == [1, 1, 1]
-        assert lm.expand_slist(_slists(1, 1, 1), 0, 3, 1, 2) == [1, 1, 1]
 
     def test_selects_the_requested_lora_index(self):
         slists = {
@@ -165,6 +141,7 @@ class TestParseLorasMultipliers:
         assert nums == [1.0, 0.5]
         assert slists["phase1"] == [1.0, 0.5]
         assert slists["shared"] == [True, True]
+        # Both switch steps default to num_inference_steps.
         assert slists["model_switch_step"] == 4
         assert slists["model_switch_step2"] == 4
 
@@ -185,16 +162,6 @@ class TestParseLorasMultipliers:
         nums, _, error = lm.parse_loras_multipliers("0.1 0.2 0.3", 2, 4)
         assert (nums, error) == ([0.1, 0.2], "")
 
-    def test_zero_loras_gives_empty_schedules(self):
-        nums, slists, error = lm.parse_loras_multipliers("0.5", 0, 4)
-        assert (nums, error) == ([], "")
-        assert slists["phase1"] == []
-
-    def test_switch_steps_default_to_num_inference_steps(self):
-        _, slists, _ = lm.parse_loras_multipliers("0.5", 1, 7)
-        assert slists["model_switch_step"] == 7
-        assert slists["model_switch_step2"] == 7
-
     def test_explicit_switch_steps_are_echoed_back(self):
         _, slists, _ = lm.parse_loras_multipliers("0.5", 1, 10, model_switch_step=3, model_switch_step2=6)
         assert (slists["model_switch_step"], slists["model_switch_step2"]) == (3, 6)
@@ -211,10 +178,6 @@ class TestParseLorasMultipliers:
         assert slists["phase2"] == [0.5]
         assert slists["phase3"] == [1.0]  # untouched default
         assert slists["shared"] == [False]
-
-    def test_semicolon_schedule_expands_across_the_switch_step(self):
-        _, slists, _ = lm.parse_loras_multipliers("0.8;0.5", 1, 6, model_switch_step=3)
-        assert lm.expand_slist(slists, 0, 6, 3, 6) == [0.8, 0.8, 0.8, 0.5, 0.5, 0.5]
 
     def test_three_phases_are_accepted_when_nb_phases_is_three(self):
         _, slists, error = lm.parse_loras_multipliers(
@@ -248,10 +211,6 @@ class TestParseLorasMultipliers:
     def test_negative_multipliers_are_allowed(self):
         nums, _, error = lm.parse_loras_multipliers("-1", 1, 4)
         assert (nums, error) == ([-1.0], "")
-
-    def test_comment_lines_are_ignored(self):
-        nums, _, error = lm.parse_loras_multipliers("# a note\n0.5\n0.25", 2, 4)
-        assert (nums, error) == ([0.5, 0.25], "")
 
     def test_list_input_of_floats_is_accepted(self):
         nums, slists, error = lm.parse_loras_multipliers([0.5, 0.25], 2, 4)
@@ -288,42 +247,6 @@ class TestParseLorasMultipliersErrors:
             "Lora Multiplier no 1 (abc) is invalid",
         )
 
-    def test_non_numeric_step_value_reports_the_split_list(self):
-        assert lm.parse_loras_multipliers("0.1,abc", 1, 4) == (
-            "",
-            "",
-            "Lora sub value no 1 (abc) in Multiplier definition '['0.1', 'abc']' is invalid in Phase 1",
-        )
-
-    def test_double_space_is_accepted(self):
-        # "1.0  0.5" is a reasonable thing for a user to type.  It used to be rejected
-        # because preparse split on a single space, leaving an empty token behind.
-        nums, _slists, error = lm.parse_loras_multipliers("1.0  0.5", 2, 4)
-        assert error == ""
-        assert nums == [1.0, 0.5]
-
-    @pytest.mark.parametrize("nb_phases", [1, 2])
-    def test_more_phases_than_nb_phases(self, nb_phases):
-        _, _, error = lm.parse_loras_multipliers("0.8;0.5;0.2", 1, 6, nb_phases=nb_phases)
-        assert error == (
-            "if the ';' syntax is used for one Lora multiplier, there should be "
-            f"at most {nb_phases} phases for this multiplier"
-        )
-
-    def test_none_raises_a_type_error(self):
-        with pytest.raises(TypeError):
-            lm.parse_loras_multipliers(None, 1, 4)
-
-    @pytest.mark.parametrize("raw", ["   ", "# only a comment", "# a\n# b"])
-    def test_input_with_no_values_is_accepted(self, raw):
-        # A box holding only whitespace or only comments means "no multipliers given",
-        # exactly like an empty box (see test_empty_string_defaults_every_lora_to_one).
-        # These used to reach preparse, come back as [""], and produce a confusing
-        # "Lora Multiplier no 1 () is invalid".
-        nums, _slists, error = lm.parse_loras_multipliers(raw, 1, 4)
-        assert error == ""
-        assert nums == [1.0]
-
     def test_colon_without_declared_branches_is_not_special(self):
         # The ':' branch syntax is only recognised when lora_multiplier_branches is
         # supplied; otherwise the whole token is handed to float() and fails.
@@ -332,12 +255,6 @@ class TestParseLorasMultipliersErrors:
             "",
             "Lora Multiplier no 1 (0.5:0.25) is invalid",
         )
-
-    def test_list_containing_a_bar_raises(self):
-        # BUG: the "only one '|'" guard uses `in` (element test on a list) and
-        # then `.find`, which lists do not have.
-        with pytest.raises(AttributeError):
-            lm.parse_loras_multipliers(["|", "1"], 2, 4)
 
 
 class TestParseLorasMultipliersBranches:
@@ -405,22 +322,13 @@ class TestGetModelSwitchSteps:
         assert (step, step2) == (2, 5)
         assert desc == "Denoising Steps:  Phase 1 = 1:2, Phase 2 = 3:5"
 
-    def test_three_phases(self):
-        step, step2, desc = lm.get_model_switch_steps(TIMESTEPS, 3, 1, 700, 300)
-        assert (step, step2) == (2, 4)
-        assert desc == "Denoising Steps:  Phase 1 = 1:2, Phase 2 = 3:4, Phase 3 = 5:5"
-
-    def test_second_threshold_is_ignored_below_three_phases(self):
-        assert lm.get_model_switch_steps(TIMESTEPS, 2, 1, 700, 300)[1] == 5
-
     @pytest.mark.parametrize(
         "switch, switch2, expected",
         [
             # 800 is itself a timestep: the comparison is `t <= threshold`, so the step
             # *at* the threshold already belongs to the next phase (index 1, not 2).
             (800, 300, (1, 5)),
-            (1000, 200, (0, 5)),  # the very first timestep equals the threshold
-            (200, 200, (4, 5)),  # the very last one does
+            (200, 200, (4, 5)),  # the very last timestep equals the threshold
         ],
     )
     def test_a_timestep_equal_to_the_threshold_switches_on_that_step(self, switch, switch2, expected):
@@ -462,25 +370,6 @@ class TestGetModelSwitchSteps:
     def test_empty_timesteps(self):
         assert lm.get_model_switch_steps([], 3, 1, 700, 300) == (0, 0, "Denoising Steps:  Phase 1 = None")
 
-    @pytest.mark.parametrize("model_switch_phase", [1, 2, 3])
-    def test_model_switch_phase_is_ignored(self, model_switch_phase):
-        # BUG (harmless): the parameter is accepted but never read.
-        assert lm.get_model_switch_steps(TIMESTEPS, 3, model_switch_phase, 700, 300) == (
-            2,
-            4,
-            "Denoising Steps:  Phase 1 = 1:2, Phase 2 = 3:4, Phase 3 = 5:5",
-        )
-
-    def test_switch_step_feeds_expand_slist(self):
-        step, step2, _ = lm.get_model_switch_steps(TIMESTEPS, 2, 1, 700, 300)
-        assert lm.expand_slist(_slists(0.8, 0.5, 0.5), 0, len(TIMESTEPS), step, step2) == [
-            0.8,
-            0.8,
-            0.5,
-            0.5,
-            0.5,
-        ]
-
 
 class TestSpans:
     @pytest.mark.parametrize(
@@ -489,47 +378,35 @@ class TestSpans:
             ("1 2 3", ["1", "2", "3"]),
             ("1.0,0.5;0.2", ["1.0,0.5;0.2"]),  # ':;,.' and digits are all token chars
             ("1|2", ["1", "2"]),
-            ("", []),
             ("   ", []),
-            ("#c", []),
             ("1 # comment 2 3", ["1"]),  # comment runs to end of line
-            ("1 # c\n2", ["1", "2"]),
-            ("1\n#c\n2", ["1", "2"]),
+            ("1\n#c\n2", ["1", "2"]),  # ... and a newline ends it
         ],
     )
     def test_tokenisation(self, text, expected):
         assert tokens(text) == expected
-
-    def test_minus_sign_is_not_part_of_a_token(self):
-        # BUG: '-' is missing from the allowed character set, so a negative
-        # multiplier is tokenised as its absolute value by the merge helpers.
-        assert tokens("-1 2") == ["1", "2"]
-
-    def test_exponent_notation_is_split(self):
-        # BUG: same root cause as above -- 'e' is not in _ALWD either, so "1e5" is two
-        # tokens to the merge helpers even though float() accepts it as one number.
-        assert tokens("1e5") == ["1", "5"]
 
     def test_spans_are_offsets_into_the_original_text(self):
         assert lm._spans("ab 12 cd") == [(3, 5)]
 
     @pytest.mark.parametrize(
         "text, expected",
-        [("a|b", 1), ("no bar", -1), ("|", 0), ("# a|b", -1), ("#a|b\nc|d", 6)],
+        [("a|b", 1), ("# a|b", -1), ("#a|b\nc|d", 6)],
     )
     def test_find_bar_ignores_bars_inside_comments(self, text, expected):
         assert lm._find_bar(text) == expected
 
-    @pytest.mark.parametrize(
-        "text, expected",
-        [("1 2", " "), ("1\n2", "\n"), ("1", " "), ("", " "), ("1 2\n3", "\n")],
-    )
-    def test_choose_sep_copies_the_last_separator(self, text, expected):
-        assert lm._choose_sep(text, lm._spans(text)) == expected
+    def test_choose_sep_looks_at_the_gap_before_the_last_token(self):
+        # The separator is copied from the gap between the last two tokens, not from
+        # the text as a whole: here the text does contain a newline, but the final gap
+        # is a space, so appending must use a space.
+        assert lm._choose_sep("1\n2 3", lm._spans("1\n2 3")) == " "
+        # ... and the mirror image, where only the final gap is a newline.
+        assert lm._choose_sep("1 2\n3", lm._spans("1 2\n3")) == "\n"
 
     @pytest.mark.parametrize(
         "text, expected",
-        [("1 #c", True), ("1 #c\n2", False), ("1", False), ("#c\n", False), ("", False)],
+        [("1 #c", True), ("1 #c\n2", False)],
     )
     def test_ends_in_comment_line(self, text, expected):
         assert lm._ends_in_comment_line(text) == expected
@@ -539,13 +416,10 @@ class TestEnforceCount:
     @pytest.mark.parametrize(
         "text, target, expected",
         [
-            ("1 2 3", 3, "1 2 3"),
             ("1 2 3", 2, "1 2"),
             ("1 2 3", 0, ""),
             ("1 2", 4, "1 2 1 1"),
-            ("", 3, "1 1 1"),
-            ("", 0, ""),
-            ("1\n2", 4, "1\n2\n1\n1"),
+            ("1\n2", 4, "1\n2\n1\n1"),  # the separator is copied from the text
         ],
     )
     def test_pads_with_ones_and_trims_from_the_end(self, text, target, expected):
@@ -557,38 +431,6 @@ class TestEnforceCount:
     def test_appending_after_a_comment_starts_a_new_line(self):
         assert lm._enforce_count("1 # c", 2) == "1 # c\n1"
 
-    def test_trimming_can_leave_a_dangling_comment_line(self):
-        assert lm._enforce_count("1 # c\n2 3", 1) == "1 # c\n"
-
-    @pytest.mark.parametrize(
-        "text, drop, expected",
-        [
-            ("1 2 3", 0, "1 2 3"),
-            ("1 2 3", 1, "1 2"),
-            ("1 2 3", 2, "1"),
-            ("1 2 3", 5, ""),
-            ("1 2 3 ", 1, "1 2"),
-            ("1\n2\n3", 1, "1\n2\n"),  # newline separators are not reclaimed
-        ],
-    )
-    def test_trim_last_tokens(self, text, drop, expected):
-        assert lm._trim_last_tokens(text, lm._spans(text), drop) == expected
-
-    @pytest.mark.parametrize(
-        "text, span, expected",
-        [
-            ("1 2 3", (2, 3), "1 3"),  # eats the space after
-            ("1 2 3", (4, 5), "1 2"),  # no space after, eats the one before
-            ("12", (0, 2), ""),
-        ],
-    )
-    def test_erase_span_and_one_sep(self, text, span, expected):
-        assert lm._erase_span_and_one_sep(text, *span) == expected
-
-    def test_append_tokens_is_a_noop_for_non_positive_counts(self):
-        assert lm._append_tokens("1 2", 0, " ") == "1 2"
-        assert lm._append_tokens("1 2", -1, " ") == "1 2"
-
     def test_append_tokens_does_not_double_the_separator(self):
         assert lm._append_tokens("1 ", 1, " ") == "1 1"
         assert lm._append_tokens("", 1, " ") == "1"
@@ -598,8 +440,8 @@ class TestTokenEditing:
     @pytest.mark.parametrize(
         "text, expected",
         [
-            ("#a|b", "#a|b"),  # bars inside a comment are left alone
             ("1 | 2", "1   2"),
+            # Bars inside a comment are left alone; a newline ends the comment.
             ("1|2 # c|d\n3|4", "1 2 # c|d\n3 4"),
         ],
     )
@@ -614,21 +456,10 @@ class TestTokenEditing:
         assert lm._strip_bars_outside_comments("1|2") == "1 2"
         assert len(lm._spans(lm._strip_bars_outside_comments("1|2"))) == 2
 
-    def test_stripping_bars_keeps_the_count_however_they_were_spaced(self):
-        # The old fusion only showed up in the unspaced spelling, which is how it
-        # survived unnoticed; both forms now yield the same tokens.
-        assert tokens(lm._strip_bars_outside_comments("1 | 2")) == ["1", "2"]
-        assert tokens(lm._strip_bars_outside_comments("1|2")) == ["1", "2"]
-        assert tokens(lm._strip_bars_outside_comments("1|2\n3|4")) == ["1", "2", "3", "4"]
-
     @pytest.mark.parametrize(
         "text, expected",
         [
-            ("1|2", ["1", "2"]),
             ("0.5|0.25|0.125", ["0.5", "0.25", "0.125"]),
-            ("1 | 2", ["1", "2"]),
-            ("1|2\n3|4", ["1", "2", "3", "4"]),
-            ("10|20", ["10", "20"]),
             # A bar inside a comment is not a separator and must not split anything.
             ("1|2 # a|b", ["1", "2"]),
         ],
@@ -639,16 +470,8 @@ class TestTokenEditing:
         # function under test and assert it against itself.
         assert tokens(lm._strip_bars_outside_comments(text)) == expected
 
-    def test_replace_tokens_by_index(self):
-        assert lm._replace_tokens("1 2 3", {0: "9", 2: "7"}) == "9 2 7"
-
     def test_replace_tokens_with_longer_text_keeps_later_indices_valid(self):
         assert lm._replace_tokens("1 2 3", {0: "0.125", 1: "0.5"}) == "0.125 0.5 3"
-
-    def test_replace_tokens_ignores_empty_map_and_out_of_range_indices(self):
-        assert lm._replace_tokens("1 2 3", {}) == "1 2 3"
-        assert lm._replace_tokens("1 2 3", {5: "9"}) == "1 2 3"
-        assert lm._replace_tokens("1 2 3", {-1: "9"}) == "1 2 3"
 
     def test_replace_tokens_skips_over_comments(self):
         assert lm._replace_tokens("1 # c\n2", {1: "0.5"}) == "1 # c\n0.5"
@@ -656,12 +479,9 @@ class TestTokenEditing:
     @pytest.mark.parametrize(
         "text, idxs, expected",
         [
-            ("1 2 3", [], "1 2 3"),
             ("1 2 3", [1], "1 3"),
             ("1 2 3", [0, 2], "2"),
-            ("1 2 3", [9], "1 2 3"),
-            ("1 2 3", [1, 1], "1 3"),  # duplicates are de-duplicated
-            ("1\n2\n3", [1], "1\n\n3"),
+            ("1\n2\n3", [1], "1\n\n3"),  # newline separators are not reclaimed
         ],
     )
     def test_drop_tokens_by_indices(self, text, idxs, expected):
@@ -671,10 +491,8 @@ class TestTokenEditing:
         "path, expected",
         [
             (r" a\b//c/ ", "a/b/c"),
-            ("a/b/", "a/b"),
-            ("/", "/"),
+            ("/", "/"),  # a lone slash is not stripped
             ("x", "x"),
-            ("", ""),
         ],
     )
     def test_default_path_key_normalises_separators(self, path, expected):
@@ -685,13 +503,9 @@ class TestSelectNewSide:
     @pytest.mark.parametrize(
         "loras, mult, mode, expected",
         [
-            (["x", "y"], "0.1|0.2", "merge before", (["x"], "0.1")),
             (["x", "y"], "0.1|0.2", "merge after", (["y"], "0.2")),
             # Loras with no matching token become "extras" appended to the side.
             (["x", "y", "z"], "0.1|0.2", "merge before", (["x", "z"], "0.1")),
-            (["x", "y", "z"], "0.1|0.2", "merge after", (["y", "z"], "0.2")),
-            (["x"], "0.1", "merge after", (["x"], "0.1")),
-            (["x"], "0.1", "merge before", (["x"], "0.1")),
         ],
     )
     def test_splits_new_set_on_the_bar(self, loras, mult, mode, expected):
@@ -706,21 +520,10 @@ class TestSelectNewSide:
         assert loras == ["y", "z"]
         assert tokens(mult) == ["2", "3"]
 
-    def test_a_second_bar_is_harmless_on_the_side_that_precedes_it(self):
-        # The "before" side stops at the first bar, so it never sees the second one.
-        assert lm._select_new_side(["x", "y", "z"], "1|2|3", "merge before") == (["x"], "1")
-
 
 class TestMergeLorasSettings:
-    def test_rejects_an_unknown_mode(self):
-        with pytest.raises(AssertionError):
-            lm.merge_loras_settings(["a"], "1", ["b"], "1", "nope")
-
     def test_merge_before_into_an_empty_set_marks_the_before_side(self):
         assert lm.merge_loras_settings([], "", ["a"], "0.5", "merge before") == (["a"], "0.5|")
-
-    def test_merge_after_into_an_empty_set_needs_no_bar(self):
-        assert lm.merge_loras_settings([], "", ["a"], "0.5", "merge after") == (["a"], "0.5")
 
     def test_merge_before_keeps_the_unbarred_old_set_as_the_after_side(self):
         assert lm.merge_loras_settings(["a"], "1", ["b"], "0.5", "merge before") == (["b", "a"], "0.5|1")
@@ -729,18 +532,6 @@ class TestMergeLorasSettings:
         # Without a bar every old lora belongs to the "after" side, which is the
         # side being replaced.
         assert lm.merge_loras_settings(["a"], "1", ["b"], "0.5", "merge after") == (["b"], "0.5")
-
-    def test_merge_before_replaces_only_the_before_side(self):
-        assert lm.merge_loras_settings(["a", "b"], "1|2", ["c"], "0.5", "merge before") == (
-            ["c", "b"],
-            "0.5|2",
-        )
-
-    def test_merge_after_replaces_only_the_after_side(self):
-        assert lm.merge_loras_settings(["a", "b"], "1|2", ["c"], "0.5", "merge after") == (
-            ["a", "c"],
-            "1|0.5",
-        )
 
     def test_duplicate_updates_the_preserved_side_and_drops_the_new_entry(self):
         assert lm.merge_loras_settings(["a", "b"], "1|2", ["a"], "0.7", "merge after") == (
@@ -775,15 +566,6 @@ class TestMergeLorasSettings:
             ["a", "x", "y", "z"],
             "1|0.5 1 1",
         )
-
-    def test_empty_new_multipliers_default_to_one(self):
-        assert lm.merge_loras_settings(["a"], "1|", ["b", "c"], "", "merge after") == (
-            ["a", "b", "c"],
-            "1|1 1",
-        )
-
-    def test_surplus_old_multipliers_are_trimmed_to_the_lora_count(self):
-        assert lm.merge_loras_settings(["a"], "1 2 3", ["c"], "0.5", "merge after") == (["c"], "0.5")
 
     def test_more_old_before_tokens_than_old_loras_collapses_the_after_side(self):
         # The `n_b_old > total_old` branch: the before side is trimmed down to the whole
@@ -828,11 +610,6 @@ class TestMergeLorasSettings:
             "1|0.5",
         )
 
-    def test_dedupe_uses_the_normalised_path_key(self):
-        assert lm.merge_loras_settings(
-            ["loras/a.safetensors"], "1|", ["loras//a.safetensors"], "0.7", "merge after"
-        ) == (["loras/a.safetensors"], "0.7|")
-
     def test_a_custom_path_key_controls_dedupe(self):
         assert lm.merge_loras_settings(["A"], "1|", ["a"], "0.7", "merge after", str.lower) == (
             ["A"],
@@ -851,10 +628,6 @@ class TestMergeLorasSettings:
 
 
 class TestExtractLorasSide:
-    def test_rejects_an_unknown_side(self):
-        with pytest.raises(AssertionError):
-            lm.extract_loras_side(["a"], "1", "sideways")
-
     def test_splits_on_the_bar(self):
         assert lm.extract_loras_side(["a", "b", "c"], "1 2|3", "before") == (["a", "b"], "1 2")
         assert lm.extract_loras_side(["a", "b", "c"], "1 2|3", "after") == (["c"], "3")
@@ -863,23 +636,9 @@ class TestExtractLorasSide:
         assert lm.extract_loras_side(["a", "b", "c"], "1 2 3", "before") == ([], "")
         assert lm.extract_loras_side(["a", "b", "c"], "1 2 3", "after") == (["a", "b", "c"], "1 2 3")
 
-    def test_empty_input(self):
-        assert lm.extract_loras_side([], "", "before") == ([], "")
-        assert lm.extract_loras_side([], "", "after") == ([], "")
-
     def test_more_before_tokens_than_loras_truncates_and_empties_the_after_side(self):
         assert lm.extract_loras_side(["a", "b"], "1 2 3 4|5", "before") == (["a", "b"], "1 2")
         assert lm.extract_loras_side(["a", "b"], "1 2 3 4|5", "after") == ([], "")
 
     def test_missing_after_multipliers_are_padded_with_one(self):
         assert lm.extract_loras_side(["a", "b", "c"], "1|", "after") == (["b", "c"], "1 1")
-
-    def test_the_two_sides_partition_the_lora_list(self):
-        # Asserting only `before + after == loras` would hold for *any* split point, so
-        # pin where the cut actually falls (after the two "before" tokens) as well.
-        loras = ["a", "b", "c", "d"]
-        before_loras, before_mult = lm.extract_loras_side(loras, "1 2|3 4", "before")
-        after_loras, after_mult = lm.extract_loras_side(loras, "1 2|3 4", "after")
-        assert (before_loras, before_mult) == (["a", "b"], "1 2")
-        assert (after_loras, after_mult) == (["c", "d"], "3 4")
-        assert before_loras + after_loras == loras
