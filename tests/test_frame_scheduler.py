@@ -114,6 +114,12 @@ class TestNormalizeFrameCount:
     def test_negative_offset_is_clamped_to_zero(self):
         assert fs.normalize_frame_count(6, 5, 4, -3) == 8
 
+    def test_an_offset_above_the_frame_count_cannot_produce_a_negative_ceil(self):
+        # ``max(0, frame_count - offset)`` guards the division, so the result is the
+        # offset itself rather than a value below it.
+        assert fs.normalize_frame_count(0, 0, 4, 10) == 10
+        assert fs.normalize_frame_count(3, 0, 4, 10) == 10
+
     @pytest.mark.parametrize("frame_count", range(1, 90))
     def test_result_is_never_below_the_input_or_the_minimum(self, frame_count):
         result = fs.normalize_frame_count(frame_count, 5, 4, 1)
@@ -146,7 +152,13 @@ class TestFloorFrameCount:
         assert fs.floor_frame_count(7, 7, 4, 1) == 9
 
     def test_below_minimum_fallback_with_offset_zero(self):
+        # offset -3 is clamped to 0, so the grid is 0, 4, 8...; flooring 6 gives 4,
+        # which is under the minimum, so the round-up fallback returns 8.
         assert fs.floor_frame_count(6, 5, 4, -3) == 8
+
+    def test_an_offset_above_the_frame_count_also_uses_the_fallback(self):
+        # lower would be ((0 - 10) // 4) * 4 + 10 == -2, i.e. below the minimum.
+        assert fs.floor_frame_count(0, 0, 4, 10) == 10
 
     @pytest.mark.parametrize("step", [0, 1])
     def test_step_of_one_or_less_only_applies_the_minimum(self, step):
@@ -171,6 +183,8 @@ class TestNormalizeOutputFrameCount:
 
     def test_below_minimum_is_lifted_to_the_minimum(self):
         assert fs.normalize_output_frame_count(1, 5, 4, 1) == 5
+        # minimum=7 is off-grid: both neighbours collapse onto 9, so the result
+        # overshoots the minimum rather than landing on it.
         assert fs.normalize_output_frame_count(3, 7, 4, 1) == 9
 
     @pytest.mark.parametrize("step", [0, 1])
@@ -179,12 +193,20 @@ class TestNormalizeOutputFrameCount:
         assert fs.normalize_output_frame_count(2, 5, step, 1) == 5
 
     @pytest.mark.parametrize("frame_count", range(5, 90))
-    def test_always_lands_on_a_neighbouring_grid_point(self, frame_count):
-        lower = fs.floor_frame_count(frame_count, 5, 4, 1)
-        upper = fs.normalize_frame_count(frame_count, 5, 4, 1)
+    def test_always_lands_on_the_nearer_neighbouring_grid_point(self, frame_count):
+        # The neighbours are derived here arithmetically rather than by calling
+        # floor_frame_count/normalize_frame_count, so a regression in those helpers
+        # cannot move this test's goalposts along with the result.
+        lower = frame_count - (frame_count - 1) % 4
+        upper = lower if lower == frame_count else lower + 4
         result = fs.normalize_output_frame_count(frame_count, 5, 4, 1)
         assert result in (lower, upper)
-        assert abs(result - frame_count) <= abs((lower if result == upper else upper) - frame_count)
+        if frame_count - lower < upper - frame_count:
+            assert result == lower
+        elif frame_count - lower > upper - frame_count:
+            assert result == upper
+        else:
+            assert result == lower  # exact tie -> the lower grid point wins
 
 
 class TestNormalizeOverlap:
@@ -343,6 +365,21 @@ class TestParseOptions:
             None,
         )
 
+    def test_comma_value_matching_a_model_command_is_also_split_off(self):
+        # QUIRK, same heuristic as above but through the ``supported_model_commands``
+        # half of the guard: the fragment becomes its own model option.
+        _, wgp, model, _, error = parse_options(
+            "[/loras_mult=1,zoom]", supported_model_commands={"zoom"}
+        )
+        assert (wgp, model, error) == ({"loras_multipliers": "1"}, {"zoom": True}, None)
+
+    def test_comma_fragment_carrying_its_own_value_is_never_rejoined(self):
+        # A fragment containing "=" is split off whatever its name, so a multiplier
+        # value with an "=" in it ends up parsed as an unknown command.
+        _, wgp, _, _, error = parse_options("[/loras_mult=1,x=2]")
+        assert wgp == {"loras_multipliers": "1"}
+        assert error.startswith("Unknown prompt command '/x'.")
+
     def test_model_commands_with_and_without_values(self):
         _, wgp, model, _, error = parse_options(
             "[/motion=fast][/style]", supported_model_commands={"motion", "style"}
@@ -386,6 +423,14 @@ class TestParseOptions:
         assert error.startswith("Unknown prompt command '/bogus'.")
         assert wgp == {}
 
+    def test_options_accepted_before_the_failing_one_are_kept(self):
+        # The error short-circuits everything after it, but what was already parsed
+        # stays in the dict. Harmless today because build_frame_scheduler throws the
+        # whole result away and returns {} on any error.
+        _, wgp, _, _, error = parse_options("[/duration=5s][/bogus]")
+        assert wgp == {"duration_frames": 80}
+        assert error.startswith("Unknown prompt command '/bogus'.")
+
     @pytest.mark.parametrize("prompt", ["[/ ]", "[/=5]"])
     def test_empty_option_names_are_ignored_but_still_count_as_a_block(self, prompt):
         stripped, wgp, model, has_options, error = parse_options(prompt)
@@ -406,14 +451,31 @@ class TestWindow:
         }
 
     @pytest.mark.parametrize(
-        "output, overlap, discard",
-        [(50, 9, 0), (52, 9, 3), (81, 0, 0), (7, 13, 4), (100, 5, 8)],
+        "output, overlap, discard, expected",
+        [
+            # requested -> (output_frames, overlap_frames, discard_last_frames, frame_num)
+            (50, 9, 0, (49, 9, 3, 61)),
+            (52, 9, 3, (53, 9, 3, 65)),
+            (81, 0, 0, (81, 0, 0, 81)),
+            (7, 13, 4, (5, 13, 7, 25)),  # 7 is a tie between 5 and 9 -> rounds down
+            (100, 5, 8, (101, 5, 11, 117)),
+        ],
     )
-    def test_layout_invariants(self, output, overlap, discard):
+    def test_layout(self, output, overlap, discard, expected):
         window = fs._window("p", output, overlap, discard, None, 5, 4)
+        assert (
+            window["output_frames"],
+            window["overlap_frames"],
+            window["discard_last_frames"],
+            window["frame_num"],
+        ) == expected
+        # ``discard_last_frames`` is *defined* as ``frame_num - output - overlap``, so
+        # the sum identity below can never fail; it documents the layout, while the
+        # literal expectations above are what actually pin the rounding.
         assert window["frame_num"] == (
             window["output_frames"] + window["overlap_frames"] + window["discard_last_frames"]
         )
+        # Rounding frame_num up can only ever grow the discard, never shrink it.
         assert window["discard_last_frames"] >= discard
         assert (window["frame_num"] - 1) % 4 == 0
         assert (window["output_frames"] - 1) % 4 == 0
@@ -525,6 +587,18 @@ class TestPrepareLorasMultWindows:
         assert fs.prepare_loras_mult_windows(scheduler, [], 10, 2) == (
             "Sliding window 1 uses /loras_mult but no LoRA is selected."
         )
+
+    def test_unparsable_multipliers_are_reported_with_the_window_number(self):
+        scheduler = {
+            "active": True,
+            "windows": [{"loras_multipliers": "1"}, {"loras_multipliers": "abc"}],
+        }
+        assert fs.prepare_loras_mult_windows(scheduler, ["lora"], 10, 2) == (
+            "Error parsing /loras_mult for Sliding window 2: "
+            "Lora Multiplier no 1 (abc) is invalid"
+        )
+        # The failing window is reported before anything is stored on it.
+        assert "loras_slists" not in scheduler["windows"][1]
 
     def test_stored_slists_are_only_written_when_requested(self):
         scheduler = {"active": True, "windows": [{"loras_multipliers": "1;2"}]}
@@ -638,6 +712,36 @@ class TestBuildFrameSchedulerLayout:
         scheduler, _ = schedule(["[/duration=48] a", "b"], total_frames=100, first_window_overlap_frames=5)
         assert scheduler["windows"][0]["overlap_frames"] == 5
 
+    def test_overlap_offset_is_applied_to_both_the_default_and_the_prompt_overlap(self):
+        scheduler, error = schedule(
+            ["a", "[/overlap=10] b"], overlap_offset=0, first_window_overlap_frames=100
+        )
+        assert error is None
+        # With offset 0 the overlap grid is plain multiples of the step, floored at
+        # one full step: the default 9 becomes 8 and the explicit 10 becomes 12.
+        assert scheduler["default_overlap_frames"] == 8
+        assert [w["overlap_frames"] for w in scheduler["windows"]][:2] == [8, 12]
+        assert scheduler["overlap_offset"] == 0
+
+    def test_frame_offset_zero_puts_the_windows_on_plain_multiples(self):
+        scheduler, error = schedule(["[/duration=48] a", "[/duration=48] b"], frame_offset=0)
+        assert error is None
+        assert [(w["output_frames"], w["frame_num"]) for w in scheduler["windows"]] == [
+            (48, 48),
+            (48, 60),
+        ]
+        assert scheduler["default_window_size"] == 84  # 81 rounded onto 4n
+        assert scheduler["frame_offset"] == 0
+
+    def test_negative_discard_last_frames_is_clamped_to_zero(self):
+        negative, error = schedule(["[/duration=48] a", "b"], discard_last_frames=-4)
+        assert error is None
+        zero, _ = schedule(["[/duration=48] a", "b"], discard_last_frames=0)
+        assert negative == zero
+        # Without the clamp the auto window would have been sized 81 - 9 + 4 = 76
+        # frames of payload (rounding to 77) instead of 72 (rounding to 73).
+        assert [w["output_frames"] for w in negative["windows"]] == [49, 73]
+
     def test_realistic_multi_prompt_schedule_with_discard(self):
         scheduler, error = schedule(
             ["[/duration=48]a", "[/overlap=13]b", "[/duration=1s]c"],
@@ -688,11 +792,18 @@ class TestBuildFrameSchedulerLayout:
 
     def test_every_window_satisfies_the_frame_num_invariant(self):
         scheduler, _ = schedule(["[/ ] a"], discard_last_frames=4)
+        # Spelled out, because the sum identity below holds by construction:
+        # discard_last_frames is derived from frame_num, not checked against it.
+        assert [
+            (w["output_frames"], w["overlap_frames"], w["discard_last_frames"], w["frame_num"])
+            for w in scheduler["windows"]
+        ] == [(77, 0, 4, 81), (69, 9, 7, 85), (53, 9, 7, 69), (5, 9, 7, 21)]
         for window in scheduler["windows"]:
             assert window["frame_num"] == (
                 window["output_frames"] + window["overlap_frames"] + window["discard_last_frames"]
             )
             assert window["discard_last_frames"] >= 4
+            assert (window["frame_num"] - 1) % 4 == 0
 
 
 class TestBuildFrameSchedulerErrors:

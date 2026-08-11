@@ -76,9 +76,11 @@ explaining them, so the suite stays green. They are listed so a maintainer can d
 - `shared/utils/prompt_parser.py:68` `serialize_prompt_units` does not guard
   `multi_prompts_gen_type` with `or ""` the way `split_prompt_units` does, so `None`
   raises `TypeError`.
-- `shared/utils/filename_formatter.py:115` date tokens are substituted sequentially over
-  the already-substituted string, so a strftime code emitted by one token can be
-  re-matched by a later one.
+- `shared/utils/filename_formatter.py:115` `_parse_date_format` substitutes date tokens
+  sequentially over the already-substituted string, so a strftime code emitted by one
+  token can be re-matched by a later one. `MM` becomes `%m`, and the later `mm` token
+  then matches the `m` it just wrote: the format `MMmm` passes `_is_valid_date_format`
+  but compiles to `%%Mm`, a literal `%` and `m` around the minutes, with the month lost.
 - `shared/utils/filename_formatter.py:205` `format()` applies no overall length cap, so a
   long `{prompt}` produces a filename that fails with `ENAMETOOLONG`.
 - `shared/utils/audio_metadata.py:81` `open(path, 'rb').read()` never closes the handle
@@ -90,12 +92,19 @@ explaining them, so the suite stays green. They are listed so a maintainer can d
 
 ### Fixed
 
-- `shared/utils/loras_mutipliers.py` `_strip_bars_outside_comments` removed phase bars
-  without leaving a separator behind, so adjacent multipliers fused. Reached through
-  `merge_loras_settings`, `_select_new_side(["x","y","z"], "1|2|3", "merge after")`
-  returned the multiplier string `"23"` — a single LoRA strength of twenty-three — where
-  `"2 3"` was meant. The bar is now replaced by a space, matching what
-  `preparse_loras_multipliers` already does when it tokenises.
+**Fix 1 — multiplier fusion.** `shared/utils/loras_mutipliers.py`
+`_strip_bars_outside_comments` removed phase bars without leaving a separator behind, so
+adjacent multipliers fused. Reached through `merge_loras_settings`,
+`_select_new_side(["x","y","z"], "1|2|3", "merge after")` returned the multiplier string
+`"23"` — a single LoRA strength of twenty-three — where `"2 3"` was meant. The bar is now
+replaced by a space, matching what `preparse_loras_multipliers` already does when it
+tokenises. It survived because the spaced spelling `1 | 2` always worked; only `1|2`
+fused.
+
+**Fix 2 — eager package import.** `shared/utils/__init__.py` re-exported the scheduler
+classes from `fm_solvers` eagerly, pulling in torch and diffusers and making every module
+in the package unreachable without the CUDA stack. It is now lazy — see the next section
+for the details and the regression guard.
 
 ## Keeping the pure modules importable
 

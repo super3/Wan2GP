@@ -113,6 +113,41 @@ class TestMapperIndexes:
         assert built.flattened == {"a_to_q": None, "a_q_proj": None}
         assert built.map_key("lora_unet_a_to_q.alpha") == "lora_unet_a_to_q.alpha"
 
+    def test_a_real_module_name_wins_over_the_alias_index(self):
+        # Two targets that are aliases of each other: the index entry for each
+        # one points at the *other* target, so the "is this already a module
+        # name?" guards in map_key are the only thing keeping a canonical key
+        # from being rewritten into its twin. Checked bare and under a
+        # namespace, because map_key guards those two cases separately.
+        built = LoraKeyMapper(["blocks.0.q_proj", "transformer_blocks.0.to_q"])
+        assert built.aliases["blocks.0.q_proj"] == "transformer_blocks.0.to_q"
+        assert built.aliases["transformer_blocks.0.to_q"] == "blocks.0.q_proj"
+        assert built.map_key("blocks.0.q_proj.alpha") == "blocks.0.q_proj.alpha"
+        assert built.map_key("transformer.blocks.0.q_proj.alpha") == (
+            "transformer.blocks.0.q_proj.alpha"
+        )
+        assert built.map_key("diffusion_model.transformer_blocks.0.to_q.alpha") == (
+            "diffusion_model.transformer_blocks.0.to_q.alpha"
+        )
+
+    def test_a_repeated_segment_is_replaced_at_every_position(self):
+        # "blocks" appears twice, so the closure must produce every combination
+        # of replacements, not just the first or the last occurrence.
+        built = LoraKeyMapper(["blocks.0.blocks.1.q_proj"])
+        assert set(built.aliases) == {
+            "blocks.0.blocks.1.to_q",
+            "blocks.0.transformer_blocks.1.q_proj",
+            "blocks.0.transformer_blocks.1.to_q",
+            "transformer_blocks.0.blocks.1.q_proj",
+            "transformer_blocks.0.blocks.1.to_q",
+            "transformer_blocks.0.transformer_blocks.1.q_proj",
+            "transformer_blocks.0.transformer_blocks.1.to_q",
+        }
+        assert set(built.aliases.values()) == {"blocks.0.blocks.1.q_proj"}
+        assert built.map_key("blocks.0.transformer_blocks.1.to_q.alpha") == (
+            "blocks.0.blocks.1.q_proj.alpha"
+        )
+
 
 class TestMapKey:
     @pytest.mark.parametrize(
@@ -161,7 +196,9 @@ class TestMapKey:
             "transformer_blocks.0.to_q.weight",
             "transformer_blocks.0.to_q",
             "",
-            # The marker sits at index 0, which the splitter requires to be > 0.
+            # Nothing but an adapter marker: the module name is empty either
+            # way (the splitter's `position > 0` guard and a `>= 0` one are
+            # indistinguishable here, since "" can never be an index key).
             ".lora_up.weight",
             ".lora.up.weight",
         ],
@@ -227,12 +264,18 @@ class TestMapKey:
         built = LoraKeyMapper(["blocks.0.attn.q_proj"])
         assert built.map_key(key) == key
 
-    def test_flattened_lookup_ignores_namespaces(self):
-        # "lora_unet_" names are matched against the flattened index only, so a
-        # namespace baked into the flat name simply fails to resolve.
+    def test_flattened_lookup_does_no_namespace_handling(self):
         built = LoraKeyMapper(["blocks.0.q_proj"])
-        key = "lora_unet_transformer_blocks_0_to_q.alpha"
-        assert built.map_key(key) == "blocks.0.q_proj.alpha"
+        # "transformer_blocks" is an *alias*, so this flat name does resolve...
+        assert built.map_key("lora_unet_transformer_blocks_0_to_q.alpha") == (
+            "blocks.0.q_proj.alpha"
+        )
+        # ...but the "transformer." / "diffusion_model." namespaces are only
+        # stripped on the dotted path, never on a flattened one, so a flat name
+        # carrying one is an unknown module and passes through untouched.
+        assert built.map_key("lora_unet_diffusion_model_blocks_0_q_proj.alpha") == (
+            "lora_unet_diffusion_model_blocks_0_q_proj.alpha"
+        )
         assert built.map_key("lora_unet_transformer_blocks_0_to_q_extra.alpha") == (
             "lora_unet_transformer_blocks_0_to_q_extra.alpha"
         )
@@ -259,18 +302,28 @@ class TestMapStateDict:
     def test_empty_state_dict_yields_empty_dict(self, mapper):
         assert mapper.map_state_dict({}) == {}
 
-    def test_colliding_keys_raise(self, mapper):
+    @pytest.mark.parametrize(
+        "state_dict",
+        [
+            # Canonical key inserted first, then a variant that maps onto it.
+            {"blocks.0.q_proj.alpha": 1, "transformer_blocks.0.to_q.alpha": 2},
+            # The other way round: the collision is detected against a name that
+            # was itself produced by the mapping, not just against a passthrough.
+            {"transformer_blocks.0.to_q.alpha": 1, "blocks.0.q_proj.alpha": 2},
+            # Neither key is canonical; both remap onto the same target.
+            {"transformer_blocks.0.to_q.alpha": 1, "blocks.0.to_q.alpha": 2},
+        ],
+    )
+    def test_colliding_keys_raise(self, mapper, state_dict):
         with pytest.raises(ValueError, match="collide after mapping to 'blocks.0.q_proj.alpha'"):
-            mapper.map_state_dict(
-                {
-                    "blocks.0.q_proj.alpha": 1,
-                    "transformer_blocks.0.to_q.alpha": 2,
-                }
-            )
+            mapper.map_state_dict(state_dict)
 
     def test_instance_is_callable(self, mapper):
-        state_dict = {"transformer_blocks.0.to_q.alpha": 7}
-        assert mapper(state_dict) == mapper.map_state_dict(state_dict)
+        # Assert the value outright -- comparing __call__ against
+        # map_state_dict would hold for any pair of identically broken
+        # implementations -- and pin that the two really are one function.
+        assert mapper({"transformer_blocks.0.to_q.alpha": 7}) == {"blocks.0.q_proj.alpha": 7}
+        assert LoraKeyMapper.__call__ is LoraKeyMapper.map_state_dict
 
     def test_accepts_any_mapping_and_returns_a_plain_dict(self, mapper):
         source = OrderedDict([("transformer_blocks.0.to_q.alpha", 1)])
