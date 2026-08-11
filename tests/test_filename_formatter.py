@@ -47,6 +47,11 @@ SETTINGS = {
     "guidance_scale": 7.5,
 }
 
+# What each alias must render to given ``SETTINGS`` -- written out as literals so the
+# alias tests compare against a fixed string rather than against another call to the
+# function under test.
+ALIAS_EXPECTATIONS = {"steps": "30", "frames": "81", "cfg": "7.5"}
+
 
 @pytest.fixture
 def frozen_clock(monkeypatch):
@@ -86,9 +91,16 @@ class TestTemplateValidation:
         assert message.startswith("Unknown placeholder: {bogus}.")
         assert message.endswith(", ".join(sorted(FilenameFormatter.ALLOWED_KEYS)))
 
-    def test_validation_happens_in_constructor_not_at_format_time(self):
+    def test_validation_happens_in_constructor_not_at_format_time(self, frozen_clock):
+        # Constructing is what raises...
         with pytest.raises(ValueError):
             FilenameFormatter("{bogus}")
+        # ...and nothing re-checks the template afterwards: swapping in an invalid
+        # one post-construction formats happily (the unknown key resolves to '',
+        # leaving an empty result, which falls back to the default date).
+        formatter = FilenameFormatter("{seed}")
+        formatter.template = "{bogus}"
+        assert formatter.format({"seed": 1}) == DEFAULT_DATE
 
     @pytest.mark.parametrize("template", ["{seed", "seed}", "{}", "{ seed }", "no placeholders"])
     def test_text_that_is_not_a_placeholder_is_not_validated(self, template):
@@ -152,6 +164,39 @@ class TestDatePlaceholder:
         # non-empty-filename fallback rather than the invalid-format fallback.
         assert fmt("{date()}") == DEFAULT_DATE
 
+    def test_numeric_arg_is_not_a_truncation_for_date(self, frozen_clock):
+        # ``{date}`` returns from ``_format_date`` before the ``arg.isdigit()``
+        # truncation branch is reached, and "50" is not a valid date format, so the
+        # whole default timestamp comes back rather than a 50-char cut of it.
+        assert fmt("{date(50)}") == DEFAULT_DATE
+
+    def test_separator_only_format_renders_literally(self, frozen_clock):
+        # 'h' is in DATE_SEPARATORS, so a format made of nothing but separators
+        # validates and strftime hands it straight back.
+        assert fmt("{date(h)}") == "h"
+
+    def test_strftime_failure_falls_back_to_the_default_format(self, monkeypatch):
+        # The ``except`` arm of ``_format_date`` is otherwise unreachable through the
+        # public API: every format that survives ``_is_valid_date_format`` is a legal
+        # strftime string on CPython.
+        class _ExplodingStrftime:
+            def strftime(self, strftime_fmt):
+                if strftime_fmt == "%Y-%m-%d-%Hh%Mm%Ss":
+                    return DEFAULT_DATE
+                raise ValueError("strftime rejected %r" % strftime_fmt)
+
+        class _FrozenDatetime:
+            @staticmethod
+            def fromtimestamp(timestamp):
+                return _ExplodingStrftime()
+
+        monkeypatch.setattr(ff, "time", types.SimpleNamespace(time=lambda: FIXED_TIMESTAMP))
+        monkeypatch.setattr(ff, "datetime", _FrozenDatetime)
+
+        # "YYYY-MM-DD" is valid, so the first strftime("%Y-%m-%d") is attempted,
+        # raises, and the retry with the default pattern is what we see.
+        assert fmt("{date(YYYY-MM-DD)}") == DEFAULT_DATE
+
     def test_adjacent_month_and_minute_tokens_are_mangled(self, frozen_clock):
         # BUG (pinned, not fixed): ``_parse_date_format`` rewrites tokens
         # sequentially over its own output, so ``MMmm`` becomes ``%m`` + ``mm``,
@@ -190,11 +235,22 @@ class TestValuePlaceholders:
     def test_direct_keys(self, frozen_clock, template, expected):
         assert fmt(template) == expected
 
+    def test_alias_map_is_exactly_the_documented_three(self):
+        assert FilenameFormatter.KEY_ALIASES == {
+            "steps": "num_inference_steps",
+            "frames": "video_length",
+            "cfg": "guidance_scale",
+        }
+
     @pytest.mark.parametrize(
         "alias, canonical", sorted(FilenameFormatter.KEY_ALIASES.items())
     )
     def test_aliases_read_the_canonical_setting(self, frozen_clock, alias, canonical):
-        assert fmt("{%s}" % alias) == fmt("{%s}" % canonical)
+        # Both spellings must produce the same *literal* string; comparing the two
+        # calls to each other would also pass if aliases silently resolved to ''.
+        expected = ALIAS_EXPECTATIONS[alias]
+        assert fmt("{%s}" % alias) == expected
+        assert fmt("{%s}" % canonical) == expected
 
     def test_alias_ignores_a_setting_stored_under_the_alias_name(self, frozen_clock):
         # ``{steps}`` resolves to ``num_inference_steps``; a literal ``steps`` entry
@@ -319,9 +375,22 @@ class TestSanitisation:
     def test_underscore_and_whitespace_runs_collapse_and_strip(self, frozen_clock, value, expected):
         assert fmt("{prompt}", {"prompt": value}) == expected
 
+    def test_delete_character_is_not_sanitised(self, frozen_clock):
+        # GAP (pinned, not fixed): UNSAFE_FILENAME_CHARS covers \x00-\x1f but stops
+        # short of \x7f (DEL), so that control character reaches the filename.
+        assert fmt("{prompt}", {"prompt": "a\x7fb"}) == "a\x7fb"
+
     @pytest.mark.parametrize("value, expected", [("", ""), (None, ""), (12, "12"), ("a/b", "a_b")])
     def test_sanitize_helper(self, value, expected):
         assert FilenameFormatter("{prompt}")._sanitize_for_filename(value) == expected
+
+    @pytest.mark.parametrize("value", [0, False, 0.0])
+    def test_sanitize_helper_swallows_falsy_non_strings(self, value):
+        # QUIRK (pinned): the ``if not value`` guard is applied *before* ``str()``, so
+        # a falsy non-string is turned into '' instead of "0"/"False". ``format`` is
+        # unaffected because it stringifies first -- see
+        # TestValuePlaceholders.test_falsy_non_none_values_are_stringified.
+        assert FilenameFormatter("{prompt}")._sanitize_for_filename(value) == ""
 
     def test_hyphens_and_dots_are_preserved(self, frozen_clock):
         assert fmt("-{seed}-", {"seed": 1}) == "-1-"
@@ -336,10 +405,11 @@ class TestEmptyTemplateFallback:
     def test_templates_that_sanitise_to_nothing_fall_back_to_the_date(self, frozen_clock, template):
         assert fmt(template) == DEFAULT_DATE
 
-    def test_fallback_uses_the_default_date_format_not_the_template_argument(self, frozen_clock):
-        # Even though the template asked for a year-only date, the empty-result
-        # fallback re-formats with the default pattern.
-        assert fmt("{date()}") == DEFAULT_DATE
+    def test_fallback_fires_after_literal_text_is_stripped(self, frozen_clock):
+        # The empty date expansion leaves "__", which sanitises to '' -- so the
+        # fallback re-formats with the *default* pattern rather than the (empty)
+        # one the template asked for.
+        assert fmt("_{date()}_") == DEFAULT_DATE
 
 
 class TestUnicode:
@@ -398,7 +468,11 @@ class TestHelpText:
 class TestFormatFilenameClassmethod:
     def test_matches_the_instance_api(self, frozen_clock):
         template = "{date(YYYYMMDD)}_{resolution}_{steps}steps"
-        assert FilenameFormatter.format_filename(template, SETTINGS) == FilenameFormatter(template).format(SETTINGS)
+        expected = "20250115_1280x720_30steps"
+        # Pinned against a literal as well as against each other, so a mutation that
+        # broke *both* paths identically would still be caught.
+        assert FilenameFormatter.format_filename(template, SETTINGS) == expected
+        assert FilenameFormatter(template).format(SETTINGS) == expected
 
     def test_propagates_validation_errors(self):
         with pytest.raises(ValueError, match="Unknown placeholder"):
@@ -416,3 +490,6 @@ class TestFormatFilenameClassmethod:
         }
         result = fmt("{date}/{prompt}/{seed}/{resolution}/{steps}/{cfg}", messy)
         assert "/" not in result and "\\" not in result
+        # Pinned exactly: every separator (literal or from a value) becomes '_' and
+        # the resulting runs collapse, so nothing survives as a directory boundary.
+        assert result == "2025-01-15-14h30m45s_a_b_c_d_1_2_12_34_3_4_9_0"

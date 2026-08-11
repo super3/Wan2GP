@@ -53,7 +53,7 @@ This is where user-visible bugs are both most likely and cheapest to catch.
 | `tests/test_model_configs.py` | `defaults/*.json`, `plugins.json`, `setup_config.json` | Every bundled model definition parses and has the shape the loader expects |
 | `tests/test_package_imports.py` | `shared/utils/__init__.py` and the pure modules | The pure logic stays importable without torch, so the suite keeps working |
 
-The suite is 1499 tests and runs in about two seconds.
+The suite is over 1,500 tests and runs in about two seconds.
 
 `tests/test_model_configs.py` is worth calling out: with ~212 model definitions in
 `defaults/`, a single typo breaks model discovery at startup for everyone. It is a

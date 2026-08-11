@@ -411,6 +411,29 @@ class TestGetModelSwitchSteps:
     def test_second_threshold_is_ignored_below_three_phases(self):
         assert lm.get_model_switch_steps(TIMESTEPS, 2, 1, 700, 300)[1] == 5
 
+    @pytest.mark.parametrize(
+        "switch, switch2, expected",
+        [
+            # 800 is itself a timestep: the comparison is `t <= threshold`, so the step
+            # *at* the threshold already belongs to the next phase (index 1, not 2).
+            (800, 300, (1, 5)),
+            (1000, 200, (0, 5)),  # the very first timestep equals the threshold
+            (200, 200, (4, 5)),  # the very last one does
+        ],
+    )
+    def test_a_timestep_equal_to_the_threshold_switches_on_that_step(self, switch, switch2, expected):
+        # Boundary guard: with a strict `<` the switch would slip one step later, and
+        # every other case in this class uses a threshold that falls between timesteps,
+        # so nothing else here would notice.
+        assert lm.get_model_switch_steps(TIMESTEPS, 2, 1, switch, switch2)[:2] == expected
+
+    def test_second_threshold_boundary_is_also_inclusive(self):
+        assert lm.get_model_switch_steps(TIMESTEPS, 3, 1, 800, 400) == (
+            1,
+            3,
+            "Denoising Steps:  Phase 1 = 1:1, Phase 2 = 2:3, Phase 3 = 4:5",
+        )
+
     def test_threshold_never_reached_falls_back_to_the_step_count(self):
         step, step2, desc = lm.get_model_switch_steps(TIMESTEPS, 2, 1, 100, 50)
         assert (step, step2) == (5, 5)
