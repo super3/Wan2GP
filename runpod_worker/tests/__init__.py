@@ -33,6 +33,19 @@ What each file guards:
     chain — including the ``rp_upload`` local-path fallback, which returns a
     filesystem path instead of raising.
 
+``test_handler.py``
+    The whole job path end to end -- ``schema.parse`` -> ``media_in.materialize``
+    -> ``engine.run`` -> ``media_out.deliver`` -> response envelope -- with the
+    real modules and a stubbed engine. Every error code, its ``retryable`` and
+    ``refresh_worker`` pairing, the idempotent replay, and ``test_input.json``
+    itself. This is the file that catches drift *between* modules.
+
+``test_engine.py``
+    ``engine.run``'s event drain loop against a fake ``SessionJob``: the
+    termination condition, the cooperative cancel on budget overrun, the
+    ``backend_fatal`` latch when a cancel never lands, the poison scan, and the
+    between-jobs truncation of the lists WanGP appends to forever.
+
 The presence of this file makes pytest resolve the modules as
 ``runpod_worker.tests.*``, which puts the repo root on ``sys.path`` so
 ``from runpod_worker import ...`` works with no conftest hack.
