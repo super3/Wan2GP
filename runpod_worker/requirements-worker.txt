@@ -1,0 +1,27 @@
+# runpod_worker/requirements-worker.txt
+#
+# ADDITIVE ONLY. The repo's root requirements.txt is never edited -- mutating it
+# in place is what made PR #317 unmergeable (it deleted mmgp, peft, rembg and
+# gradio from the shared file). Everything this worker needs beyond the WanGP
+# stack lives here, and it is exactly one package.
+#
+# Install it under runpod_worker/constraints.txt, always:
+#
+#   pip install -c runpod_worker/constraints.txt -r runpod_worker/requirements-worker.txt
+#   pip check
+#
+# runpod 1.12.0 pulls fastapi[all]>=0.141.1, boto3>=1.43.66, cryptography>=50,
+# paramiko>=5, aiohttp[speedups]>=3.14.3, colorama<0.4.7 (verified against the
+# PyPI metadata for 1.12.0). fastapi[all] drags in pydantic-settings and
+# pydantic-extra-types, which are free to bump pydantic and break the
+# pydantic==2.10.6 / gradio==5.29.0 / mcp==1.10.1 pins in requirements.txt.
+# The constraints file is what stops that; `pip check` is what proves it.
+#
+# boto3 arrives as a runpod dependency, which is why media_out.py may import it
+# without adding a line here. No other third-party import in this package is
+# outside the standard library.
+#
+# <2 because RunPod has changed the handler contract across majors before; the
+# floor is 1.12.0 because that is the release whose rp_fitness / rp_job / rp_local
+# behaviour this worker was written against.
+runpod>=1.12.0,<2
