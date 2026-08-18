@@ -448,6 +448,21 @@ def _boto3_client():
     )
 
 
+def _rp_upload_available() -> bool:
+    """Whether ``runpod``'s uploader can be imported at all.
+
+    A worker running outside the platform (a container smoke test, a local
+    Tier-2 run) may have boto3 without ``runpod``. Falling through to base64
+    there would be a silent downgrade of a bucket that is perfectly reachable,
+    so :func:`deliver` uses this to pick the direct uploader instead.
+    """
+    try:
+        from runpod.serverless.utils import rp_upload  # noqa: F401,PLC0415
+    except Exception:  # noqa: BLE001 - a broken install is as good as absent
+        return False
+    return True
+
+
 def _upload_via_rp_upload(path: Path, key: str, content_type: str) -> str:
     """``rp_upload.upload_file_to_bucket``, with the local-fallback trap defused."""
     try:
@@ -520,13 +535,52 @@ def _upload_via_boto3(path: Path, key: str, content_type: str) -> str:
 
 
 def find_existing(key: str, *, cfg=None) -> dict[str, Any] | None:
-    """A previously uploaded object for ``key``, or ``None``.
+    """A previously delivered object for ``key``, or ``None``.
 
     The idempotency probe (failure mode 23): a client retry or RunPod's own
     ``/retry`` re-derives the same key, so an already-delivered job can return
     in milliseconds having burned zero GPU seconds. Any error is swallowed into
     ``None`` — a probe must never be able to fail a job.
+
+    Both durable transports are probed, bucket first: an endpoint running the
+    documented phase-1 shape (network volume, no BUCKET_* credentials) has no
+    bucket to HEAD, and probing only the bucket there would silently re-run
+    every retried generation at full GPU cost.
     """
+    return _find_in_bucket(key, cfg=cfg) or _find_on_volume(key)
+
+
+def _find_on_volume(key: str) -> dict[str, Any] | None:
+    """The volume-side half of :func:`find_existing`.
+
+    Mirrors the layout :func:`_copy_to_volume` writes: ``outputs/<key>`` under
+    ``WANGP_VOLUME_ROOT``. A zero-byte file is treated as absent — that is a
+    half-finished copy, not a delivery.
+    """
+    try:
+        dest = _volume_root() / "outputs" / key
+        if not dest.is_file():
+            return None
+        size = dest.stat().st_size
+        if size <= 0:
+            return None
+        return {
+            "transport": "volume",
+            "kind": "volume",
+            "volume_path": f"outputs/{key}",
+            "filename": dest.name,
+            "size_bytes": size,
+            "bytes": size,
+            "content_type": guess_content_type(dest),
+            "sha256": sha256_file(dest),
+            "key": key,
+            "cached": True,
+        }
+    except Exception:  # noqa: BLE001 - a probe must never be able to fail a job
+        return None
+
+
+def _find_in_bucket(key: str, *, cfg=None) -> dict[str, Any] | None:
     if not bucket_configured(cfg) or not _bucket_name():
         return None
     try:
@@ -733,7 +787,14 @@ def deliver(
                         )
                     tried.append(f"rp_bucket: {reason}")
                     continue
-                direct = os.environ.get("WANGP_S3_DIRECT", "0") == "1"
+                # WANGP_S3_DIRECT forces boto3; the absence of `runpod` picks
+                # it anyway, because rp_upload is then unimportable and the
+                # bucket would otherwise be skipped for a reason that has
+                # nothing to do with the bucket.
+                direct = (
+                    os.environ.get("WANGP_S3_DIRECT", "0") == "1"
+                    or not _rp_upload_available()
+                )
                 uploader = "boto3" if direct else "rp_upload"
                 started = time.monotonic()
                 url = (_upload_via_boto3 if direct else _upload_via_rp_upload)(

@@ -610,9 +610,22 @@ def _unpack_run_result(raw: Any) -> tuple[Any, bool, list[str], dict[str, Any], 
         timed_out = getattr(raw, "timed_out", False)
         logs = getattr(raw, "logs", None) or getattr(raw, "tail", None) or []
         phase_marks = getattr(raw, "phase_marks", None) or {}
-        generate_s = getattr(raw, "generate_s", None)
-        if generate_s is None:
-            generate_s = getattr(raw, "duration_s", 0.0)
+        # engine.RunOutcome spells it `gen_s`; the plan's sketch said
+        # `generate_s`. Accept either, plus `duration_s`, so the metric is never
+        # silently 0.0 (which then falls back to a wall clock that excludes the
+        # queue wait).
+        generate_s = next(
+            (
+                value
+                for value in (
+                    getattr(raw, "generate_s", None),
+                    getattr(raw, "gen_s", None),
+                    getattr(raw, "duration_s", None),
+                )
+                if value is not None
+            ),
+            0.0,
+        )
     return (
         result,
         bool(timed_out),
@@ -646,7 +659,11 @@ def _unlink_outputs(paths: list[str]) -> None:
     if not paths or _flag("WORKER_KEEP_OUTPUTS", "0"):
         return
     try:
-        root = Path(os.path.realpath(C.OUTPUT_DIR))
+        # Env first, like media_in._job_root()/media_out._volume_root(): the
+        # module constant is frozen at import, so a process that had
+        # WANGP_OUTPUT_DIR set later (or a test) would otherwise compare against
+        # the wrong root and refuse every unlink.
+        root = Path(os.path.realpath(os.environ.get("WANGP_OUTPUT_DIR") or C.OUTPUT_DIR))
     except OSError:  # pragma: no cover - realpath on a sane path does not fail
         return
     for raw in paths:

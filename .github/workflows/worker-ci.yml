@@ -6,9 +6,10 @@
 # minutes. Nothing here installs requirements.txt -- it pulls torch, gradio and mmgp,
 # takes many minutes, and proves nothing this suite cannot prove without them.
 #
-# NOTE: .gitignore:1 is `.*`, which swallows this file. It is not tracked unless the
-# pattern is negated (`!.github/`) or it is added with `git add -f`. If workflow runs
-# never appear on a PR, that is why.
+# NOTE: .gitignore:1 is `.*`, which matches `.github` and would silently hide this file
+# from a plain `git add`. .gitignore carries `!.dockerignore` and `!.github/` negations
+# to defeat that, alongside the pre-existing `!.gitignore` / `!requirements.txt` pair.
+# If you add a dotfile elsewhere in the tree, expect the same trap.
 name: worker-ci
 
 # The two path lists are duplicated on purpose: GitHub Actions does not support YAML
