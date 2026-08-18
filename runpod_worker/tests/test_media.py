@@ -701,6 +701,58 @@ def test_direct_s3_upload_sets_the_content_type(sandbox, video, monkeypatch):
     assert result["expires_in_s"] == 3600
 
 
+def test_boto3_uploader_is_used_when_runpod_is_absent(sandbox, video, monkeypatch):
+    """A reachable bucket must not be skipped just because the SDK is missing.
+
+    ``deliver`` picks the direct uploader when ``rp_upload`` cannot be imported
+    (a container smoke test, a Tier-2 local run): otherwise the bucket transport
+    would raise ``upload_failed`` and ``auto`` would silently downgrade to
+    base64 for a reason that has nothing to do with the bucket.
+    """
+    client = _FakeS3Client()
+    monkeypatch.setattr(media_out, "_boto3_client", lambda: client)
+    monkeypatch.setattr(media_out, "_rp_upload_available", lambda: False)
+    for key in ("BUCKET_ENDPOINT_URL", "BUCKET_ACCESS_KEY_ID",
+                "BUCKET_SECRET_ACCESS_KEY", "BUCKET_NAME"):
+        monkeypatch.setenv(key, "set")
+    monkeypatch.delenv("WANGP_S3_DIRECT", raising=False)
+
+    result = media_out.deliver(video, job_id="no-sdk-1", cfg=C.WorkerConfig())
+    assert result["transport"] == "rp_bucket" and result["uploader"] == "boto3"
+    assert client.uploads and result["url"].startswith("https://")
+
+
+def test_find_existing_probes_the_volume_without_a_bucket(sandbox, video):
+    """Failure mode 23 on the documented phase-1 shape: volume, no BUCKET_*.
+
+    Probing only the bucket there would re-run every retried generation at full
+    GPU cost, which is the entire thing the probe exists to prevent.
+    """
+    cfg = C.WorkerConfig()
+    delivered = media_out.deliver(video, job_id="vol-idem-1",
+                                  request_opts={"mode": "volume"}, cfg=cfg)
+    assert delivered["transport"] == "volume"
+
+    found = media_out.find_existing(delivered["key"], cfg=cfg)
+    assert found is not None
+    assert found["transport"] == "volume"
+    assert found["cached"] is True
+    assert found["volume_path"] == delivered["volume_path"]
+    assert found["sha256"] == delivered["sha256"]
+    assert found["size_bytes"] == delivered["size_bytes"]
+
+    assert media_out.find_existing("wangp/x/never-generated.mp4", cfg=cfg) is None
+
+
+def test_find_existing_ignores_a_zero_byte_volume_object(sandbox):
+    """A half-finished copy is not a delivery."""
+    key = "wangp/minimax_h3_fl2va_pruned/truncated.mp4"
+    dest = sandbox.volume / "outputs" / key
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_bytes(b"")
+    assert media_out.find_existing(key, cfg=sandbox.cfg) is None
+
+
 def test_find_existing_is_the_idempotency_probe(sandbox, monkeypatch):
     """Failure mode 23: a retry re-derives the key and returns 0 GPU seconds in."""
     client = _FakeS3Client()
