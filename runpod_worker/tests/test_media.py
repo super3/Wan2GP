@@ -230,6 +230,41 @@ def test_volume_path_traversal_is_rejected(sandbox, attempt):
     assert excinfo.value.code in ("bad_request", "media_fetch_failed")
 
 
+def test_volume_traversal_is_rejected_through_materialize(sandbox, tmp_path):
+    """The end-to-end version of the guard above, on the path a caller reaches.
+
+    ``resolve_volume_path`` is the unit; this is the request. A real
+    ``/etc/passwd`` exists on every runner, so a lexical-only check that resolved
+    before rejecting would happily hand WanGP the file — and WanGP's own
+    ``has_*_file_extension`` gate would not stop a ``.png`` named copy of it.
+    """
+    for attempt in ("../../etc/passwd", "../../../../etc/passwd",
+                    "clips/../../etc/passwd"):
+        with pytest.raises(WorkerError) as excinfo:
+            media_in.materialize({"image_start": {"volume": attempt}},
+                                 job_id="trav-1", cfg=sandbox.cfg)
+        assert excinfo.value.code in ("bad_request", "media_fetch_failed")
+
+    # And no existence oracle: a target that really is there outside the root
+    # must fail exactly like one that is not.
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "real.png").write_bytes(PNG)
+    errors = []
+    for name in ("real.png", "absent.png"):
+        with pytest.raises(WorkerError) as excinfo:
+            media_in.materialize(
+                {"image_start": {"volume": f"../{outside.name}/{name}"}},
+                job_id="trav-2", cfg=sandbox.cfg,
+            )
+        errors.append((excinfo.value.code, excinfo.value.message))
+    assert errors[0][0] == errors[1][0]
+
+    assert not (media_in.job_dir_for("trav-1") / "in").exists() or not list(
+        (media_in.job_dir_for("trav-1") / "in").iterdir()
+    ), "a rejected input must not leave a materialized file behind"
+
+
 def test_volume_symlink_escape_is_rejected(sandbox, tmp_path):
     """Lexical `..` checks miss this one; the realpath check does not."""
     secret = tmp_path / "outside"
@@ -322,7 +357,16 @@ def test_ssrf_guard_blocks(url):
 
 
 def _serve(handler_cls):
-    server = socketserver.ThreadingTCPServer(("127.0.0.1", 0), handler_cls)
+    """A loopback-only server. No outbound network: nothing leaves the host.
+
+    A sandbox that forbids even a 127.0.0.1 bind skips the test rather than
+    failing it — the URL path is opt-in (ALLOW_URL_INPUTS=0 by default) and the
+    rest of the suite must stay runnable on a locked-down runner.
+    """
+    try:
+        server = socketserver.ThreadingTCPServer(("127.0.0.1", 0), handler_cls)
+    except OSError as exc:  # pragma: no cover - environment dependent
+        pytest.skip(f"cannot bind a loopback socket in this sandbox: {exc}")
     threading.Thread(target=server.serve_forever, daemon=True).start()
     return server
 
@@ -590,6 +634,94 @@ def test_ffprobe_failure_is_reported_not_raised(sandbox, video, monkeypatch):
     monkeypatch.setenv("WANGP_FFPROBE", str(stub))
     meta = media_out.ffprobe(video)
     assert "probe_error" in meta and "moov atom" in meta["probe_error"]
+
+
+# --------------------------------------------------------------------------
+# The bucket transport without boto3 installed
+# --------------------------------------------------------------------------
+
+def test_boto3_absence_is_a_typed_error_not_an_import_crash(sandbox, monkeypatch):
+    """boto3 ships with runpod, but the CPU tier must not require it.
+
+    Skipped when boto3 *is* installed; either way ``media_out`` itself imports
+    without it (asserted by ``test_modules_stay_cpu_only``).
+    """
+    try:
+        import boto3  # noqa: F401
+    except ImportError:
+        pass
+    else:
+        pytest.skip("boto3 is installed; the missing-dependency path cannot be exercised")
+    with pytest.raises(WorkerError) as excinfo:
+        media_out._boto3_client()
+    assert excinfo.value.code == "upload_failed"
+    assert "boto3" in excinfo.value.message
+
+
+class _FakeS3Client:
+    """Just enough S3 to drive the direct uploader. No boto3, no network."""
+
+    def __init__(self):
+        self.uploads: list[dict] = []
+        self.heads: list[dict] = []
+        self.head_result: dict | None = None
+
+    def upload_file(self, filename, bucket, key, ExtraArgs=None):  # noqa: N803 - boto3's name
+        self.uploads.append({"filename": filename, "bucket": bucket, "key": key,
+                             "extra": ExtraArgs})
+
+    def generate_presigned_url(self, operation, Params=None, ExpiresIn=None):  # noqa: N803
+        return f"https://bucket.example.com/{Params['Key']}?X-Amz-Expires={ExpiresIn}"
+
+    def head_object(self, Bucket=None, Key=None):  # noqa: N803
+        self.heads.append({"bucket": Bucket, "key": Key})
+        if self.head_result is None:
+            raise RuntimeError("404 Not Found")
+        return self.head_result
+
+
+def test_direct_s3_upload_sets_the_content_type(sandbox, video, monkeypatch):
+    """WANGP_S3_DIRECT=1 exists because rp_upload hardcodes ExpiresIn=604800
+    (rp_upload.py:321) and does not set ContentType — a browser then downloads
+    the mp4 as application/octet-stream instead of playing it."""
+    client = _FakeS3Client()
+    monkeypatch.setattr(media_out, "_boto3_client", lambda: client)
+    for key in ("BUCKET_ENDPOINT_URL", "BUCKET_ACCESS_KEY_ID",
+                "BUCKET_SECRET_ACCESS_KEY", "BUCKET_NAME"):
+        monkeypatch.setenv(key, "set")
+    monkeypatch.setenv("WANGP_S3_DIRECT", "1")
+    monkeypatch.setenv("WANGP_S3_EXPIRES_S", "3600")
+
+    result = media_out.deliver(video, job_id="direct-1",
+                               model_type="minimax_h3_fl2va_pruned", cfg=C.WorkerConfig())
+    assert result["transport"] == "rp_bucket" and result["uploader"] == "boto3"
+    assert result["url"].startswith("https://")
+    assert client.uploads[0]["extra"] == {"ContentType": "video/mp4"}
+    assert client.uploads[0]["key"] == result["key"]
+    assert result["expires_in_s"] == 3600
+
+
+def test_find_existing_is_the_idempotency_probe(sandbox, monkeypatch):
+    """Failure mode 23: a retry re-derives the key and returns 0 GPU seconds in."""
+    client = _FakeS3Client()
+    monkeypatch.setattr(media_out, "_boto3_client", lambda: client)
+    for key in ("BUCKET_ENDPOINT_URL", "BUCKET_ACCESS_KEY_ID",
+                "BUCKET_SECRET_ACCESS_KEY", "BUCKET_NAME"):
+        monkeypatch.setenv(key, "set")
+
+    assert media_out.find_existing("wangp/x/job.mp4", cfg=C.WorkerConfig()) is None
+    client.head_result = {"ContentLength": 4096, "ContentType": "video/mp4"}
+    found = media_out.find_existing("wangp/x/job.mp4", cfg=C.WorkerConfig())
+    assert found and found["url"].startswith("https://")
+    assert found["size_bytes"] == 4096
+    # A probe must never be able to fail a job.
+    monkeypatch.setattr(media_out, "_boto3_client",
+                        lambda: (_ for _ in ()).throw(RuntimeError("boom")))
+    assert media_out.find_existing("wangp/x/job.mp4", cfg=C.WorkerConfig()) is None
+
+
+def test_find_existing_is_inert_without_a_bucket(sandbox):
+    assert media_out.find_existing("wangp/x/job.mp4", cfg=sandbox.cfg) is None
 
 
 # --------------------------------------------------------------------------
