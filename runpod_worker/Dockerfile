@@ -37,15 +37,21 @@
 # minutes into a billed job. Drop 8.0 only if A100 is out of your GPU priority
 # list; every arch you add costs build minutes and wheel size, not run time.
 ARG CUDA_ARCHITECTURES="8.0;8.6;8.9;9.0"
+# Pin to a tag or branch for a reproducible build; `main` is a moving target.
+# --depth 1 --branch only accepts a ref name, not a bare commit sha.
 ARG SAGEATTENTION_REF="main"
+# nvcc is memory-hungry: budget roughly 2 GB of builder RAM per job. Lower this
+# (--build-arg MAX_JOBS=4) if the build dies with an OOM-killed cicc.
+ARG MAX_JOBS="8"
 
 FROM nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04 AS builder
 ARG CUDA_ARCHITECTURES
 ARG SAGEATTENTION_REF
+ARG MAX_JOBS
 ENV DEBIAN_FRONTEND=noninteractive \
-    TORCH_CUDA_ARCH_LIST=${CUDA_ARCHITECTURES} \
+    TORCH_CUDA_ARCH_LIST="${CUDA_ARCHITECTURES}" \
     FORCE_CUDA=1 \
-    MAX_JOBS=8 \
+    MAX_JOBS="${MAX_JOBS}" \
     CUDA_HOME=/usr/local/cuda \
     PIP_ROOT_USER_ACTION=ignore
 
@@ -92,6 +98,11 @@ RUN python3 /tmp/patch_sage_setup.py setup.py && \
 # Swapping to cudnn-runtime saves ~3 GB and breaks the pip install.
 FROM nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04
 
+LABEL org.opencontainers.image.title="WanGP MiniMax H3 RunPod Serverless worker" \
+      org.opencontainers.image.description="RunPod Serverless handler driving WanGP (deepbeepmeep/Wan2GP) through shared/api.py. This image integrates WanGP; see docs/API.md:9 and LICENSE.txt:316 for the required disclosure." \
+      org.opencontainers.image.source="https://github.com/deepbeepmeep/Wan2GP" \
+      org.opencontainers.image.licenses="Apache-2.0"
+
 # --- environment -------------------------------------------------------------
 # Split into three ENV blocks: platform, WanGP runtime layout, worker policy.
 # Every one of these is overridable from the RunPod endpoint's env settings;
@@ -125,7 +136,7 @@ ENV WANGP_ROOT=/opt/wangp \
 # switch costs a full release_model()+reload. ALLOW_MODEL_SWITCH=1 opts out.
 #
 # --attention sdpa, not sage/sage2: resolve_attention_mode (shared/attention.py:294-302)
-# RAISES on an unsupported mode, and wgp.py:6815-6818 turns an unsupported
+# RAISES on an unsupported mode, and wgp.py:6816-6819 turns an unsupported
 # per-task override into send_cmd("exit"); return True -- a silent, file-less
 # "success" that bills for the whole load. Flip to sage2 via WANGP_CLI_ARGS +
 # WANGP_ATTENTION only after confirming the endpoint's GPU tier and measuring it.

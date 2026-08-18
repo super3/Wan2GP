@@ -1,0 +1,25 @@
+{
+  "input": {
+    "model_type": "minimax_h3_fl2va_pruned",
+    "profile": "Turbo Lightx2v FL2V 4 Steps v1.0 768p",
+    "settings": {
+      "prompt": "integrated_multimodal_description: [Shot 1] A five-second cinematic single take inside a rain-lashed glass observatory at midnight. A radio astronomer leans toward a brass receiver and says clearly (S1) <d>[English] If you can hear me, follow this signal.</d> The camera makes a slow push from medium shot to close-up; her speech completes naturally within the shot with precise lip synchronization.\noverall_soundscape: Rain rattling across the observatory dome, a low electrical hum, three clean receiver tones, and her synchronized voice.\nnon_diegetic_music: One quiet bowed-glass chord rising beneath the transmission and fading at the end.",
+      "resolution": "832x480",
+      "video_length": 124,
+      "sample_solver": "euler",
+      "image_prompt_type": "",
+      "video_prompt_type": "",
+      "audio_prompt_type": "",
+      "sliding_window_size": 362,
+      "sliding_window_overlap": 18,
+      "seed": 918273645
+    },
+    "output": {
+      "mode": "auto",
+      "content_type": "video/mp4"
+    },
+    "runtime": {
+      "timeout_s": 900
+    }
+  }
+}
