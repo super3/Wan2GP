@@ -1,0 +1,58 @@
+# runpod_worker/constraints.txt — pin-guard for the `runpod` install layer.
+#
+# A pip *constraints* file never installs anything. It only says: "if you touch
+# this package at all, it must be exactly this version." Passing it to the
+# runpod install is what keeps `pip install runpod` from quietly re-resolving
+# the WanGP stack that the previous layer just built.
+#
+# WHAT IT IS GUARDING AGAINST (runpod 1.12.0's declared dependencies, read from
+# the PyPI metadata for that release):
+#
+#   aiohttp[speedups]>=3.14.3   boto3>=1.43.66        click>=8.4.2
+#   colorama>=0.4.6,<0.4.7      cryptography>=50.0.0  fastapi[all]>=0.141.1
+#   paramiko>=5.0.0             psutil>=7.2.2         requests>=2.34.2
+#   urllib3>=2.7.0              watchdog>=6.0.0       (+ 8 more)
+#
+# `fastapi[all]` is the dangerous one: it pulls pydantic-settings and
+# pydantic-extra-types, either of which may require a newer pydantic than the
+# `pydantic==2.10.6` that gradio 5.29.0 and mcp 1.10.1 were resolved against.
+# Without this file the runpod layer can silently upgrade pydantic and leave a
+# broken gradio/mcp behind, and nothing fails until `import wgp` at cold start.
+#
+# EVERY VERSION BELOW WAS READ OUT OF THE REPO, NOT OUT OF THE PLAN DOCUMENT.
+# Line numbers are into requirements.txt / Dockerfile at the repo root.
+#
+# HOW TO USE IT
+#   pip install -c runpod_worker/constraints.txt -r runpod_worker/requirements-worker.txt
+#   pip check          # <- the gate. The Dockerfile fails the build if this fails.
+#
+# HOW TO EXTEND IT
+#   If `pip check` ever fails on a package not listed here, add that package at
+#   the version requirements.txt pins it to. Do NOT relax a pin here to make the
+#   build pass -- that just moves the breakage to cold start.
+
+# --- the three the plan calls out: the pydantic blast radius -----------------
+pydantic==2.10.6          # requirements.txt:78
+gradio==5.29.0            # requirements.txt:40  (gradio_rangeslider rides along)
+mcp==1.10.1               # requirements.txt:79
+
+# --- the torch triple: installed from download.pytorch.org/whl/cu128 in an ---
+# --- earlier layer, and a plain-PyPI reinstall would be the CPU build.      ---
+# PEP 440: `==2.10.0` matches the local version `2.10.0+cu128`, so these pins
+# hold without naming the +cu128 local segment (which pip cannot resolve from
+# a constraints file against a different index).
+torch==2.10.0             # Dockerfile:40
+torchvision==0.25.0       # Dockerfile:40
+torchaudio==2.10.0        # Dockerfile:40
+
+# --- the rest of the exactly-pinned WanGP stack, in requirements.txt order ---
+# Inert unless something in the runpod closure tries to move them, which is
+# exactly when you want them to be here.
+mmgp==3.7.12              # requirements.txt:2   — the offloading engine; the
+                          #   entire reason to build on WanGP rather than
+                          #   diffusers. A bump here changes VRAM behaviour.
+diffusers==0.36.0         # requirements.txt:4
+transformers==4.54.0      # requirements.txt:5
+numpy==2.1.2              # requirements.txt:15
+torchcodec==0.10.0        # requirements.txt:33  — ABI-coupled to torch
+peft==0.17.0              # requirements.txt:84  — LoRA loading path
