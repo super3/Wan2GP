@@ -1,4 +1,4 @@
-# runpod_worker/constraints.txt — pin-guard for the `runpod` install layer.
+# runpod_worker/constraints.txt -- pin-guard for the `runpod` install layer.
 #
 # A pip *constraints* file never installs anything. It only says: "if you touch
 # this package at all, it must be exactly this version." Passing it to the
@@ -48,11 +48,11 @@ torchaudio==2.10.0        # Dockerfile:40
 # --- the rest of the exactly-pinned WanGP stack, in requirements.txt order ---
 # Inert unless something in the runpod closure tries to move them, which is
 # exactly when you want them to be here.
-mmgp==3.7.12              # requirements.txt:2   — the offloading engine; the
+mmgp==3.7.12              # requirements.txt:2   -- the offloading engine; the
                           #   entire reason to build on WanGP rather than
                           #   diffusers. A bump here changes VRAM behaviour.
 diffusers==0.36.0         # requirements.txt:4
 transformers==4.54.0      # requirements.txt:5
 numpy==2.1.2              # requirements.txt:15
-torchcodec==0.10.0        # requirements.txt:33  — ABI-coupled to torch
-peft==0.17.0              # requirements.txt:84  — LoRA loading path
+torchcodec==0.10.0        # requirements.txt:33  -- ABI-coupled to torch
+peft==0.17.0              # requirements.txt:84  -- LoRA loading path
