@@ -2,7 +2,7 @@
 
 A RunPod Serverless worker that generates MiniMax H3 video (with synchronized audio) by
 driving WanGP in-process through `shared/api.py`. One `model_type` per endpoint, one
-generation per process, weights on a network volume, output delivered as a URL.
+generation at a time per worker, weights on a network volume, output delivered as a URL.
 
 **Callers must use `POST /run` + `GET /status/{id}` (or a webhook). Never `/runsync`.**
 A generation takes minutes; `/runsync` waits 90 s by default and 300 s at most, and
@@ -89,9 +89,9 @@ Nothing here is legal advice; read `LICENSE.txt` yourself.
 | Model | `minimax_h3_fl2va_pruned` by default; `minimax_h3_fl2va`, `minimax_h3_ref2va`, `minimax_h3_ref2va_pruned` are supported, one per endpoint |
 | Input | prompt + optional start/end frames, control video, reference images, audio references — as base64 or `volume://` paths |
 | Output | a muxed `.mp4` with an AAC track, delivered by presigned PUT, your S3 bucket, or base64 under a cap |
-| Concurrency | **1 generation per worker process, ever.** WanGP holds a process-global generation lock and installs a process-global `redirect_stdout` for the whole job. Scale with `max_workers`, never with `concurrency_modifier`. |
+| Concurrency | **Exactly one generation at a time per worker process.** WanGP holds a process-global generation lock and installs a process-global `redirect_stdout` for the whole job, so two jobs in one process is not a tuning question. Jobs are served sequentially by the same warm process; scale with `max_workers`, never with `concurrency_modifier`. |
 | Validation | every request is pre-flighted on CPU in <50 ms — unknown keys, illegal flag-letter combinations, frame-count math, LoRA paths — so a bad request costs zero GPU seconds |
-| Cancellation | cooperative; `POST /cancel/{id}` and the per-request `timeout_s` both land at the model's next interrupt check |
+| Cancellation | the per-request `timeout_s` is the in-process stop: on overrun the worker aborts the generation cooperatively, which lands at the model's next interrupt check. `POST /cancel/{id}` stops the *job* but not the *generation* — see [Cancellation, precisely](#cancellation-precisely). |
 
 What it deliberately does **not** do: run more than one model per endpoint (a switch costs
 a full `release_model()` + reload), accept arbitrary local paths in `settings`, return a
@@ -218,11 +218,14 @@ tree. First build is 40–90 minutes (SageAttention compiles from source in stag
   `MAX_JOBS` (default 8; nvcc needs ~2 GB of builder RAM per job — lower it if `cicc`
   gets OOM-killed).
 
-> **Gotcha: `.dockerignore` and `.github/` are invisible to git.** `.gitignore:1` is `.*`
-> and there is no negation for either. A local build reads `.dockerignore` off disk and
-> is fine; **a fresh clone or a CI build has no ignore file at all** and ships `.git` plus
-> any local `ckpts/` into the build context. Fix with one line in `.gitignore`
-> (`!.dockerignore` and `!.github/`) or `git add -f .dockerignore .github`.
+> **Gotcha: `.gitignore:1` is `.*`, which matches every dotfile.** `.dockerignore` and
+> `.github/workflows/worker-ci.yml` are tracked only because they were force-added
+> (`git add -f`); ignore rules do not apply to files git already tracks, so they stay
+> tracked. But **any new dotfile is silently skipped by a plain `git add`** — a second
+> workflow, a `.env.example`, a `.github/dependabot.yml`. If `.dockerignore` ever goes
+> missing from a clone, the build context grows by the whole `.git` directory plus any
+> local `ckpts/`. The durable fix is two negation lines in `.gitignore`:
+> `!.dockerignore` and `!.github/`.
 
 Verify before pushing:
 
@@ -248,16 +251,22 @@ Serverless → New Endpoint → import from Docker Registry.
 | **Network volume** | the one you just warmed | |
 | **Concurrency** | leave alone | The worker passes no `concurrency_modifier`; the SDK default of 1 is correct and required. |
 
-Minimum env to set on the endpoint:
+Env worth setting on the endpoint. Nothing here is *required* — the image bakes working
+defaults and the worker boots with an empty env — but these are the ones that matter:
 
 ```
-WANGP_MODEL_TYPE=minimax_h3_fl2va_pruned
+WANGP_MODEL_TYPE=minimax_h3_fl2va_pruned    # baked; set it anyway, it is the endpoint's identity
 WANGP_ALLOWED_LORAS=minimax_h3_lightx2v_fl2v_turbo_4step_alpha128_v1.0_768p_bf16.safetensors
-BUCKET_ENDPOINT_URL=...          # or nothing, and require callers to send presigned_url
-BUCKET_ACCESS_KEY_ID=...
+BUCKET_ENDPOINT_URL=...          # or none of the four, and require callers to send
+BUCKET_ACCESS_KEY_ID=...         # output.presigned_url instead
 BUCKET_SECRET_ACCESS_KEY=...
 BUCKET_NAME=...
+REQUIRE_BUCKET=1                 # if outputs will exceed the 6 MB base64 cap
 ```
+
+Leaving `WANGP_ALLOWED_LORAS` empty means **no LoRA allow-list**, and a request may then
+name an arbitrary `https://` LoRA that WanGP will download. Set it on anything that is not
+fully trusted.
 
 VRAM is not the binding constraint (5–6 GB for 5 s at 832×480 with mmgp block-swapping);
 **system RAM is**, because mmgp streams ~48–60 GB of weights through it. RunPod does not
@@ -346,9 +355,9 @@ marked **(baked)**. Nothing below is required for the worker to start.
 | `BUCKET_ENDPOINT_URL` | *(unset)* | S3-compatible endpoint. All three of endpoint/key/secret must be set for the `rp_bucket` transport to be attempted at all. |
 | `BUCKET_ACCESS_KEY_ID` | *(unset)* | |
 | `BUCKET_SECRET_ACCESS_KEY` | *(unset)* | |
-| `BUCKET_NAME` | *(unset)* | Required for the direct-boto3 uploader and for the idempotency HEAD probe. Note `rp_upload`'s own default bucket name is the current `%m-%y`, which is never what you want. |
+| `BUCKET_NAME` | *(unset)* | Required for the direct-boto3 uploader and for the bucket half of the idempotency probe (the volume half needs no credentials). Note `rp_upload`'s own default bucket name is the current `%m-%y`, which is never what you want. |
 | `BUCKET_REGION` | `us-east-1` | |
-| `WANGP_S3_DIRECT` | `0` | `1` uploads with boto3 directly instead of `runpod`'s `rp_upload`. Sets `ContentType`, honours `WANGP_S3_EXPIRES_S`, and enables `find_existing()`. Used automatically when the `runpod` package is absent. |
+| `WANGP_S3_DIRECT` | `0` | `1` uploads with boto3 directly instead of `runpod`'s `rp_upload`. Sets `ContentType` and honours `WANGP_S3_EXPIRES_S`. Used automatically when the `runpod` package is absent. (The idempotency probe always talks to boto3 directly, whatever this is set to.) |
 | `WANGP_S3_PREFIX` | `wangp` | Key prefix. Object keys are `<prefix>/<model_type>/<job_id or idempotency_key>.mp4`. |
 | `WANGP_S3_EXPIRES_S` | `604800` (7 d) | Presigned-GET lifetime for the direct uploader. `rp_upload` hardcodes 604800 and ignores this. |
 | `WANGP_S3_PUBLIC_BASE_URL` | *(unset)* | If set, the response carries `<base>/<key>` instead of a presigned URL (for a public bucket or a CDN in front of it). |
@@ -369,7 +378,7 @@ marked **(baked)**. Nothing below is required for the worker to start.
 | `WANGP_EAGER_BOOT` | `auto` | `auto` = boot (`import wgp`, weight gate) at import when running as `__main__` or when `RUNPOD_WEBHOOK_GET_JOB` is set, so a pytest import stays free. `1` forces it, `0` defers to the first job. |
 | `WORKER_FITNESS` | `1` | Register the SDK fitness checks (boot, CUDA, weights, transport). A failing check exits the worker so the platform marks it unhealthy and replaces it. |
 | `WORKER_SKIP_GPU_FITNESS` | `0` | `1` drops the `torch.cuda.is_available()` check — for a CPU smoke test of the container. |
-| `WORKER_IDEMPOTENCY` | `1` | HEAD-probe the derived object key before generating. A retry (yours or RunPod's `/retry`) then returns the existing object at zero GPU seconds. Needs `BUCKET_NAME`. |
+| `WORKER_IDEMPOTENCY` | `1` | Probe the derived object key before generating. A retry (yours or RunPod's `/retry`) then returns the existing object at zero GPU seconds. Both durable transports are probed: a HEAD against the bucket when the `BUCKET_*` trio **and** `BUCKET_NAME` are set, then `outputs/<key>` on the network volume. With neither configured the probe is a no-op. A hit is marked `video.cached: true` and carries no ffprobe block — nothing was generated to probe. |
 | `WORKER_KEEP_OUTPUTS` | `0` | `1` keeps generated files in `WANGP_OUTPUT_DIR` after delivery. Debug only; the disk is not swept. |
 | `WORKER_LOG_TAIL` | `30` | Lines of WanGP output attached to a failure response as `logs_tail`. |
 | `WORKER_ERROR_OBJECT` | `0` | `1` replaces the string `error` field with `{code, message, retryable, details}`. Off by default because the documented response shape uses the string. |
@@ -521,10 +530,28 @@ while :; do
   sleep 5
 done
 
-# cancel
+# cancel -- see the caveat below: this ends the JOB, not the generation
 curl -s -X POST "https://api.runpod.ai/v2/$ENDPOINT_ID/cancel/$ID" \
      -H "Authorization: Bearer $RUNPOD_API_KEY"
 ```
+
+#### Cancellation, precisely
+
+`POST /cancel/{id}` reaches the worker: the SDK long-polls a stop channel and calls
+`task.cancel()` on the asyncio task running the handler. The handler is `async` and hands
+the body to `asyncio.to_thread` exactly so that poll loop keeps running — a synchronous
+handler starves it for the whole multi-minute job and the signal is never seen.
+
+But `task.cancel()` cancels the *await*, not the thread. Python cannot kill a running
+thread, so **the generation continues to completion (or to its `timeout_s`) and you keep
+being billed for it**; only the result is discarded. The engine exposes a `cancel_check`
+hook for a cooperative in-process abort, and the handler does not currently wire the SDK's
+stop signal into it.
+
+Practical consequence: **`runtime.timeout_s` is your real cost control**, not `/cancel`.
+Set it to what you are actually willing to pay for. The budget path *does* abort the
+generation from inside the process — `job.cancel()` sets WanGP's abort flag and the model
+notices at its next interrupt check, within one denoising step.
 
 `124 = 5 + 17·7` is on the lattice, so nothing is floored. The profile supplies the turbo
 LoRA, `num_inference_steps: 4`, `guidance_scale: 1` and `flow_shift: 6` — **the turbo
@@ -596,6 +623,11 @@ echoed into a response or a log.
 `refresh_worker: true` may appear on a **successful** response too: it means this worker
 served you and is now retiring (failure budget, VRAM drift). It is not an error.
 
+An idempotent hit (same `runtime.idempotency_key`, object already in the bucket or on the
+network volume) returns
+the same envelope with `metrics.idempotent_hit: true`, `video.cached: true`, no ffprobe
+block, and an `executionTime` of a few hundred milliseconds.
+
 ### Progress
 
 Readable mid-flight from `/status`. Each frame **overwrites** the previous one — it is a
@@ -644,7 +676,7 @@ by `pct`. `eta_s` appears once two steps of the same phase have been observed.
 | `wangp_validation` | WanGP's own validator rejected the settings | no | no |
 | `generation_failed` | The generation ran and failed | only when poisoned | when poisoned |
 | `timeout` | Exceeded the request's wall-clock budget and was cancelled | **yes** | after the failure budget |
-| `cancelled` | Cancelled by the client before producing a file | **yes** | no |
+| `cancelled` | WanGP reported the generation aborted without a budget overrun (worker drain/shutdown, internal abort) | **yes** | no |
 | `no_output` | WanGP reported success and produced no video file | no | **no** |
 | `output_too_large` | No configured transport can carry the result | no | no |
 | `upload_failed` | An upload was attempted and did not yield a real URL | **yes** | no |
@@ -670,7 +702,7 @@ whole reason CI runs on a plain runner.
 
 ```bash
 pip install pytest
-pytest runpod_worker/tests -q          # 222 tests, ~3 s
+pytest runpod_worker/tests -q          # 291 tests, ~3 s
 ```
 
 This is `.github/workflows/worker-ci.yml`, plus a hadolint pass over the Dockerfile. It
@@ -691,6 +723,16 @@ What it protects, in rough order of value:
 - **`test_rp_upload_local_fallback_is_caught`**: `rp_upload` returns a `local_upload/…`
   path instead of raising when it cannot build a client. Silently returning that to a
   caller is the single most likely data-loss bug in this design.
+- **`tests/test_handler.py`** drives `handler.run_job` end to end with a stubbed engine
+  and the *real* schema/media/config modules: the success envelope, every error code and
+  its `retryable`/`refresh_worker` pairing, media materialization, scratch-dir and
+  output-file cleanup, the idempotent replay, and `test_input.json` itself. This is what
+  catches interface drift between the modules, which no single-module test can see.
+- **`tests/test_engine.py`** drives the event drain loop with a fake `SessionJob`: the
+  termination condition (`job.done` *and* `events.closed` *and* a drained queue, because
+  the error text arrives after `_set_result`), the cooperative cancel on budget overrun,
+  the `backend_fatal` latch when a cancel never lands, the poison-marker scan, and the
+  between-jobs truncation of the lists WanGP appends to forever.
 
 ### Tier 2 — GPU, no RunPod
 
@@ -748,7 +790,8 @@ docker run --rm --gpus all --env-file .env.staging \
 4. `python3 -m runpod_worker.scripts.calibrate --endpoint $ENDPOINT_ID --matrix
    steps=4,8,20 frames=124,209,362 --repeat 3` → p50/p90 per cell, cold-start
    distribution, $/generation, and a recommended `WANGP_DEFAULT_BUDGET_S` (measured
-   p99 × 1.3). `--json` / `--csv` write the raw data.
+   p99 × 1.3). `--json` / `--csv` write the raw data. It reads `$RUNPOD_API_KEY` (or
+   `--api-key`) and honours `$RUNPOD_API_BASE` for a non-default API host.
 5. Chaos pass. Each of these should produce a specific, fast, non-poisoning failure:
    `timeout_s: 60` on a 20-step job (expect `timeout`, not a platform kill); a `.png` in
    `audio_guide` (`media_unsupported`); `video_length: 700` (`invalid_setting`);
@@ -883,12 +926,13 @@ work.
 See "Operational chores" — an endpoint with no requests for 3 days has max workers
 auto-reduced to 2, and to **0 after 7 days**, and stays reduced until raised by hand.
 
-### 15. CI never runs / the image contains `.git`
+### 15. A new dotfile silently never lands in a commit
 
-`.gitignore:1` is `.*`, which swallows both `.github/` and `.dockerignore`. Neither file
-is tracked unless you negate the pattern or `git add -f` them. Symptom: workflows do not
-appear on GitHub, and a build from a fresh clone has a build context tens of GB larger
-than a local one.
+`.gitignore:1` is `.*`. `.dockerignore` and `.github/workflows/worker-ci.yml` survive only
+because they were force-added; anything *new* under `.github/` (or any other dotfile) is
+skipped by `git add` with no error. Symptoms: a workflow that never runs, or a build from
+a fresh clone whose context is tens of GB larger than a local one because `.dockerignore`
+did not come along. Add `!.dockerignore` and `!.github/` to `.gitignore`.
 
 ---
 
@@ -993,5 +1037,5 @@ in this repo**; a Ref2VA endpoint runs at 20 steps.
 | `scripts/verify_weights.py` | Pre-deploy gate; the same enumeration the boot fitness check runs. |
 | `scripts/calibrate.py` | Timing matrix → measured timeout and cost numbers. |
 | `scripts/patch_sage_setup.py` | Build-time: pins SageAttention's target architectures without a GPU present. |
-| `tests/` | CPU-only test suite. No GPU, no torch, no weights, no network. |
+| `tests/` | CPU-only test suite: `test_schema.py`, `test_media.py`, `test_wgp_config_drift.py`, `test_handler.py` (end-to-end `run_job` with a stubbed engine), `test_engine.py` (the drain loop with a fake job). No GPU, no torch, no weights, no network. |
 | `../.github/workflows/worker-ci.yml` | The Tier-1 suite plus hadolint, on every PR touching this directory. |
