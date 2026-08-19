@@ -112,3 +112,50 @@ config wins the target metric. Watch upstream #110/#111 for fixes.
 
 Total: roughly a week of effort, ~$20 of test spend, with a kill switch after
 each phase.
+
+## Alternative: porting Raylight's method directly into WanGP (no ComfyUI)
+
+Assessed 2026-08-19 by reading the H3 model and orchestration code. Verdict:
+technically feasible, unusually well-suited model, but a bigger build and a
+permanent fork burden. File-level findings:
+
+**What makes it easy** (the model is USP-friendly by construction):
+- Single hook point: every block's attention funnels through one call --
+  `pay_attention(qkv_list)` at `models/minimax_h3/transformer.py:205` -- the
+  exact analog of what Raylight monkey-patches; the block loop at
+  `transformer.py:625-642` is where forward would pad/split the packed
+  sequence per rank and all-gather after.
+- The denoise loop is SPMD-reproducible: all encodes finish BEFORE the loop
+  and hand over CPU tensors; initial latents come from a CPU generator seeded
+  by the task seed (`pipeline.py:476-489`). Rank-0-only encode/VAE-decode with
+  a broadcast of context+latents is structurally clean.
+- No `cuda:0` hardcodes; one-GPU-per-process pinning already exists (`--gpu`
+  rewrites CUDA_VISIBLE_DEVICES at wgp import).
+- WanGP's runtime LoRA path (incl. per-step multipliers and pruned-adaln
+  conversion, `transformer.py:378-440`) keeps working -- avoiding Raylight's
+  open H3-turbo-LoRA bug (#110) entirely.
+
+**What must be built** (each a real work item):
+- Rank-aware forward: shard the RoPE table by rank ranges; RECOMPUTE the
+  AdaLN (start,stop,row) segment list per shard (`transformer.py:605-609`);
+  force sdpa/sage and disable Sol sparse attention (global `sink_tokens`
+  offset is split-hostile, `sol_attention.py:24`), FirstBlockCache and
+  Spectrum step-skipping (full-sequence signatures diverge per shard), and
+  make FinalLayer's global audio/video slice indices shard-aware.
+- Process-group bootstrap (torchrun or Ray), a command channel so ranks>0
+  enter `pipeline.generate` per sliding window with identical args, and
+  cancellation broadcast (today's abort flags are process-local; ranks would
+  hang at the next NCCL collective).
+- Skip-loading on ranks>0: loading is monolithic -- every rank would load the
+  Qwen3-VL-32B text encoder and both VAEs into host RAM (N x 26.7 GB pins,
+  which the ~46.6 GiB serverless containers cannot hold). mmgp must run
+  per-rank with resident (profile 1/3-style) weights; whether its paging
+  coexists with NCCL memory pools is untested.
+
+**The decisive cost -- upstream churn:** wgp.py is 13,860 lines with 29
+upstream commits since 2026-07-01; `models/minimax_h3/` is 3,327 lines with
+26 commits in the 2.5 weeks since H3 landed. A fork patching model internals
+must track that surface forever; Raylight outsources exactly this maintenance
+to its author. Estimate 2-3 weeks to a solid port vs ~1 week for the ComfyUI
+route, with the same Amdahl-limited ~1.3-1.5x end-to-end ceiling for the
+4-step turbo workload.
