@@ -36,14 +36,17 @@ pydantic==2.10.6          # requirements.txt:78
 gradio==5.29.0            # requirements.txt:40  (gradio_rangeslider rides along)
 mcp==1.10.1               # requirements.txt:79
 
-# --- the torch triple: installed from download.pytorch.org/whl/cu128 in an ---
-# --- earlier layer, and a plain-PyPI reinstall would be the CPU build.      ---
-# PEP 440: `==2.10.0` matches the local version `2.10.0+cu128`, so these pins
-# hold without naming the +cu128 local segment (which pip cannot resolve from
-# a constraints file against a different index).
-torch==2.10.0             # Dockerfile:40
-torchvision==0.25.0       # Dockerfile:40
-torchaudio==2.10.0        # Dockerfile:40
+# --- the torch triple: RESOLVED BY requirements.txt, not pinned by us. ------
+# Measured on a real RunPod pod (2026-08-19), not taken from the plan: a plain
+# `pip install -r requirements.txt` lands exactly these versions, on CUDA 13
+# wheels from PyPI, and that stack ran a full generation on Blackwell sm_120.
+# The previous 2.10.0 pins here were stale -- requirements.txt overwrites the
+# Dockerfile's torch install, so constraining to 2.10.0 would have tried to
+# DOWNGRADE torch during the runpod layer.
+# Re-measure and update these if requirements.txt changes.
+torch==2.13.0             # verified 2026-08-19
+torchvision==0.28.0       # verified 2026-08-19
+torchaudio==2.11.0        # verified 2026-08-19
 
 # --- the rest of the exactly-pinned WanGP stack, in requirements.txt order ---
 # Inert unless something in the runpod closure tries to move them, which is
