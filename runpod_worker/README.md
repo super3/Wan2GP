@@ -429,24 +429,31 @@ These are **forbidden** and raise `bad_request`: all 15 WanGP attachment keys
 (`image_start`, `image_end`, `image_refs`, `image_guide`, `image_mask`, `video_guide`,
 `video_guide2`, `video_mask`, `video_source`, `custom_guide`, `audio_guide`,
 `audio_guide2`, `audio_source`, `replace_voice_sample`, `replace_voice_sample2`), plus
-`mode`, `_api`, `client_id`, `state`, `type`, `base_model_type` and `priority`.
+`mode`, `_api`, `client_id`, `state`, `type`, `base_model_type` and `priority`, plus the
+five post-processing selectors `postprocess_audio`, `prompt_enhancer`,
+`replace_voice_method`, `spatial_upsampling` and `temporal_upsampling`.
 Media may come **only** from `input.media`; a path in `settings` would be handed straight
 to WanGP as an arbitrary local file read, and `mode` flips WanGP's validator into an edit
-branch that reads `video_source` off disk.
+branch that reads `video_source` off disk. The post-processing five are forbidden because
+`download_requested_postprocessing_assets` (`wgp.py:3532`) runs *inside* `generate_media`
+(`wgp.py:6786`) — on the clock, pulling assets the boot-time weight gate never proved were
+present, and loading a second model into the same GPU.
 
 Pre-flight rules the worker enforces on CPU, before anything loads:
 
 | Rule | Behaviour |
 |---|---|
 | `video_length` | Floored onto the model's lattice (`107 + 17·n`: 107, 124, 141, 158, …) with a warning, then rejected if still above `WANGP_MAX_FRAMES`. `363 → 362`; `100000 → invalid_setting`. |
-| `sliding_window_overlap` | **Rounded to nearest** legal value, matching `normalize_overlap` — `30 → 35`, not `18`. |
+| `sliding_window_overlap` | **Rounded to nearest** legal value, matching `normalize_overlap` — `30 → 35`, not `18`. `0` is legal and left alone. |
+| `sliding_window_size` | Floored onto the lattice and clamped to `124…481`. **`0` is rejected**: it does not disable sliding windows (`wgp.py:6930` only skips the flooring, and both variants declare `sliding_window: true`), it schedules nine zero-length windows with a negative overlap. To generate in one window, set `video_length ≤ sliding_window_size`. |
 | `num_inference_steps` | Capped at `WANGP_MAX_STEPS`. |
 | `resolution` | Must be on the model's block grid (32 for MiniMax H3); the error names the nearest valid size. |
 | `sample_solver` | Must be one of the model's declared solvers. |
 | `skip_steps_cache_type` / `skip_steps_multiplier` | `first_block` requires a multiplier in `0.06 / 0.08 / 0.10 / 0.12 / 0.14`. |
 | `seed` | Any negative value (or absent) resolves to a random seed in `[1, 999999999]`, and the resolved value is echoed back so the job is reproducible. |
-| `activated_loras` | Basename allow-list; no absolute paths, no `..`, no non-http schemes. |
-| flag letters | `image_prompt_type` ⊆ `TSEVL`; `video_prompt_type` and `audio_prompt_type` are checked against the variant's own whitelists, and every "you must provide a …" rule is pre-flighted (`S`→`image_start`, `E`→`image_end`, `I`→`image_refs`, `V`→`video_guide`, `+`→`video_guide2`, `A`→`audio_guide`, `B`→`audio_guide2`). |
+| `activated_loras` | Basename allow-list (`WANGP_ALLOWED_LORAS`, empty ⇒ none accepted); no absolute paths, no `..`, and **no URLs of any scheme** except one a shipped accelerator profile contributes verbatim. |
+| flag letters | `image_prompt_type` ⊆ `TSEVL`; `video_prompt_type` and `audio_prompt_type` are checked against the variant's own whitelists — for FL2VA that is `guide_custom_choices` (`GVKFI`) **plus the mask group** (`A`, `N`: "Masked Area" / "Non Masked Area"), for Ref2VA `PDEV+-` plus `KI`. Every "you must provide a …" rule is pre-flighted (`S`→`image_start`, `E`→`image_end`, `I`→`image_refs`, `V`→`video_guide`, `V`+`A`→`video_mask`, `V`+`+`→`video_guide2`, `A`→`audio_guide`, `B`→`audio_guide2`), with the same nesting WanGP uses. |
+| `media` count | At most `WANGP_MAX_MEDIA_ITEMS` (16) attachments per request, over every key — the byte budget alone cannot stop an entry-count attack. |
 | Ref2VA counts | ≤9 image refs, ≤2 videos, ≤2 audio refs, `#audio ≤ #images + #videos`, ≤12 files total. |
 | `image_mode` | Must be 0. A non-zero value makes WanGP emit images, which the video transport cannot deliver. |
 
@@ -469,6 +476,13 @@ Duration rules (each reference video ≥2 s and truncated to 15 s, each audio 2�
 String shorthands are accepted: `"volume://clips/plate.mp4"`, `"https://…"`,
 `"data:video/mp4;base64,…"`. A **bare** string (`"clips/plate.mp4"`) is refused on
 purpose — it would be indistinguishable from a worker-filesystem path.
+
+`volume` paths resolve under **`$WANGP_VOLUME_ROOT/$WANGP_VOLUME_INPUT_SUBDIR`**
+(`/runpod-volume/inputs`), not the volume root: the volume is shared and also carries
+`ckpts/`, `loras/` and — when `volume` is in the output chain — delivered `outputs/`. Stage
+caller-readable material under `inputs/`. `..`, absolute paths, `|`, NUL and symlinks that
+leave the directory are all rejected on the realpath, and the file is opened `O_NOFOLLOW`
+so the check cannot be raced.
 
 `range` applies to video slots only and becomes WanGP's virtual-media suffix
 (`path|start_frame=…,end_frame=…`). `start_frame` is zero-based, `end_frame` is inclusive.
