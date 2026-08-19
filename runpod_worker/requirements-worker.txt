@@ -24,7 +24,15 @@
 # <2 because RunPod has changed the handler contract across majors before; the
 # floor is 1.12.0 because that is the release whose rp_fitness / rp_job / rp_local
 # behaviour this worker was written against.
-runpod>=1.12.0,<2
+# runpod 1.11+ declares tomlkit>=0.15.1, but gradio 5.29.0 (requirements.txt:40)
+# requires tomlkit<0.14.0. Those ranges do not intersect -- pinning tomlkit makes
+# the resolve IMPOSSIBLE, and letting runpod win silently breaks gradio, which
+# `import wgp` needs. 1.10.0 is the newest release declaring tomlkit>=0.12.2,
+# which requirements.txt satisfies at 0.13.3.
+# The worker uses only serverless.start, serverless.progress_update and
+# serverless.utils.rp_upload -- all long-standing APIs present in 1.10.0.
+# Found by the pip check gate on the first real image build, 2026-08-19.
+runpod==1.10.0
 # Base images commonly export HF_HUB_ENABLE_HF_TRANSFER=1; huggingface_hub
 # hard-fails every download if the package is then missing. See
 # config.ensure_hf_transfer_sane().
