@@ -96,7 +96,7 @@ from runpod_worker.errors import (  # noqa: E402
     WorkerError,
     default_retryable,
 )
-from runpod_worker.obs import LOG  # noqa: E402
+from runpod_worker.obs import LOG, ring_tail  # noqa: E402
 
 __all__ = [
     "BOOT",
@@ -550,6 +550,10 @@ def error_response(
         "retryable": bool(retryable),
         "details": detail_list,
         "logs_tail": log_tail,
+        # The worker's own structured-log history (boot included). The console
+        # worker-log view has no read API, so this is the only way a caller can
+        # see what the worker did before the job failed.
+        "worker_logs": ring_tail(_worker_logs_tail_size()),
         "worker_id": WORKER_ID,
     }
     if _flag("WORKER_ERROR_OBJECT", "0"):
@@ -595,6 +599,22 @@ def error_response(
 
 #: Spec spelling, kept so engine/tests written against the plan still resolve.
 _fail = error_response
+
+
+def _worker_logs_tail_size() -> int:
+    """How many ring records to attach to a response. 0 disables."""
+    return max(0, _int_env("WORKER_LOGS_TAIL", 60))
+
+
+def _wants_debug(req: Any) -> bool:
+    """``input.runtime.debug`` -- attach the worker-log ring to a SUCCESSFUL
+    response too. The runtime block is free-form (schema copies it verbatim),
+    so accept the usual truthy spellings and nothing else."""
+    runtime = getattr(req, "runtime", None) or {}
+    value = runtime.get("debug") if isinstance(runtime, Mapping) else None
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    return value is True or value == 1
 
 
 def _progress(job: Mapping[str, Any], payload: Mapping[str, Any]) -> None:
@@ -1140,6 +1160,8 @@ def _success_response(
         "metrics": dict(metrics),
         "worker_id": WORKER_ID,
     }
+    if _wants_debug(req):
+        body["worker_logs"] = ring_tail(_worker_logs_tail_size())
     if should_recycle():
         body["refresh_worker"] = True
         LOG.warn(

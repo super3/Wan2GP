@@ -316,6 +316,15 @@ inferred.
   Worth switching if workers are on >=32 GB cards; profile 4 remains the safe
   default (5.6 GB VRAM peak, runs on any tier). (Desktops without cgroup limits run profile 1 fine -- this is a
   container limit, not a model or VRAM limit.)
+- **Worker container logs have no read API** (the console view is the only
+  reader; `/v2/{endpoint}/logs` is a worker-key ingest route), so the worker
+  keeps its own history reachable through the job status API: every response to
+  a FAILED job carries `worker_logs` (the tail of the worker's structured-log
+  ring, boot events included; size via `WORKER_LOGS_TAIL`, default 60, ring via
+  `WORKER_LOG_RING`, default 200), and any job can request the same on success
+  with `"runtime": {"debug": true}`. For deaths *during boot* -- when no job
+  ever runs -- set `LOG_SHIP_URL` on the endpoint: the worker POSTs JSON log
+  batches there every `LOG_SHIP_INTERVAL_S` (default 2 s), best effort.
 - **Read phase timings from tqdm, not `phase_marks_s`.** The "inference" mark
   fires when denoising *starts* on a warm model, so denoising time lands inside
   the "decoding" window. Warm-job reality at 832x480/124f/4 steps:
