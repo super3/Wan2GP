@@ -544,17 +544,63 @@ def test_constraints_agree_with_requirements():
     )
 
 
-def test_the_torch_triple_matches_the_dockerfile():
+def test_constraints_still_pin_the_torch_triple():
+    """The triple must stay pinned somewhere, or the runpod layer can move it."""
+    constraints = _pins(CONSTRAINTS.read_text(encoding="utf-8"))
+    for name in sorted(_NOT_FROM_REQUIREMENTS):
+        assert constraints.get(name), f"constraints.txt no longer pins {name}"
+
+
+def test_runtime_stage_does_not_pre_install_torch():
+    """requirements.txt owns the torch version -- pre-installing it is wasted work.
+
+    Measured on a real RunPod pod (2026-08-19): `pip install -r requirements.txt`
+    resolves torch to 2.13.0 on CUDA 13 wheels and REPLACES anything installed
+    before it. The old `torch==2.10.0+cu128` line downloaded ~2.5 GB per build
+    and was discarded seconds later, while leaving the false impression that the
+    image ran a cu128 build.
+    """
+    dockerfile = (Path(__file__).resolve().parents[1] / "Dockerfile").read_text(
+        encoding="utf-8"
+    )
+    # Strip comments -- the reasoning above is allowed to mention the old pin.
+    code = "\n".join(
+        line for line in dockerfile.splitlines() if not line.lstrip().startswith("#")
+    )
+    runtime = code.split("requirements.txt")[0]
+    # The only torch install permitted before requirements.txt is the WITH_SAGE
+    # builder-stage one, which is guarded by an `if`.
+    for m in re.finditer(r"pip install[^\n]*\btorch==", runtime):
+        context = runtime[max(0, m.start() - 200):m.start()]
+        assert "WITH_SAGE" in context, (
+            "the runtime stage pre-installs torch; requirements.txt will "
+            "overwrite it (verified 2026-08-19) -- delete the line"
+        )
+
+
+def test_sage_builder_torch_matches_constraints():
+    """A SageAttention wheel is compiled against one torch ABI.
+
+    If the builder stage compiles against a different torch than the runtime
+    ends up with, the wheel installs perfectly and dies at the first kernel
+    launch. Keep the builder pin equal to the constrained version.
+    """
     dockerfile = (Path(__file__).resolve().parents[1] / "Dockerfile").read_text(
         encoding="utf-8"
     )
     constraints = _pins(CONSTRAINTS.read_text(encoding="utf-8"))
-    for name in sorted(_NOT_FROM_REQUIREMENTS):
-        version = constraints.get(name)
-        assert version, f"constraints.txt no longer pins {name}"
-        assert f"{name}=={version}+cu128" in dockerfile, (
-            f"constraints.txt pins {name}=={version} but the Dockerfile installs "
-            "a different version from download.pytorch.org"
+    want = constraints["torch"]
+    builder = [
+        line for line in dockerfile.splitlines()
+        if "pip install" in line and "torch==" in line and not line.lstrip().startswith("#")
+    ]
+    assert builder, "no torch install found in the Dockerfile at all"
+    for line in builder:
+        got = re.search(r"torch==([0-9][^\s;+]*)", line).group(1)
+        assert got == want, (
+            f"Dockerfile compiles SageAttention against torch {got} but "
+            f"constraints.txt pins torch {want}; the wheel would ABI-mismatch "
+            "at the first kernel launch"
         )
 
 
