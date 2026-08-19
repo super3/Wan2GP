@@ -1433,3 +1433,17 @@ def test_schema_and_media_in_agree_on_the_source_keys():
     prefixes = {prefix for prefix, _ in S.MEDIA_STRING_PREFIXES}
     for prefix in prefixes:
         assert prefix in source, f"media_in no longer accepts the {prefix} shorthand"
+
+
+def test_media_entry_rejects_unknown_fields_and_double_sources(cfg):
+    """schema and media_in must not disagree about which shapes are legal: a
+    request accepted here and rejected there passes validation and then dies in
+    materialization."""
+    error = raises("bad_request",
+                   {"settings": {"prompt": DEMO_PROMPT},
+                    "media": {"image_start": {"b64": "AAAA", "path": "x.png"}}}, cfg=cfg)
+    assert "unknown fields" in error.message
+    error = raises("bad_request",
+                   {"settings": {"prompt": DEMO_PROMPT},
+                    "media": {"image_start": {"b64": "AAAA", "volume": "x.png"}}}, cfg=cfg)
+    assert "exactly one" in error.message
