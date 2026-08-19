@@ -48,6 +48,10 @@ PROMPT = (
     "overall_soundscape: A single click, a low electrical hum, faint room tone.\n"
     "non_diegetic_music: One soft sustained cello note."
 )
+#: Attention modes WanGP honours ONLY as a per-generation override, never as a
+#: global mode (shared/attention.py:28-33 keeps them out of get_attention_modes).
+OVERRIDE_ONLY_MODES = ("sol",)
+
 ACCEL_PROFILE = "Turbo Lightx2v FL2V 4 Steps v1.0 768p"
 RESOLUTION = "832x480"
 VIDEO_LENGTH = 124
@@ -93,9 +97,17 @@ def main() -> int:
     # "profile 1" while actually running profile 4: vram_peak 5.6 GB, not 25).
     from runpod_worker.config import CLI_ATTENTION_MODES  # noqa: PLC0415
 
+    # Measured: a "sol" leg ran at SDPA speed and never printed
+    # "[MiniMax H3] Sol-Attn enabled" -- WanGP ignores sol as a global mode and
+    # takes it only from the per-job override_attention setting.
+    override_attention = None
+    if args.attention in OVERRIDE_ONLY_MODES:
+        override_attention = args.attention
+        os.environ["WANGP_ATTENTION"] = "sdpa"
+
     cli = f"--profile {args.profile} --verbose 1"
-    if args.attention in CLI_ATTENTION_MODES:
-        cli = f"--attention {args.attention} " + cli
+    if os.environ["WANGP_ATTENTION"] in CLI_ATTENTION_MODES:
+        cli = f"--attention {os.environ['WANGP_ATTENTION']} " + cli
     os.environ["WANGP_CLI_ARGS"] = cli
     os.environ.setdefault("WANGP_EAGER_BOOT", "0")
 
@@ -146,12 +158,15 @@ def main() -> int:
             "input": {
                 "model_type": os.environ.get("WANGP_MODEL_TYPE", "minimax_h3_fl2va_pruned"),
                 "profile": ACCEL_PROFILE,
-                "settings": {
-                    "prompt": PROMPT,
-                    "resolution": RESOLUTION,
-                    "video_length": VIDEO_LENGTH,
-                    "seed": seed,
-                },
+                "settings": dict(
+                    {
+                        "prompt": PROMPT,
+                        "resolution": RESOLUTION,
+                        "video_length": VIDEO_LENGTH,
+                        "seed": seed,
+                    },
+                    **({"override_attention": override_attention} if override_attention else {}),
+                ),
                 "output": {"mode": "b64"},
                 "runtime": {"timeout_s": 2400},
             },
