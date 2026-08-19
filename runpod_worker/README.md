@@ -292,6 +292,39 @@ publish per-tier host RAM for serverless workers, so log
 
 ---
 
+## Operational findings (measured on RunPod serverless, 2026-08-19)
+
+Hard-won facts from the first production deployment; each was observed, not
+inferred.
+
+- **Set `minCudaVersion: "13.0"` on every endpoint.** The image's torch resolves
+  to CUDA-13 wheels, and RunPod's fleet is mixed: hosts with pre-12.8 drivers
+  refuse to start the container (`nvidia-container-cli: unsatisfied condition:
+  cuda>=12.8`); hosts with exactly-12.8 drivers start it and then torch dies at
+  init (`driver too old (found 12080)`), producing an unhealthy-worker restart
+  loop that bills while going nowhere. Only CUDA >= 13.0 hosts work. The gate is
+  the fix; rebuilding on cu12.8 wheels would widen the eligible fleet (A40/A6000
+  Ampere hosts) at the cost of a rebuild.
+- **mmgp profiles 1 and 2 are unusable in these containers.** Both pin the full
+  model set (~45 GB) into page-locked RAM; the container's locked-memory limit
+  kills the process partway through pinning the 25 GB text encoder -- silently,
+  no traceback, followed by a crash loop. Profile 4 pins only the ~20 GB
+  transformer and works; profile 3 works (VRAM-resident, ~25 GB peak) but showed
+  no speed win over profile 4 in a confounded single-host comparison. Keep
+  profile 4. (Desktops without cgroup limits run profile 1 fine -- this is a
+  container limit, not a model or VRAM limit.)
+- **Read phase timings from tqdm, not `phase_marks_s`.** The "inference" mark
+  fires when denoising *starts* on a warm model, so denoising time lands inside
+  the "decoding" window. Warm-job reality at 832x480/124f/4 steps:
+  encode ~2-7 s (first call ~30 s), denoise ~8.1 s/step, VAE decode + mux ~11 s.
+- **Per-step denoise speed was identical (~8.1 s) on an A100-SXM4-80GB and a
+  Blackwell PRO 6000 MIG 2g.48gb slice** -- memory-bandwidth-bound at these
+  settings. Pay for the cheapest CUDA-13 tier, not the biggest chip.
+  `vram_peak` was ~5.6 GB under profile 4.
+- **Download-on-first-boot works well**: 54 GB of weights in ~150-300 s
+  (hf_transfer), so a cold worker is serving in ~4-5 min with no network volume
+  and no datacenter pin.
+
 ## Environment variables
 
 Everything is env-overridable and everything has a default; the image bakes the values
