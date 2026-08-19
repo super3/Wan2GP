@@ -21,6 +21,7 @@ from pathlib import Path
 
 import pytest
 
+from runpod_worker.tests import assert_import_is_clean
 from runpod_worker import config as C
 from runpod_worker import schema as S
 from runpod_worker.errors import WorkerError
@@ -264,11 +265,9 @@ def test_letter_whitelists_match_the_handler_source():
 
 
 def test_schema_stays_cpu_only():
-    for module in ("torch", "wgp", "gradio", "numpy", "runpod"):
-        assert module not in sys.modules, (
-            f"importing runpod_worker.schema pulled in {module}; the CPU tier must run "
-            f"on a plain runner with only pytest installed"
-        )
+    assert_import_is_clean(
+        "runpod_worker.schema", ("torch", "wgp", "gradio", "numpy", "runpod")
+    )
 
 
 # ==========================================================================

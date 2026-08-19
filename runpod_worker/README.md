@@ -91,7 +91,7 @@ Nothing here is legal advice; read `LICENSE.txt` yourself.
 | Output | a muxed `.mp4` with an AAC track, delivered by presigned PUT, your S3 bucket, or base64 under a cap |
 | Concurrency | **Exactly one generation at a time per worker process.** WanGP holds a process-global generation lock and installs a process-global `redirect_stdout` for the whole job, so two jobs in one process is not a tuning question. Jobs are served sequentially by the same warm process; scale with `max_workers`, never with `concurrency_modifier`. |
 | Validation | every request is pre-flighted on CPU in <50 ms — unknown keys, illegal flag-letter combinations, frame-count math, LoRA paths — so a bad request costs zero GPU seconds |
-| Cancellation | the per-request `timeout_s` is the in-process stop: on overrun the worker aborts the generation cooperatively, which lands at the model's next interrupt check. `POST /cancel/{id}` stops the *job* but not the *generation* — see [Cancellation, precisely](#cancellation-precisely). |
+| Cancellation | `runtime.timeout_s` and `POST /cancel/{id}` both abort the generation cooperatively, landing at the model's next interrupt check (one denoising step). Neither is instantaneous — see [Cancellation, precisely](#cancellation-precisely). |
 
 What it deliberately does **not** do: run more than one model per endpoint (a switch costs
 a full `release_model()` + reload), accept arbitrary local paths in `settings`, return a
@@ -195,25 +195,36 @@ handles them.
 
 ```bash
 docker build --platform linux/amd64 \
-  --build-arg CUDA_ARCHITECTURES="8.0;8.6;8.9;9.0" \
   -f runpod_worker/Dockerfile \
   -t you/wangp-h3:2026.08.18-1 .
 docker push you/wangp-h3:2026.08.18-1
 ```
 
 Build from the **repo root** — the Dockerfile copies `requirements.txt` and the whole
-tree. First build is 40–90 minutes (SageAttention compiles from source in stage 1).
+tree. The default build is ~10 minutes and ships **no SageAttention**: the image runs
+`--attention sdpa`, so a compiled sage wheel would be built, shipped and never loaded —
+40–90 minutes of nvcc for nothing, and more than the 30-minute-per-step limit RunPod's own
+image builder allows, which the phase-1 plan counts on. Opt in only after measuring sage2
+on the endpoint's GPU tier, and flip `WANGP_CLI_ARGS`/`WANGP_ATTENTION` to match:
+
+```bash
+docker build --platform linux/amd64 --build-arg WITH_SAGE=1 \
+  --build-arg CUDA_ARCHITECTURES="8.0;8.6;8.9;9.0;12.0" \
+  -f runpod_worker/Dockerfile -t you/wangp-h3-sage:2026.08.18-1 .
+```
 
 - **`--platform linux/amd64` is mandatory.** RunPod rejects ARM images. On an Apple
   Silicon machine, that flag makes it an emulated cross-build; a cloud builder is faster.
 - **Never tag `:latest`.** RunPod caches images per host and a mutable tag silently
   serves stale code. Use `YYYY.MM.DD-N`. Rollback is "point the endpoint at the previous
   tag and save" — which only works if the tags are immutable.
-- **`CUDA_ARCHITECTURES` must cover your GPU priority list.** The repo's own default
-  `"8.0;8.6"` excludes L4/L40S/4090 (SM 8.9) and H100 (SM 9.0) — exactly the fleet a
-  serverless endpoint schedules on. `is_sage2_supported()` checks the *device*
-  capability, not what the wheel was built for, so a wheel missing your arch fails at the
-  first attention kernel launch, minutes into a billed job.
+- **With `WITH_SAGE=1`, `CUDA_ARCHITECTURES` must cover your GPU priority list.** The
+  repo's own default `"8.0;8.6"` excludes L4/L40S/4090 (SM 8.9), H100 (SM 9.0) and B200
+  (SM 12.0) — exactly the fleet a serverless endpoint schedules on. `is_sage2_supported()`
+  (`shared/sage2_core.py:75-81`) only checks that the *device* capability is ≥ 8.0; it
+  never checks what the wheel was built for, so a wheel missing your arch reports
+  "supported" and then fails at the first attention kernel launch, minutes into a billed
+  job. This worker's default is `"8.0;8.6;8.9;9.0;12.0"`.
 - Other build args: `SAGEATTENTION_REF` (default `main`; pin it for reproducibility) and
   `MAX_JOBS` (default 8; nvcc needs ~2 GB of builder RAM per job — lower it if `cicc`
   gets OOM-killed).
@@ -566,16 +577,25 @@ curl -s -X POST "https://api.runpod.ai/v2/$ENDPOINT_ID/cancel/$ID" \
 the body to `asyncio.to_thread` exactly so that poll loop keeps running — a synchronous
 handler starves it for the whole multi-minute job and the signal is never seen.
 
-But `task.cancel()` cancels the *await*, not the thread. Python cannot kill a running
-thread, so **the generation continues to completion (or to its `timeout_s`) and you keep
-being billed for it**; only the result is discarded. The engine exposes a `cancel_check`
-hook for a cooperative in-process abort, and the handler does not currently wire the SDK's
-stop signal into it.
+`task.cancel()` cancels the *await*, not the thread, and Python cannot kill a running
+thread. So the handler translates it into a cooperative signal: it shields the worker
+thread's task, sets a `threading.Event`, and passes `Event.is_set` to `engine.run` as its
+`cancel_check`, which the drain loop polls every 0.5 s. The engine then calls
+`job.cancel()` — WanGP's abort flag plus `wan_model._interrupt` — and the model stops at
+its next interrupt check, within one denoising step.
 
-Practical consequence: **`runtime.timeout_s` is your real cost control**, not `/cancel`.
-Set it to what you are actually willing to pay for. The budget path *does* abort the
-generation from inside the process — `job.cancel()` sets WanGP's abort flag and the model
-notices at its next interrupt check, within one denoising step.
+Two consequences worth knowing:
+
+- **Cancellation is cooperative, so it is not instantaneous.** You are billed until the
+  model reaches its next interrupt check. If it never does within `WANGP_CANCEL_GRACE_S`,
+  the process is declared poisoned (`backend_fatal` + `refresh_worker`), because the WanGP
+  worker thread is a daemon that cannot be killed and still holds the process-wide
+  generation lock.
+- **The result of a cancelled job is discarded by the platform**, so a `refresh_worker` in
+  that response never reaches it. The budget path is what you should rely on for cost.
+
+Practical consequence: **`runtime.timeout_s` is still your primary cost control.** Set it
+to what you are actually willing to pay for; `/cancel` is the interactive escape hatch.
 
 `124 = 5 + 17·7` is on the lattice, so nothing is floored. The profile supplies the turbo
 LoRA, `num_inference_steps: 4`, `guidance_scale: 1` and `flow_shift: 6` — **the turbo
@@ -857,6 +877,15 @@ is not the one you warmed.
 `REQUIRE_BUCKET=1` with an incomplete `BUCKET_*` trio also fails a fitness check — by
 design.
 
+**Not all fitness checks are ours.** The SDK auto-registers its own memory, disk and
+network checks for every worker (`rp_system_fitness.py:29-30`): ≥4 GB free RAM
+(`RUNPOD_MIN_MEMORY_GB`) and **≥10 % free disk** (`RUNPOD_MIN_DISK_PERCENT`), plus GPU,
+CUDA-version, CUDA-init and GPU-benchmark checks. A failure is `os._exit(1)` with only the
+SDK's own log line to explain it — none of this worker's structured logs. With a 20–30 GB
+image on a small container disk the disk check is reachable, so if the loop shows no
+`boot_failed` at all, raise the endpoint's container disk or lower
+`RUNPOD_MIN_DISK_PERCENT`.
+
 ### 3. Jobs succeed but return `no_output`
 
 WanGP reported success and wrote no file. **Read `logs_tail`** — the reason is in an
@@ -871,7 +900,17 @@ The response tells you exactly which env vars fix it. In order of preference: ha
 caller pass `output.presigned_url` (no secrets on the worker, best for multi-tenant); or
 set `BUCKET_ENDPOINT_URL` + `BUCKET_ACCESS_KEY_ID` + `BUCKET_SECRET_ACCESS_KEY` +
 `BUCKET_NAME`; or raise `WANGP_B64_OUT_MAX` if the file genuinely fits in RunPod's 10 MB
-envelope (it holds ~7.5 MB of binary after base64 inflation).
+envelope (it holds ~7.5 MB of binary after base64 inflation); or add `volume` to
+`WANGP_OUTPUT_CHAIN`, which writes the file to the network volume and returns
+`volume_path` instead of a URL — only useful when the caller can read that volume out of
+band, which is why it is not in the default chain.
+
+**You should not be finding this out after a generation.** On the shipped default
+(`presigned,rp_bucket,base64`) with no bucket and no `output.presigned_url`, every
+response already carries a warning saying the endpoint can only return outputs under
+`WANGP_B64_OUT_MAX` — a 5 s 832×480 clip with audio is plausibly 2–8 MB, i.e. right on the
+line. Set `WORKER_REQUIRE_DELIVERABLE=1` to turn that warning into a sub-second rejection,
+or `REQUIRE_BUCKET=1` to fail the whole worker at fitness time.
 
 If uploads "succeed" but the URL is unusable, you are probably hitting `rp_upload`'s
 silent fallback: it returns a `local_upload/<name>` **path** rather than raising when it
@@ -905,6 +944,19 @@ worker is torn down between requests and every job is a cold start.
 default — `get_lora_dir()` returns a *relative* path, which is why the config must set an
 absolute root). If you get `bad_request: LoRA '…' is not staged`, the basename is not in
 `WANGP_ALLOWED_LORAS`; the error lists what is allowed.
+
+A **caller** cannot name a URL at all (`bad_request: remote LoRA URLs are not accepted`).
+Only a shipped accelerator profile may, and only verbatim — `check_loras_exist` downloads
+whenever the local file is absent (`wgp.py:3697-3706`), so a caller-supplied URL is a
+fetch-and-load primitive pointed at the shared volume. If the profile's own LoRA is not
+staged you get a warning on the response saying WanGP will download it during the
+generation; stage it with `prefetch_weights.py` and the warning goes away.
+
+> **Privacy note.** The worker never logs the prompt or the settings dict. WanGP does:
+> `WANGP_CONSOLE=1` (the baked default) routes its stdout to the container log, and
+> `wgp.py:7276` prints the full enhanced prompt when prompt enhancement is on — which is
+> one more reason `prompt_enhancer` is a forbidden key here. Container logs are visible to
+> anyone with access to the RunPod account.
 
 ### 8. Blank container logs for the whole generation
 

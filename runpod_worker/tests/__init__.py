@@ -50,3 +50,40 @@ The presence of this file makes pytest resolve the modules as
 ``runpod_worker.tests.*``, which puts the repo root on ``sys.path`` so
 ``from runpod_worker import ...`` works with no conftest hack.
 """
+
+
+def assert_import_is_clean(module: str, forbidden: "tuple[str, ...]") -> None:
+    """Assert ``import <module>`` does not pull in any of ``forbidden``.
+
+    Runs in a **clean subprocess** on purpose. Inspecting this process's
+    ``sys.modules`` only proves that nothing *in the whole pytest session*
+    imported the package -- which is a different, much weaker claim, and one
+    that flips to a false failure the moment the suite runs somewhere the
+    package is installed (the ``runpod SDK contract`` job installs ``runpod``
+    and ``boto3``, and other tests in the same session import both).
+
+    A subprocess makes the assertion mean what it says, in every environment.
+    """
+    import subprocess
+    import sys as _sys
+    from pathlib import Path as _Path
+
+    code = (
+        "import sys, json\n"
+        f"import {module}\n"
+        f"print(json.dumps([m for m in {forbidden!r} if m in sys.modules]))\n"
+    )
+    proc = subprocess.run(
+        [_sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        cwd=str(_Path(__file__).resolve().parents[2]),
+    )
+    assert proc.returncode == 0, f"importing {module} failed:\n{proc.stderr}"
+    import json as _json
+
+    leaked = _json.loads(proc.stdout.strip().splitlines()[-1])
+    assert not leaked, (
+        f"importing {module} pulled in {leaked}; the CPU tier must run on a "
+        f"plain runner with only pytest installed"
+    )
