@@ -35,6 +35,12 @@
 pydantic==2.10.6          # requirements.txt:78
 gradio==5.29.0            # requirements.txt:40  (gradio_rangeslider rides along)
 mcp==1.10.1               # requirements.txt:79
+# tomlkit: NOT in requirements.txt directly -- gradio 5.29.0 requires
+# tomlkit<0.14.0,>=0.12.0 and requirements.txt resolves it to 0.13.3. The runpod
+# closure pulls 0.15.1, which uninstalls 0.13.3 and breaks gradio. Caught by the
+# `pip check` gate on the first real build (2026-08-19); it is the exact failure
+# mode this file exists to prevent, and it was missing.
+tomlkit==0.13.3           # transitive via gradio
 
 # --- the torch triple: RESOLVED BY requirements.txt, not pinned by us. ------
 # Measured on a real RunPod pod (2026-08-19), not taken from the plan: a plain
