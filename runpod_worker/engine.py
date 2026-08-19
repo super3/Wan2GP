@@ -322,6 +322,10 @@ def _boot_locked() -> Any:
         # WANGP_ATTENTION: wgp.py:3304-3305 lets the CLI flag overwrite
         # server_config["attention_mode"], so the file must agree with the flag
         # or the config is a lie.
+        hf_mode = C.ensure_hf_transfer_sane()
+        if hf_mode == "disabled":
+            LOG.warn("hf_transfer_disabled",
+                     reason="HF_HUB_ENABLE_HF_TRANSFER=1 but hf_transfer not importable")
         cfg_path = C.ensure_wgp_config(C.CONFIG.cli_args)
         C.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
