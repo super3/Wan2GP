@@ -78,6 +78,8 @@ def main() -> int:
     parser.add_argument("--tag", default="")
     args = parser.parse_args()
 
+    from runpod_worker.config import CLI_ATTENTION_MODES as C_CLI_MODES  # noqa: N806
+
     world = int(os.environ.get("WORLD_SIZE", "1"))
     rank = int(os.environ.get("RANK", "0"))
     tag = args.tag or (f"usp{world}" if world > 1 else f"single-{args.attention}")
@@ -85,7 +87,12 @@ def main() -> int:
     # Config must be pinned before runpod_worker.config / wgp import.
     os.environ["WANGP_ATTENTION"] = args.attention
     os.environ["WANGP_PROFILE"] = str(args.profile)
-    os.environ["WANGP_CLI_ARGS"] = f"--attention {args.attention} --profile {args.profile} --verbose 1"
+    # "sol" is config-only: wgp.py:3303 rejects it as a CLI value, so pass it
+    # through WANGP_ATTENTION (-> wgp_config.json) with no --attention flag.
+    cli = f"--profile {args.profile} --verbose 1"
+    if args.attention in C_CLI_MODES:
+        cli = f"--attention {args.attention} " + cli
+    os.environ["WANGP_CLI_ARGS"] = cli
     os.environ.setdefault("WANGP_EAGER_BOOT", "0")
 
     if world > 1:
