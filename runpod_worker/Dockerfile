@@ -82,11 +82,14 @@ RUN mkdir -p /wheels && \
     fi
 
 # The torch here must match the torch in the runtime stage exactly: a C++
-# extension is compiled against a specific torch ABI.
+# extension is compiled against a specific torch ABI. The runtime stage no
+# longer pins torch -- requirements.txt resolves it (measured: 2.13.0, CUDA 13
+# wheels from PyPI) -- so this must track that same version, from the same
+# index, or the wheel installs cleanly and dies at the first kernel launch.
+# If requirements.txt moves torch, update BOTH this line and constraints.txt.
 # hadolint ignore=DL3059
 RUN if [ "${WITH_SAGE}" = "1" ]; then \
-      pip install --no-cache-dir torch==2.10.0+cu128 \
-        --index-url https://download.pytorch.org/whl/cu128; \
+      pip install --no-cache-dir torch==2.13.0; \
     fi
 
 COPY runpod_worker/scripts/patch_sage_setup.py /tmp/patch_sage_setup.py
@@ -221,11 +224,25 @@ WORKDIR /opt/wangp
 # hadolint ignore=DL3013,DL3059
 RUN pip install --no-cache-dir --upgrade pip setuptools wheel
 
-# torch FIRST, from the cu128 index, so nothing in requirements.txt can pull the
-# generic build in as a transitive dependency (Dockerfile:36-40 does the same).
-# hadolint ignore=DL3059
-RUN pip install --no-cache-dir torch==2.10.0+cu128 torchvision==0.25.0+cu128 \
-      torchaudio==2.10.0+cu128 --index-url https://download.pytorch.org/whl/cu128
+# NO torch pre-install here -- deliberately.
+#
+# This layer used to install torch==2.10.0+cu128 from the cu128 index "so
+# nothing in requirements.txt can pull the generic build in". Measured on a real
+# RunPod pod (2026-08-19): that does not work. `pip install -r requirements.txt`
+# resolves torch to 2.13.0 and REPLACES the pinned build, pulling the CUDA 13
+# wheel set (nvidia-cublas-13.x, nvidia-cudnn-cu13, ...) from PyPI. The pin cost
+# ~2.5 GB of download per build and was discarded seconds later.
+#
+# The resolved stack -- torch 2.13.0 / torchvision 0.28.0 / torchaudio 2.11.0 on
+# CUDA 13 wheels -- was verified end to end on that pod: `import wgp` succeeded
+# and a full minimax_h3_fl2va_pruned generation completed on an RTX PRO 4500
+# (Blackwell, sm_120, driver 580.173.02), 20 steps in 394.7 s. Note the cu13
+# wheels run fine on this cu12.8.1 base image: torch ships its own CUDA runtime
+# in those nvidia-* packages, so the base image's CUDA only has to satisfy the
+# driver, not the wheels.
+#
+# requirements.txt therefore OWNS the torch version. constraints.txt pins the
+# triple to the verified versions so the runpod layer cannot move them.
 
 # requirements.txt is consumed VERBATIM. Editing it is what made PR #317
 # unmergeable. Its line 1 --extra-index-url is honoured from the file itself.
