@@ -4,13 +4,21 @@
 #  BUILD FROM THE REPO ROOT (the context is the whole repo, not runpod_worker/):
 #
 #    docker build --platform linux/amd64 \
-#      --build-arg CUDA_ARCHITECTURES="8.0;8.6;8.9;9.0" \
 #      -f runpod_worker/Dockerfile -t you/wangp-h3:2026.08.18-1 .
 #
 #  * --platform linux/amd64 is MANDATORY. RunPod rejects ARM images.
 #  * NEVER tag :latest. RunPod caches images per host and a mutable tag silently
 #    serves stale code to warm workers. Use YYYY.MM.DD-N.
-#  * First build is 40-90 min, nearly all of it SageAttention's nvcc passes.
+#  * DEFAULT BUILD IS ~10 MIN AND SHIPS NO SageAttention. The image runs
+#    `--attention sdpa` (see WANGP_CLI_ARGS below), so a compiled sage wheel
+#    would be built, shipped and never loaded -- 40-90 min of nvcc for nothing,
+#    and more than RunPod's own image builder allows per step (30 min), which the
+#    phase-1 plan counts on. Opt in only when you have measured sage2 on the
+#    endpoint's GPU tier AND flipped WANGP_CLI_ARGS/WANGP_ATTENTION to match:
+#
+#      docker build --platform linux/amd64 --build-arg WITH_SAGE=1 \
+#        --build-arg CUDA_ARCHITECTURES="8.0;8.6;8.9;9.0;12.0" \
+#        -f runpod_worker/Dockerfile -t you/wangp-h3:2026.08.18-1 .
 #
 #  Relationship to the repo's own Dockerfile: same base image and same torch
 #  triple (Dockerfile:1, Dockerfile:40), and requirements.txt is consumed
@@ -29,14 +37,17 @@
 # -----------------------------------------------------------------------------
 # stage 1 — compile SageAttention (needs nvcc; there is NO GPU at build time)
 # -----------------------------------------------------------------------------
+# WITH_SAGE: 0 (default) skips the compile entirely -- the builder stage still
+# runs but produces an empty /wheels, and the runtime stage's install is a no-op.
+ARG WITH_SAGE=0
 # CUDA_ARCHITECTURES: the repo default "8.0;8.6" (Dockerfile:20) excludes L4 /
-# L40S / RTX 4090 (SM89) and H100 (SM90) -- precisely the fleet a serverless
-# endpoint schedules on. is_sage2_supported() (shared/sage2_core.py) checks the
-# *device* capability at run time, not which arches the wheel was built for, so
-# a wheel missing the host's SM fails at the first attention kernel launch,
-# minutes into a billed job. Drop 8.0 only if A100 is out of your GPU priority
-# list; every arch you add costs build minutes and wheel size, not run time.
-ARG CUDA_ARCHITECTURES="8.0;8.6;8.9;9.0"
+# L40S / RTX 4090 (SM89), H100 (SM90) and B200 (SM120) -- precisely the fleet a
+# serverless endpoint schedules on. is_sage2_supported() (shared/sage2_core.py:75-81)
+# only checks that the *device* capability is >= 8.0; it never checks which arches
+# the wheel carries, so a wheel missing the host's SM reports "supported" and then
+# dies at the first attention kernel launch, minutes into a billed job. Every arch
+# you add costs build minutes and wheel size, not run time.
+ARG CUDA_ARCHITECTURES="8.0;8.6;8.9;9.0;12.0"
 # Pin to a tag or branch for a reproducible build; `main` is a moving target.
 # --depth 1 --branch only accepts a ref name, not a bare commit sha.
 ARG SAGEATTENTION_REF="main"
@@ -45,6 +56,7 @@ ARG SAGEATTENTION_REF="main"
 ARG MAX_JOBS="8"
 
 FROM nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04 AS builder
+ARG WITH_SAGE
 ARG CUDA_ARCHITECTURES
 ARG SAGEATTENTION_REF
 ARG MAX_JOBS
@@ -64,13 +76,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # and must exist in the environment because we build with --no-build-isolation
 # (torch cannot be seen from an isolated build env).
 # hadolint ignore=DL3013,DL3059
-RUN pip install --no-cache-dir --upgrade pip setuptools wheel packaging
+RUN mkdir -p /wheels && \
+    if [ "${WITH_SAGE}" = "1" ]; then \
+      pip install --no-cache-dir --upgrade pip setuptools wheel packaging; \
+    fi
 
 # The torch here must match the torch in the runtime stage exactly: a C++
 # extension is compiled against a specific torch ABI.
 # hadolint ignore=DL3059
-RUN pip install --no-cache-dir torch==2.10.0+cu128 \
-      --index-url https://download.pytorch.org/whl/cu128
+RUN if [ "${WITH_SAGE}" = "1" ]; then \
+      pip install --no-cache-dir torch==2.10.0+cu128 \
+        --index-url https://download.pytorch.org/whl/cu128; \
+    fi
 
 COPY runpod_worker/scripts/patch_sage_setup.py /tmp/patch_sage_setup.py
 
@@ -79,13 +96,22 @@ COPY runpod_worker/scripts/patch_sage_setup.py /tmp/patch_sage_setup.py
 # SageAttention wheel installs perfectly and then dies at the first kernel
 # launch. Current upstream honours TORCH_CUDA_ARCH_LIST natively, in which case
 # the script is a verified no-op; see its docstring.
-# hadolint ignore=DL3059
-RUN git clone --depth 1 --branch "${SAGEATTENTION_REF}" \
-      https://github.com/thu-ml/SageAttention.git /tmp/sage
-WORKDIR /tmp/sage
-# hadolint ignore=DL3059
-RUN python3 /tmp/patch_sage_setup.py setup.py && \
-    pip wheel --no-build-isolation --no-deps -w /wheels . && \
+#
+# Skipped wholesale unless WITH_SAGE=1: this single step is 40-90 min, which is
+# both the whole build's cost and more than RunPod's own image builder allows in
+# one step, and the baked default (--attention sdpa) never loads the result.
+# DL3003: `cd` rather than WORKDIR, because the whole step is inside one
+# conditional -- a WORKDIR would have to exist even when the clone is skipped.
+# hadolint ignore=DL3003,DL3059
+RUN if [ "${WITH_SAGE}" = "1" ]; then \
+      git clone --depth 1 --branch "${SAGEATTENTION_REF}" \
+        https://github.com/thu-ml/SageAttention.git /tmp/sage && \
+      cd /tmp/sage && \
+      python3 /tmp/patch_sage_setup.py setup.py && \
+      pip wheel --no-build-isolation --no-deps -w /wheels . ; \
+    else \
+      echo "[build] WITH_SAGE=0: SageAttention not compiled (--attention sdpa)"; \
+    fi && \
     ls -la /wheels
 
 # -----------------------------------------------------------------------------
@@ -157,7 +183,22 @@ ENV WANGP_MODEL_TYPE=minimax_h3_fl2va_pruned \
     WANGP_CONSOLE=1 \
     WANGP_OUTPUT_CHAIN=presigned,rp_bucket,base64 \
     ALLOW_URL_INPUTS=0 \
-    ALLOW_MODEL_SWITCH=0
+    ALLOW_MODEL_SWITCH=0 \
+    WANGP_ALLOWED_LORAS="" \
+    WANGP_VOLUME_INPUT_SUBDIR=inputs
+
+# WANGP_ALLOWED_LORAS is EMPTY on purpose, and empty means "no caller-supplied
+# LoRAs at all" -- not "any LoRA". An activated_loras entry is a filename WanGP
+# resolves under the shared loras directory, and an http(s) entry used to be a
+# caller-steered download primitive (update_loras_url_cache wgp.py:9980-9996 ->
+# check_loras_exist wgp.py:3689-3706 -> urlretrieve). URLs are refused outright
+# now; to let callers name staged files, list their BASENAMES here, comma
+# separated. The turbo LoRA does not need this: it arrives through
+# input.profile, whose fragment ships in the image.
+#
+# WANGP_VOLUME_INPUT_SUBDIR confines `{"volume": "..."}` inputs to
+# /runpod-volume/inputs, keeping outputs/, ckpts/ and loras/ out of reach of a
+# request. Set it to "" only on a single-tenant endpoint.
 
 # --- system packages ---------------------------------------------------------
 # ffmpeg is baked for two reasons: media_out shells out to `ffprobe` for the
@@ -192,11 +233,18 @@ COPY requirements.txt /opt/wangp/requirements.txt
 # hadolint ignore=DL3059
 RUN pip install --no-cache-dir -r requirements.txt
 
-# SageAttention wheel from stage 1. --no-deps: it declares torch, and we already
-# have the exact cu128 build.
+# SageAttention wheel from stage 1, if one was built. --no-deps: it declares
+# torch, and we already have the exact cu128 build. With WITH_SAGE=0 the
+# directory is empty and this is a no-op -- `pip install /wheels/*.whl` with no
+# match would otherwise fail the build on a glob that never expanded.
 COPY --from=builder /wheels /wheels
 # hadolint ignore=DL3013,DL3059
-RUN pip install --no-cache-dir --no-deps /wheels/*.whl && rm -rf /wheels
+RUN if ls /wheels/*.whl >/dev/null 2>&1; then \
+      pip install --no-cache-dir --no-deps /wheels/*.whl; \
+    else \
+      echo "[build] no SageAttention wheel; running --attention sdpa"; \
+    fi && \
+    rm -rf /wheels
 
 # --- the runpod SDK, under constraints --------------------------------------
 # runpod 1.12.0 requires fastapi[all]>=0.141.1, boto3>=1.43.66, cryptography>=50,
@@ -263,8 +311,11 @@ from shared.ffmpeg_setup import download_ffmpeg; download_ffmpeg()" \
 # startup.lock exists (wgp.py:13787-13812). None of that is wanted here, and an
 # inherited ENTRYPOINT would also swallow the SDK's own CLI flags.
 #
-# CMD (not ENTRYPOINT) so the flags the SDK parses still work by overriding it:
-#   docker run ... python3 -u handler.py --rp_serve_api --rp_api_host 0.0.0.0
+# CMD (not ENTRYPOINT) so the flags the SDK parses still work by overriding it.
+# NOTE the absolute path: WORKDIR is /opt/wangp, and handler.py lives one level
+# down, so `python3 -u handler.py` here exits with "can't open file".
+#   docker run ... python3 -u /opt/wangp/runpod_worker/handler.py \
+#                    --rp_serve_api --rp_api_host 0.0.0.0
 #   docker run ... python3 -u -m runpod_worker.scripts.verify_weights <model_type>
 # For the local one-shot path the SDK reads test_input.json from the PROCESS CWD
 # (runpod/serverless/modules/rp_local.py, hardcoded), hence `-w /opt/wangp/runpod_worker`

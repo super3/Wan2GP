@@ -743,20 +743,26 @@ def _maybe_warm_after_boot() -> None:
 # ---------------------------------------------------------------------------
 
 
+def _failure_budget() -> int:
+    return max(1, int(getattr(C.CONFIG, "failure_budget", 3) or 3))
+
+
 def note_failure(code: str | None = None, *, recycle: bool = False, reason: str = "") -> int:
-    """Record a failed job. Returns the consecutive-failure count."""
+    """Record a failed job. Returns the consecutive-failure count.
+
+    Only ``recycle=True`` latches ``_RECYCLE_REASON``. The consecutive-failure
+    BUDGET is deliberately not latched here: it is a soft counter that a single
+    success clears, and burning it into a permanent verdict meant every later
+    response — including successful ones — carried ``refresh_worker: True`` and
+    paid a 150-250 s weight reload. :func:`should_recycle` computes the budget
+    half live instead.
+    """
     global _CONSECUTIVE_FAILURES, _RECYCLE_REASON
     with _FAILURE_LOCK:
         _CONSECUTIVE_FAILURES += 1
         STATS["consecutive_failures"] = _CONSECUTIVE_FAILURES
         if recycle and _RECYCLE_REASON is None:
             _RECYCLE_REASON = reason or f"poisoned by {code or 'unknown failure'}"
-        budget = max(1, int(getattr(C.CONFIG, "failure_budget", 3)))
-        if _CONSECUTIVE_FAILURES >= budget and _RECYCLE_REASON is None:
-            _RECYCLE_REASON = (
-                f"{_CONSECUTIVE_FAILURES} consecutive failures "
-                f"(WORKER_FAILURE_BUDGET={budget})"
-            )
         count = _CONSECUTIVE_FAILURES
     LOG.warn("failure_recorded", error_code=code, consecutive=count, recycle=should_recycle())
     return count
@@ -766,7 +772,8 @@ def note_success() -> None:
     """Record a job that produced output. Clears the consecutive-failure run.
 
     Does NOT clear a poison flag: a process that has seen a CUDA fault does not
-    become healthy because the next job happened to survive.
+    become healthy because the next job happened to survive. It DOES clear the
+    soft budget, which is the whole point of a *consecutive*-failure counter.
     """
     global _CONSECUTIVE_FAILURES
     with _FAILURE_LOCK:
@@ -784,14 +791,28 @@ def mark_poisoned(reason: str) -> None:
 
 
 def should_recycle() -> bool:
-    """Whether the handler should return ``refresh_worker: True``."""
+    """Whether the handler should return ``refresh_worker: True``.
+
+    Two sources: the latched poison flag (permanent, by design) and the
+    consecutive-failure budget (live, so a success clears it).
+    """
     with _FAILURE_LOCK:
-        return _RECYCLE_REASON is not None
+        if _RECYCLE_REASON is not None:
+            return True
+        return _CONSECUTIVE_FAILURES >= _failure_budget()
 
 
 def recycle_reason() -> str | None:
     with _FAILURE_LOCK:
-        return _RECYCLE_REASON
+        if _RECYCLE_REASON is not None:
+            return _RECYCLE_REASON
+        budget = _failure_budget()
+        if _CONSECUTIVE_FAILURES >= budget:
+            return (
+                f"{_CONSECUTIVE_FAILURES} consecutive failures "
+                f"(WORKER_FAILURE_BUDGET={budget})"
+            )
+        return None
 
 
 def reset_failure_budget() -> None:
@@ -1059,6 +1080,16 @@ def run(
         # there, not both -- doubling the increment halves WORKER_FAILURE_BUDGET.
         if outcome.success and outcome.files:
             note_success()
+        elif "validation" in outcome.stages and not poisoned:
+            # WanGP's own validate_settings / validate_generative_settings said
+            # no. That is the caller's input, not this worker's health -- and it
+            # is exactly the class schema.parse cannot pre-empt (reference-video
+            # duration, audio duration, control-video soundtrack presence:
+            # minimax_h3_handler.py:389-445 all need ffprobe/librosa on the real
+            # file). Counting it meant three bad client uploads in a row killed a
+            # healthy worker.
+            LOG.info("validation_rejected", stages=list(outcome.stages),
+                     note="not counted against WORKER_FAILURE_BUDGET")
         else:
             if outcome.timed_out or outcome.cancelled:
                 code = GENERATION_TIMEOUT
