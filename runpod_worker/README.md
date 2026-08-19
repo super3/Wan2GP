@@ -309,9 +309,11 @@ inferred.
   model set (~45 GB) into page-locked RAM; the container's locked-memory limit
   kills the process partway through pinning the 25 GB text encoder -- silently,
   no traceback, followed by a crash loop. Profile 4 pins only the ~20 GB
-  transformer and works; profile 3 works (VRAM-resident, ~25 GB peak) but showed
-  no speed win over profile 4 in a confounded single-host comparison. Keep
-  profile 4. (Desktops without cgroup limits run profile 1 fine -- this is a
+  transformer and works; profile 3 works (VRAM-resident, ~25 GB peak), but its
+  speed is unmeasured -- the one profile-3 run landed on a host with a ~2.6x
+  slower matmul fitness number than the production workers, so its 69.6 s warm
+  time says nothing about the profile itself. Keep profile 4 until a same-host
+  A/B says otherwise. (Desktops without cgroup limits run profile 1 fine -- this is a
   container limit, not a model or VRAM limit.)
 - **Read phase timings from tqdm, not `phase_marks_s`.** The "inference" mark
   fires when denoising *starts* on a warm model, so denoising time lands inside
