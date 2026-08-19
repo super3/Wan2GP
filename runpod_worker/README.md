@@ -335,11 +335,13 @@ inferred.
   ray. Measured on ONE 2x A40 pod, same clip, warm second job:
   **profile 4: 70.86 s on 1 GPU -> 53.89 s on 2 GPUs (1.31x)**; profile 1:
   71.14 s -> 55.03 s (1.29x). Cold: 121.7 -> 92.3 s and 93.2 -> 101.5 s.
-  That is Amdahl's law, not an implementation defect: of the 70.86 s, only
-  ~33 s is denoise (the parallel part) and ~38 s is serial text encode + VAE
-  decode + mux, so perfect scaling predicts 54.5 s and we measured 53.89 s --
-  i.e. the denoise phase parallelized at ~100% efficiency and the all-to-all
-  overhead is in the noise. Correctness is proven before timing: the gloo
+  Per-step timings from the shipped progress logs decompose it exactly:
+  denoise runs **11.75 s/step on 1 GPU and 7.3 s/step on 2**, i.e. the
+  parallel phase itself speeds up **1.61x (80% efficiency on 2 GPUs** -- the
+  missing 20% is the two all-to-alls per block). Of the 70.86 s warm job,
+  4 x 11.75 = 47 s is denoise and ~24 s is serial (text encode, VAE decode,
+  mux, base64); the serial part is unchanged at 24.7 s in the 2-GPU run, as
+  expected. 47/1.61 + 24 = 53.9 s, exactly what was measured. Correctness is proven before timing: the gloo
   suite (`runpod_worker/scripts/test_usp_gloo.py`) shows USP attention is
   numerically identical to full-sequence SDPA, and it is re-run on the bench
   host before any GPU work. Sol sparse attention and the skip-steps caches
