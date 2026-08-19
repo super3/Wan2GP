@@ -237,9 +237,25 @@ def test_letter_whitelists_match_the_handler_source():
         f"minimax_h3_handler.py letters_filter set changed to {sorted(upstream)}; "
         "update _FALLBACK_LETTERS / _FL2VA_MODEL_DEF / _REF2VA_MODEL_DEF in schema.py"
     )
+    # The mask group is not a letters_filter: it is a `selection` of whole modes
+    # ("", "A", "NA") that wgp.py:11602 filters through "XYZWNA". Omitting it
+    # made FL2VA's documented "Masked Area" / "Non Masked Area" modes
+    # unreachable, and left the "A implies video_mask" pre-flight dead.
+    masks = set(re.findall(r'"mask_preprocessing"\s*:\s*\{"selection":\s*\[([^\]]*)\]',
+                           source))
+    assert masks == {'"", "A", "NA"'}, (
+        f"minimax_h3_handler.py mask_preprocessing changed to {sorted(masks)}; "
+        "update _FL2VA_MODEL_DEF / _FALLBACK_LETTERS in schema.py"
+    )
     fl2va = S.letters_allowed(FL2VA_PRUNED, S.fallback_model_def(FL2VA_PRUNED))
     ref2va = S.letters_allowed(REF2VA, S.fallback_model_def(REF2VA))
-    assert set(fl2va["video_prompt_type"]) == set("GVKFI")
+    assert set(fl2va["video_prompt_type"]) == set("GVKFI") | set("AN")
+    # "U" belongs to guide_preprocessing, which neither variant declares.
+    assert "U" not in fl2va["video_prompt_type"]
+    # The fallback (no model_def) must agree with the model_def-driven answer.
+    assert set(S.letters_allowed(FL2VA_PRUNED)["video_prompt_type"]) == set(
+        fl2va["video_prompt_type"]
+    )
     assert set(fl2va["audio_prompt_type"]) == set("AK2")
     assert set(ref2va["video_prompt_type"]) == set("PDEV+-") | set("KI")
     assert set(ref2va["audio_prompt_type"]) == set("ABK")
@@ -678,10 +694,15 @@ def test_sliding_window_size_and_overlap_are_normalized(cfg):
     assert req.settings["sliding_window_size"] == 124   # window_min
     assert req.settings["sliding_window_overlap"] == 120  # overlap_max
 
-    # 0 means "sliding windows off" and must survive untouched (wgp.py:6930).
-    req = parse({"settings": {"prompt": DEMO_PROMPT, "sliding_window_size": 0,
-                              "sliding_window_overlap": 0}}, cfg=cfg)
-    assert req.settings["sliding_window_size"] == 0
+    # 0 does NOT disable sliding windows -- wgp.py:6930 only skips the flooring,
+    # and wgp.py:7158/7164/7196 then schedule 9 zero-length windows with a
+    # negative overlap. Reject it instead of scheduling that on a billed GPU.
+    error = raises("invalid_setting",
+                   {"settings": {"prompt": DEMO_PROMPT, "sliding_window_size": 0}},
+                   cfg=cfg)
+    assert "does not disable sliding windows" in error.message
+    # An overlap of 0 is legitimate and still survives untouched.
+    req = parse({"settings": {"prompt": DEMO_PROMPT, "sliding_window_overlap": 0}}, cfg=cfg)
     assert req.settings["sliding_window_overlap"] == 0
 
 
@@ -1040,12 +1061,53 @@ def test_lora_guards(env):
     assert "not staged" in error.message
     assert parse({"settings": {"prompt": DEMO_PROMPT,
                                "activated_loras": ["staged.safetensors"]}}, cfg=cfg)
-    # A URL whose basename is staged resolves to the staged file with no network.
-    assert parse(
+    # A URL is refused even when its basename is on the allow-list. WanGP only
+    # downloads when the local file is ABSENT (wgp.py:3697-3706), so allowing it
+    # would mean "https://attacker/<allowlisted-name>" is fetched and loaded as
+    # weights on any endpoint where that name is listed but not actually staged.
+    error = raises(
+        "bad_request",
         {"settings": {"prompt": DEMO_PROMPT,
                       "activated_loras": ["https://example.com/loras/staged.safetensors"]}},
         cfg=cfg,
     )
+    assert "remote LoRA URLs" in error.message
+
+
+def test_an_empty_lora_allow_list_accepts_nothing(env):
+    """Empty means "no caller-supplied LoRAs", not "any LoRA".
+
+    The permissive reading made the shipped default (the Dockerfile sets
+    ALLOW_URL_INPUTS=0 and ALLOW_MODEL_SWITCH=0 but never WANGP_ALLOWED_LORAS)
+    accept every name a caller invented.
+    """
+    env.delenv("WANGP_ALLOWED_LORAS", raising=False)
+    cfg = C.WorkerConfig()
+    assert cfg.allowed_loras == ()
+    error = raises("bad_request",
+                   {"settings": {"prompt": DEMO_PROMPT,
+                                 "activated_loras": ["anything.safetensors"]}}, cfg=cfg)
+    assert "no caller-supplied LoRAs" in error.message
+
+
+def test_caller_may_not_reroute_a_profile_lora(env):
+    """The profile's own URL is honoured verbatim; a lookalike is not."""
+    env.delenv("WANGP_ALLOWED_LORAS", raising=False)
+    cfg = C.WorkerConfig()
+    profile_url = json.loads(
+        (Path(__file__).resolve().parents[2] / "profiles" / "minimax_h3"
+         / f"{PROFILE_NAME}.json").read_text(encoding="utf-8")
+    )["activated_loras"][0]
+    payload = example_a()
+    payload["settings"]["activated_loras"] = [profile_url]
+    assert parse(payload, FL2VA_PRUNED, cfg=cfg).settings["activated_loras"]
+
+    payload = example_a()
+    payload["settings"]["activated_loras"] = [
+        "https://attacker.example/" + profile_url.rsplit("/", 1)[-1]
+    ]
+    error = raises("bad_request", payload, FL2VA_PRUNED, cfg=cfg)
+    assert "remote LoRA URLs" in error.message
 
 
 def test_a_baked_profile_lora_is_exempt_from_the_allow_list(env):
@@ -1064,7 +1126,16 @@ def test_media_must_name_a_source_object(cfg):
     """A bare string would be a filesystem path on the worker."""
     error = raises("bad_request", {"settings": {"prompt": DEMO_PROMPT},
                                    "media": {"image_start": "/etc/hostname"}}, cfg=cfg)
-    assert "bare string" in error.message
+    assert "must be an object" in error.message
+    assert any("filesystem" in item for item in error.details)
+    # The scheme:// shorthands README:460 documents ARE accepted, and are
+    # rewritten into the object form media_in._normalize_item expects.
+    req = parse({"settings": {"prompt": DEMO_PROMPT},
+                 "media": {"video_guide": "volume://clips/plate.mp4"}}, cfg=cfg)
+    assert req.media["video_guide"] == {"volume": "clips/plate.mp4"}
+    req = parse({"settings": {"prompt": DEMO_PROMPT},
+                 "media": {"image_start": "data:image/png;base64,iVBORw0KGgo="}}, cfg=cfg)
+    assert req.media["image_start"]["b64"].startswith("data:image/png")
     raises("bad_request", {"settings": {"prompt": DEMO_PROMPT},
                            "media": {"image_start": {}}}, cfg=cfg)
     error = raises("bad_request", {"settings": {"prompt": DEMO_PROMPT},
@@ -1240,3 +1311,126 @@ def test_request_to_dict_round_trips_as_json(cfg):
     req = parse(example_d(), REF2VA, cfg=cfg)
     body = json.dumps(req.to_dict())
     assert json.loads(body)["model_type"] == REF2VA
+
+
+# ==========================================================================
+# Review fixes: mask letters, media caps, post-processing, the frame cap
+# ==========================================================================
+
+def test_the_mask_mode_is_reachable_and_demands_a_mask(cfg):
+    """FL2VA declares mask_preprocessing {"selection": ["", "A", "NA"]}
+    (minimax_h3_handler.py:322) -> "Masked Area" / "Non Masked Area"
+    (wgp.py:11580-11582). Dropping that group made the mode unreachable AND left
+    the "A implies video_mask" pre-flight dead, so a mask WanGP requires was
+    reported as "will be ignored"."""
+    payload = {
+        "settings": {"prompt": DEMO_PROMPT, "video_prompt_type": "GVA",
+                     "audio_prompt_type": "2", "denoising_strength": 1.0},
+        "media": {"video_guide": {"volume": "clips/plate.mp4"},
+                  "video_mask": {"volume": "clips/mask.mp4"}},
+    }
+    req = parse(payload, FL2VA_PRUNED, cfg=cfg)
+    assert req.settings["video_prompt_type"] == "GVA"
+    assert not any("video_mask will be ignored" in item for item in req.warnings)
+
+    without_mask = {k: v for k, v in payload.items()}
+    without_mask["media"] = {"video_guide": {"volume": "clips/plate.mp4"}}
+    error = raises("invalid_setting", without_mask, FL2VA_PRUNED, cfg=cfg)
+    assert "video_mask is required" in error.message
+
+
+def test_a_mask_without_a_control_video_is_only_a_warning(cfg):
+    """wgp.py nests the mask rule inside `if "V" in video_prompt_type` (1341)."""
+    req = parse(
+        {"settings": {"prompt": DEMO_PROMPT, "video_prompt_type": ""},
+         "media": {"video_mask": {"volume": "clips/mask.mp4"}}},
+        FL2VA_PRUNED, cfg=cfg,
+    )
+    assert any("video_mask will be ignored" in item for item in req.warnings)
+
+
+def test_video_guide2_is_only_required_alongside_a_control_video(cfg):
+    """The "+" rule lives inside the "V" branch upstream (wgp.py:1341/1347), so
+    a "+" without a "V" is never reached there and must not be rejected here."""
+    req = parse(
+        {"settings": {"prompt": DEMO_PROMPT, "video_prompt_type": "+"}},
+        REF2VA, cfg=cfg,
+    )
+    assert req.settings["video_prompt_type"] == "+"
+    error = raises(
+        "invalid_setting",
+        {"settings": {"prompt": DEMO_PROMPT, "video_prompt_type": "V+-"},
+         "media": {"video_guide": b64_stub()}},
+        REF2VA, cfg=cfg,
+    )
+    assert "video_guide2" in error.message
+
+
+def test_media_item_count_is_capped(cfg, env):
+    """The byte budget counts bytes, not entries: 20k valid 14-byte GIFs cost
+    280 KB against a 7 MB budget and 20k inodes on the container disk."""
+    payload = {"settings": {"prompt": DEMO_PROMPT, "video_prompt_type": "I"},
+               "media": {"image_refs": [b64_stub() for _ in range(200)]}}
+    error = raises("bad_request", payload, REF2VA, cfg=cfg)
+    assert "attachments" in error.message
+
+    # With the cap lifted the request gets as far as the model's own rule, which
+    # proves the cap is what fired first (and that it is tunable).
+    env.setenv("WANGP_MAX_MEDIA_ITEMS", "300")
+    later = raises("invalid_setting", payload, REF2VA, cfg=C.WorkerConfig())
+    assert "at most 9 reference images" in later.message
+
+
+def test_postprocessing_keys_are_forbidden(cfg):
+    """download_requested_postprocessing_assets (wgp.py:3532) runs INSIDE
+    generate_media (wgp.py:6786), i.e. on the clock, and can pull multi-GB
+    assets the boot-time weight gate never proved were present."""
+    for key, value in (("temporal_upsampling", "rife2"),
+                       ("spatial_upsampling", "lanczos2"),
+                       ("postprocess_audio", "enhance"),
+                       ("replace_voice_method", "clone"),
+                       ("prompt_enhancer", "T")):
+        error = raises("bad_request",
+                       {"settings": {"prompt": DEMO_PROMPT, key: value}}, cfg=cfg)
+        assert key in error.message
+    assert S.POSTPROCESS_KEYS <= S.FORBIDDEN_KEYS
+
+
+def test_max_frames_zero_does_not_collapse_the_cap(env):
+    """0 read as "unlimited" used to fall through `or` to the env var, which was
+    also "0", flooring the cap onto frames_minimum (107) -- so the model's own
+    default video_length was rejected."""
+    env.setenv("WANGP_MAX_FRAMES", "0")
+    cfg = C.WorkerConfig()
+    assert cfg.max_frames == 362
+    req = parse({"settings": {"prompt": DEMO_PROMPT, "video_length": 124}}, cfg=cfg)
+    assert req.settings["video_length"] == 124
+
+    env.setenv("WANGP_MAX_FRAMES", "not-a-number")
+    assert C.WorkerConfig().max_frames == 362
+
+
+def test_priority_is_accepted_and_reported_as_inert(cfg):
+    req = parse({"settings": {"prompt": DEMO_PROMPT}, "runtime": {"priority": 7}}, cfg=cfg)
+    assert req.priority == 7
+    assert any("priority is inert" in item for item in req.warnings)
+    raises("bad_request",
+           {"settings": {"prompt": DEMO_PROMPT}, "runtime": {"priority": 11}}, cfg=cfg)
+
+
+def test_schema_and_media_in_agree_on_the_source_keys():
+    """A key accepted by one and rejected by the other is a request that passes
+    validation and then dies in materialization."""
+    from runpod_worker import media_in
+
+    source = Path(media_in.__file__).read_text(encoding="utf-8")
+    match = re.search(r'accepted\s*=\s*\{([^}]*)\}', source)
+    assert match, "media_in._normalize_item no longer declares an `accepted` set"
+    accepted = {item.strip().strip('"\'') for item in match.group(1).split(",") if item.strip()}
+    accepted.discard("range")           # a modifier, not a source
+    accepted.add("base64")              # media_in renames it to b64 on the way in
+    assert set(S.MEDIA_SOURCE_KEYS) == accepted
+
+    prefixes = {prefix for prefix, _ in S.MEDIA_STRING_PREFIXES}
+    for prefix in prefixes:
+        assert prefix in source, f"media_in no longer accepts the {prefix} shorthand"

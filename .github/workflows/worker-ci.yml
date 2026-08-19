@@ -16,27 +16,44 @@ name: worker-ci
 # anchors/aliases in workflow files, so `paths: &x` / `paths: *x` would not parse.
 # Keep them in sync.
 #
-# wgp.py and models/_settings.json are inputs to the suite, not just subjects of it:
-# tests/test_wgp_config_drift.py text-scans wgp.py for unguarded server_config["..."]
-# reads, and tests/test_schema.py re-derives ATTACHMENT_KEYS and the settings universe
-# from source. Leaving them out would mean the two tests written to catch upstream
-# drift never run when upstream drifts.
+# The upstream files below are INPUTS to the suite, not just subjects of it. Every
+# one of them is read at test time, so leaving it out means the test written to
+# catch its drift never runs when it drifts:
+#
+#   wgp.py                                  test_wgp_config_drift (unguarded
+#                                           server_config[...] reads), test_schema
+#                                           (ATTACHMENT_KEYS)
+#   shared/api.py                           test_wgp_config_drift:52
+#   models/_settings.json                   test_schema (the settings universe)
+#   models/minimax_h3/minimax_h3_handler.py  test_schema:34 (letters, lattice, caches)
+#   defaults/<model_type>.json              test_schema:100
+#   shared/utils/frame_scheduler.py         test_schema (the frame lattice)
+#   requirements.txt                        test_wgp_config_drift (constraints.txt
+#                                           mirrors a dozen of its pins by hand)
 on:
   pull_request:
     paths:
       - 'runpod_worker/**'
       - 'Dockerfile'
+      - 'requirements.txt'
       - 'wgp.py'
-      - 'models/_settings.json'
+      - 'shared/api.py'
       - 'shared/utils/frame_scheduler.py'
+      - 'models/**'
+      - 'defaults/**'
+      - 'profiles/minimax_h3/**'
       - '.github/workflows/worker-ci.yml'
   push:
     paths:
       - 'runpod_worker/**'
       - 'Dockerfile'
+      - 'requirements.txt'
       - 'wgp.py'
-      - 'models/_settings.json'
+      - 'shared/api.py'
       - 'shared/utils/frame_scheduler.py'
+      - 'models/**'
+      - 'defaults/**'
+      - 'profiles/minimax_h3/**'
       - '.github/workflows/worker-ci.yml'
 
 permissions:
@@ -99,6 +116,82 @@ jobs:
           for warning in request.warnings:
               print("warning:", warning)
           PY
+
+  sdk-contract:
+    name: runpod SDK contract
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # The tier-1 job installs pytest and nothing else, so every SDK behaviour the
+      # worker depends on is exercised against a fake there. This job installs the
+      # real wheel (pure Python, resolves in seconds) and asserts the four contracts
+      # the design actually leans on. None of them is documented as stable, and a
+      # silent rename would otherwise surface as a dead endpoint in production.
+      - name: Install the runpod SDK
+        run: |
+          python -m pip install --disable-pip-version-check --quiet pytest
+          python -m pip install --disable-pip-version-check \
+            -c runpod_worker/constraints.txt -r runpod_worker/requirements-worker.txt
+
+      - name: Assert the SDK surface the worker calls
+        run: |
+          python - <<'PY'
+          import inspect
+          import runpod
+          from runpod.serverless.modules import rp_job
+          from runpod.serverless.utils import rp_upload
+
+          missing = "register_fitness_check is gone; register_fitness_checks() no-ops"
+          assert callable(runpod.serverless.register_fitness_check), missing
+          missing = "progress_update is gone; every job would report no progress"
+          assert callable(runpod.serverless.progress_update), missing
+
+          params = set(inspect.signature(rp_upload.upload_file_to_bucket).parameters)
+          wanted = {"file_name", "file_location", "bucket_name", "prefix", "extra_args"}
+          assert wanted <= params, f"upload_file_to_bucket signature: {sorted(params)}"
+
+          # rp_job.run_job POPS "error"/"refresh_worker" off the handler's return
+          # value and turns refresh_worker into stopPod; error_response() and
+          # _success_response() are written to exactly that shape.
+          source = inspect.getsource(rp_job.run_job)
+          for needle in ('pop("error"', 'pop("refresh_worker"', '"stopPod"'):
+              assert needle in source, f"rp_job.run_job no longer does {needle}"
+          print("ok: runpod", getattr(runpod, "__version__", "?"))
+          PY
+
+      # With the SDK importable, register_fitness_checks() actually registers --
+      # the branch the tier-1 job can never reach because `runpod is None` there.
+      - name: Assert the fitness checks register
+        env:
+          WORKER_FITNESS: '1'
+          WANGP_EAGER_BOOT: '0'
+        run: |
+          python - <<'PY'
+          from runpod_worker import handler
+          names = handler.register_fitness_checks()
+          assert names == ["_fitness_boot", "_fitness_gpu", "_fitness_weights",
+                           "_fitness_transport"], names
+          print("ok: fitness checks", names)
+          PY
+
+      # The worker requirements resolve under the constraints file. This is the
+      # same gate the Dockerfile runs as `pip check`, except that one sits ~60
+      # minutes into an image build; a floor bump in runpod's dependency set
+      # should fail here in seconds instead.
+      - name: Resolve the worker requirements under constraints
+        run: |
+          python -m pip install --disable-pip-version-check --dry-run --quiet \
+            -c runpod_worker/constraints.txt -r runpod_worker/requirements-worker.txt
+          python -m pip check
+
+      - name: pytest with the SDK present
+        run: pytest runpod_worker/tests -q
 
   hadolint:
     name: hadolint (runpod_worker/Dockerfile)

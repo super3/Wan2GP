@@ -345,7 +345,13 @@ def test_success_without_a_file_is_not_poison(tmp_path):
     assert engine.should_recycle() is False
 
 
-def test_failure_budget_latches_after_n_failures(monkeypatch):
+def test_failure_budget_trips_but_does_not_latch(monkeypatch):
+    """The budget is a *consecutive*-failure counter, so a success clears it.
+
+    Latching its verdict in ``_RECYCLE_REASON`` meant every later response --
+    successes included -- carried ``refresh_worker: True``, i.e. one bad run
+    bought a 150-250 s weight reload on every subsequent job forever.
+    """
     monkeypatch.setenv("WORKER_FAILURE_BUDGET", "2")
     monkeypatch.setattr(C, "CONFIG", C.WorkerConfig())
     engine.reset_failure_budget()
@@ -353,6 +359,25 @@ def test_failure_budget_latches_after_n_failures(monkeypatch):
     assert engine.should_recycle() is False
     assert engine.note_failure("generation_failed") == 2
     assert engine.should_recycle() is True
+    assert "consecutive failures" in (engine.recycle_reason() or "")
+
+    engine.note_success()
+    assert engine.should_recycle() is False
+    assert engine.recycle_reason() is None
+
+
+def test_a_validation_outcome_is_not_charged_to_the_worker(monkeypatch):
+    """WanGP rejecting a request is the caller's fault, not the worker's."""
+    monkeypatch.setenv("WORKER_FAILURE_BUDGET", "2")
+    monkeypatch.setattr(C, "CONFIG", C.WorkerConfig())
+    engine.reset_failure_budget()
+    for _ in range(4):
+        job = FakeJob(result=FakeResult(
+            success=False, errors=[Err("validation", "reference video is too short")]))
+        outcome = engine.run({"prompt": "x"}, budget_s=30, sess=FakeSession(job))
+        assert outcome.stages == ("validation",)
+    assert engine.stats()["consecutive_failures"] == 0
+    assert engine.should_recycle() is False
 
 
 def test_note_success_clears_the_run_but_not_the_poison_latch():
