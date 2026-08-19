@@ -309,11 +309,12 @@ inferred.
   model set (~45 GB) into page-locked RAM; the container's locked-memory limit
   kills the process partway through pinning the 25 GB text encoder -- silently,
   no traceback, followed by a crash loop. Profile 4 pins only the ~20 GB
-  transformer and works; profile 3 works (VRAM-resident, ~25 GB peak), but its
-  speed is unmeasured -- the one profile-3 run landed on a host with a ~2.6x
-  slower matmul fitness number than the production workers, so its 69.6 s warm
-  time says nothing about the profile itself. Keep profile 4 until a same-host
-  A/B says otherwise. (Desktops without cgroup limits run profile 1 fine -- this is a
+  transformer and works. Profile 3 works (VRAM-resident, ~24.9 GB peak) and a
+  controlled A/B on identical hardware (two endpoints, both NVIDIA A40 @
+  EU-SE-1, same image and payloads, seeds 12345/5555) measured it ~7% faster
+  than profile 4: warm job 69.0 s vs 73.9 s, first job 108.5 s vs 116.6 s.
+  Worth switching if workers are on >=32 GB cards; profile 4 remains the safe
+  default (5.6 GB VRAM peak, runs on any tier). (Desktops without cgroup limits run profile 1 fine -- this is a
   container limit, not a model or VRAM limit.)
 - **Read phase timings from tqdm, not `phase_marks_s`.** The "inference" mark
   fires when denoising *starts* on a warm model, so denoising time lands inside
