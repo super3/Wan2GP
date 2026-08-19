@@ -38,10 +38,11 @@ def test_upstream_forward_unchanged_since_usp_mirror():
 def test_usp_module_stays_torch_lazy_for_this_suite():
     # The CPU suite must stay importable without torch; usp.py needs torch at
     # module scope, so nothing in runpod_worker may import it at module scope.
+    needle = "minimax_h3" + ".usp"  # split so this file does not match itself
     for py in (REPO / "runpod_worker").rglob("*.py"):
-        if py.name in ("usp_bench.py", "test_usp_gloo.py"):
-            continue  # torch-dependent by design, never imported by the suite
+        if py.name in ("usp_bench.py", "test_usp_gloo.py", "test_usp_drift.py"):
+            continue  # torch-dependent (or this guard itself), never imported by the suite
         text = py.read_text()
-        assert "minimax_h3.usp" not in text.replace("models/minimax_h3/usp", ""), (
+        assert needle not in text, (
             f"{py} references the torch-requiring usp module; keep the worker package torch-free"
         )
