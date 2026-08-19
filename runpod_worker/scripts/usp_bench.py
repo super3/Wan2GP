@@ -78,8 +78,6 @@ def main() -> int:
     parser.add_argument("--tag", default="")
     args = parser.parse_args()
 
-    from runpod_worker.config import CLI_ATTENTION_MODES as C_CLI_MODES  # noqa: N806
-
     world = int(os.environ.get("WORLD_SIZE", "1"))
     rank = int(os.environ.get("RANK", "0"))
     tag = args.tag or (f"usp{world}" if world > 1 else f"single-{args.attention}")
@@ -89,8 +87,14 @@ def main() -> int:
     os.environ["WANGP_PROFILE"] = str(args.profile)
     # "sol" is config-only: wgp.py:3303 rejects it as a CLI value, so pass it
     # through WANGP_ATTENTION (-> wgp_config.json) with no --attention flag.
+    # NOTE: runpod_worker.config must NOT be imported before this point --
+    # it builds its CONFIG singleton at import time, so an early import
+    # silently freezes the DEFAULT profile/attention (a bench run reported
+    # "profile 1" while actually running profile 4: vram_peak 5.6 GB, not 25).
+    from runpod_worker.config import CLI_ATTENTION_MODES  # noqa: PLC0415
+
     cli = f"--profile {args.profile} --verbose 1"
-    if args.attention in C_CLI_MODES:
+    if args.attention in CLI_ATTENTION_MODES:
         cli = f"--attention {args.attention} " + cli
     os.environ["WANGP_CLI_ARGS"] = cli
     os.environ.setdefault("WANGP_EAGER_BOOT", "0")
@@ -139,6 +143,20 @@ def main() -> int:
             "vram_peak_mb": metrics.get("vram_peak_mb"),
             "phase_marks_s": metrics.get("phase_marks_s"),
         }
+        # A run that silently used another profile is worse than no run: the
+        # VRAM peak is the fingerprint (profile 1/3 keep weights resident,
+        # ~23-25 GB; profile 4 streams them, ~5.6 GB).
+        peak_gb = (run["vram_peak_mb"] or 0) / 1024
+        if run["status"] == "completed":
+            resident = peak_gb > 15
+            if str(args.profile) in ("1", "3") and not resident:
+                run["profile_warning"] = (
+                    f"requested profile {args.profile} but vram_peak {peak_gb:.1f} GB "
+                    f"looks like a streaming profile")
+            if str(args.profile) in ("4", "5") and resident:
+                run["profile_warning"] = (
+                    f"requested profile {args.profile} but vram_peak {peak_gb:.1f} GB "
+                    f"looks like a resident profile")
         runs.append(run)
         if rank == 0:
             print("BENCH_RUN " + json.dumps(run), flush=True)
