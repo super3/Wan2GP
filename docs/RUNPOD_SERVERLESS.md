@@ -154,7 +154,7 @@ JOB_ROOT     = Path(os.environ.get("WANGP_JOB_ROOT", "/tmp/wangp-jobs"))
 
 MODEL_TYPE   = os.environ.get("WANGP_MODEL_TYPE", "minimax_h3_fl2va_pruned")
 # WanGP `config` string: system_configs,system_configs2,system_configs3,configs
-# (shared/config_groups.py:1-3). normalize_config_selection() rstrips trailing
+# (shared/config_groups.py:1-3). serialize_config_selection() (:18-20) rstrips trailing
 # commas, so ALWAYS store the rstripped form or the reload test at wgp.py:6773
 # will never match what load_models() recorded at wgp.py:4082.
 MODEL_CONFIG = os.environ.get("WANGP_MODEL_CONFIG", "").rstrip(",")
@@ -164,22 +164,30 @@ MODEL_CONFIG = os.environ.get("WANGP_MODEL_CONFIG", "").rstrip(",")
 #
 # wgp.py:2575  ->  if the config file is ABSENT, wgp builds its full default
 #                  dict (wgp.py:2576-2617) and writes it.
-# wgp.py:2620-2622 -> if the file EXISTS, wgp does `server_config = json.loads(text)`
+# wgp.py:2623    -> if the file EXISTS, wgp does `server_config = json.loads(text)`
 #                  and REPLACES the defaults wholesale. Only two keys are
 #                  setdefault'ed afterwards (wgp.py:2625, 2631).
 # wgp.py:3301  ->  attention_mode = server_config["attention_mode"]   # BARE READ
 #
 # I grepped every module-scope bare subscript of server_config
-# (`grep -nP 'server_config\["[^"]+"\](?!\s*=)' wgp.py`). Exactly one is
-# unguarded at import time: attention_mode (3301).
+# (`grep -nP 'server_config\["[^"]+"\](?!\s*=)' wgp.py`). That scan returns
+# FOUR module-scope reads: attention_mode (3301) and video/image/audio_profile
+# (3310-3312).
+#   - Only attention_mode can actually KeyError: the three profile keys are
+#     setdefault'ed by _normalize_profile_defaults(server_config), CALLED at
+#     module scope (wgp.py:2678), which runs before the reads at 3310-3312.
+#   - But a text scan cannot see through that call, so the drift test flags all
+#     four. Rather than carry a hand-maintained exception list, REQUIRED_WGP_KEYS
+#     lists all four and the config supplies them unconditionally. Costs nothing.
 #   - multi_prompts_gen_type (2630) is assigned two lines earlier (2626).
-#   - video/image/audio_profile (3310-3312) are covered by
-#     _normalize_profile_defaults(server_config) at wgp.py:2678.
+#   - The 3310-3312 reads are additionally short-circuited when force_profile_no
+#     >= 0, i.e. whenever --profile is in WANGP_CLI_ARGS. Drop that flag and they
+#     execute.
 # So a hand-written config MUST carry attention_mode or `import wgp` dies with
 # KeyError before shared/api.py:1082 returns. tests/test_wgp_config_drift.py
 # re-derives this set from source on every CI run.
 # --------------------------------------------------------------------------
-REQUIRED_WGP_KEYS = ("attention_mode",)
+REQUIRED_WGP_KEYS = ("attention_mode", "video_profile", "image_profile", "audio_profile")
 
 
 def checkpoint_paths() -> list[str]:
@@ -1384,7 +1392,7 @@ RUN python3 -c "import sys; sys.path.insert(0,'/opt/wangp'); \
 from shared.ffmpeg_setup import download_ffmpeg; download_ffmpeg()"
 
 # The repo root MUST be writable: `import wgp` does os.mkdir('settings')
-# (wgp.py:2548), writes wgp_config.json (2617), and get_default_settings
+# (wgp.py:2549), writes wgp_config.json (2618), and get_default_settings
 # json.dump()s settings/<model_type>_settings.json (wgp.py:3174).
 # loras_url_cache_v2.json is also a bare relative path. Read-only rootfs breaks this.
 RUN useradd -u 1000 -ms /bin/bash user && \
@@ -1496,7 +1504,7 @@ The two dominant controllable costs are the idle tail on bursty traffic and cold
 | # | Failure | Detection | Handling | Recycle? |
 |---|---|---|---|---|
 | 1 | Malformed input, unknown settings key, illegal flag letter | `schema.parse` | `bad_request` / `unknown_setting` / `invalid_setting` in <50 ms, 0 GPU seconds | No |
-| 2 | **`import wgp` raises `KeyError: 'attention_mode'`** from a hand-written config | `wgp.py:3301` bare subscript; the config file *replaces* wgp's defaults (`wgp.py:2620-2622`) | `ensure_wgp_config()` always writes `attention_mode`; `REQUIRED_WGP_KEYS` asserts it; `tests/test_wgp_config_drift.py` re-derives the unguarded-read set from `wgp.py` source on every CI run | n/a (boot) |
+| 2 | **`import wgp` raises `KeyError: 'attention_mode'`** from a hand-written config | `wgp.py:3301` bare subscript; the config file *replaces* wgp's defaults (`wgp.py:2623`) | `ensure_wgp_config()` always writes `attention_mode`; `REQUIRED_WGP_KEYS` asserts it; `tests/test_wgp_config_drift.py` re-derives the unguarded-read set from `wgp.py` source on every CI run | n/a (boot) |
 | 3 | Weights missing / wrong quantization on the volume | `get_missing_core_file_entries_for_status(deps, mt) != []` **before** any load | Fitness check fails → worker exits 1 → marked unhealthy → replaced. Never serves a request, never silently downloads 27 GB on the clock. | n/a |
 | 4 | Volume-staged LoRAs invisible | `get_lora_dir` returns a **relative** path (`wgp.py:2498`, the `abspath` is commented out) | `loras_root` is set to an **absolute** path in `wgp_config.json` (verified: `get_lora_root` reads it at `wgp.py:2472`) | No |
 | 5 | Arbitrary local-file read via `settings` | `settings.image_start = "/etc/hostname"` would pass straight through `_absolutize_setting_path` to WanGP | `FORBIDDEN_KEYS` rejects all 15 `ATTACHMENT_KEYS` plus `mode` in `input.settings`. Media may come **only** from `input.media`. `mode` matters because `_is_edit_task_params` (`wgp.py:1871`) flips `validate_task` into the edit branch, which reads `video_source` directly. | No |
@@ -1518,7 +1526,7 @@ The two dominant controllable costs are the idle tail on bursty traffic and cold
 | 21 | `/cancel` from the API is never observed | The SDK awaits the handler inline on the loop (`rp_job.py:257`), starving `monitor_stop_signals` | `async def handler` + `asyncio.to_thread` | No |
 | 22 | Two jobs in one process | `engine._JOB_LOCK` plus `_submit_tasks` raising `RuntimeError` (`shared/api.py:648`) | `worker_busy`, `retryable: true`. Should be unreachable at concurrency 1. | No |
 | 23 | Duplicate delivery (`/retry`, client retry) | Derived object key + HEAD probe | Early return, 0 GPU seconds. Seed is pre-resolved so a genuine re-run is reproducible. | No |
-| 24 | Read-only rootfs | `import wgp` does `os.mkdir("settings")` (`wgp.py:2548`) and writes `wgp_config.json`; `get_default_settings` writes `settings/<mt>_settings.json` (`wgp.py:3174`); `loras_url_cache_v2.json` is a bare relative path | Repo root is chowned writable in the image; documented as a hard requirement | n/a |
+| 24 | Read-only rootfs | `import wgp` does `os.mkdir("settings")` (`wgp.py:2549`) and writes `wgp_config.json`; `get_default_settings` writes `settings/<mt>_settings.json` (`wgp.py:3174`); `loras_url_cache_v2.json` is a bare relative path | Repo root is chowned writable in the image; documented as a hard requirement | n/a |
 | 25 | Model switch between jobs | `model_type != wgp.transformer_type` → `release_model()` + full reload (`wgp.py:6773`) | Rejected unless `ALLOW_MODEL_SWITCH=1`; one model per endpoint is the documented shape | No |
 | 26 | Endpoint silently scaled to 0 | 3 idle days → max 2; 7 idle days → 0 | Weekly synthetic job + alert; documented in the runbook | n/a |
 
@@ -1678,12 +1686,13 @@ Effort estimates are for one engineer already familiar with the repo.
 
 **`wgp.py`**
 - `ATTACHMENT_KEYS` = 15 keys at `:167-168`.
-- Config: absent → wgp writes its full default dict (`:2575-2618`); present → `server_config = json.loads(text)` replaces the defaults (`:2620-2622`) with only two `setdefault`s (`:2625`, `:2631`). `attention_mode = server_config["attention_mode"]` at **`:3301`** is the sole unguarded module-scope bare subscript; `video/image/audio_profile` (`:3310-3312`) are covered by `_normalize_profile_defaults` (`:2678`).
+- Config: absent → wgp writes its full default dict (`:2575-2618`); present → `server_config = json.loads(text)` replaces the defaults (`:2623`) with only two `setdefault`s (`:2625`, `:2631`). `attention_mode = server_config["attention_mode"]` at **`:3301`** is the only read that can actually `KeyError`; `video/image/audio_profile` (`:3310-3312`) are `setdefault`ed first by `_normalize_profile_defaults`, *called* at module scope (`:2678`). A text scan cannot see through that call, so the drift test reports all four — `REQUIRED_WGP_KEYS` therefore lists all four rather than carrying an exception list.
 - `--attention` whitelist `["auto","sdpa","sage","sage2","flash","xformers"]`, raises otherwise (`:3303-3308`).
 - `torch.cuda.get_device_capability` at module scope (`:2508`) and `shared/attention.py:14` → **`import wgp` requires a GPU**.
-- cwd must be the repo root: `open("models/_settings.json")` (`:2530`), `os.mkdir("settings")` (`:2548`).
+- cwd must be the repo root: `open("models/_settings.json")` (`:2530`), `os.mkdir("settings")` (`:2549`).
+- `get_lora_root()` (`:2469-2477`) gives a CLI `--loras` value **precedence over** `server_config["loras_root"]` (`lora_root = cli_lora_root or config_lora_root or DEFAULT_LORA_ROOT`). Putting `--loras` in `WANGP_CLI_ARGS` therefore silently defeats the absolute `loras_root` that volume-staged LoRAs depend on. The worker documents `--config` and `--loras` as forbidden in `WANGP_CLI_ARGS`.
 - `get_lora_root()` reads `server_config.get("loras_root", DEFAULT_LORA_ROOT)` (`:2469-2477`); `get_lora_dir()` returns a **relative** path (the `abspath` is commented out at `:2498`); `get_lora_local_path` maps an https URL to `lora_dir/basename` and returns absolute paths verbatim (`:3670-3677`).
-- Model reload gate: `if model_type != transformer_type or reload_needed or profile != loaded_profile or config != loaded_config` (`:6773`). `config` is normalized at `:6717` but `load_models` stores `loaded_config = config_id or ""` **unnormalized** at `:4082` — so any manual `load_models` call must pass an already-normalized string (`normalize_config_selection` rstrips trailing commas, `shared/config_groups.py:19-27`).
+- Model reload gate: `if model_type != transformer_type or reload_needed or profile != loaded_profile or config != loaded_config` (`:6773`). `config` is normalized at `:6717` but `load_models` stores `loaded_config = config_id or ""` **unnormalized** at `:4082` — so any manual `load_models` call must pass an already-normalized string (the rstrip lives in `serialize_config_selection`, `shared/config_groups.py:18-20`, which `normalize_config_selection` (`:22-28`) returns).
 - `floor_frame_count(video_length, …)` at `:6929`; `sliding_window_size` floored at `:6931`.
 - `get_default_settings` **writes** `settings/<model_type>_settings.json` when absent (`:3155-3176`) and returns only ~20 keys.
 - `clean_settings` merges over `primary_settings` = `models/_settings.json` = **112 keys** (`:1747-1760`, `:2530-2531`).
