@@ -735,15 +735,20 @@ def _preflight_transport(req: Any) -> None:
     """
     opts = getattr(req, "output", None) or {}
     mode = str(opts.get("mode") or "auto").strip().lower()
-    if mode not in ("auto", "b64", "base64", "inline"):
+    # Only "auto" is a surprise. A caller who asked for base64 outright chose the
+    # cap; a caller who named presigned/rp_bucket/volume gets a real error from
+    # deliver() if that transport is not usable.
+    if mode != "auto":
         return
     if opts.get("presigned_url") or opts.get("url"):
         return
-    chain = media_out.default_chain() if mode == "auto" else ["base64"]
+    chain = media_out.default_chain()
     if "rp_bucket" in chain and C.CONFIG.bucket_configured:
         return
     if "volume" in chain:
         return
+    if "base64" not in chain:
+        return  # deliver() will raise a precise error for whatever is left
     cap = int(getattr(C.CONFIG, "b64_out_max", 0) or 0)
     message = (
         f"this endpoint can only return outputs under {cap} B: the only transport "
