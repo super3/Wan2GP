@@ -290,9 +290,8 @@ RUN set -e; \
     pip install --no-cache-dir -c runpod_worker/constraints.txt \
       -r runpod_worker/requirements-worker.txt; \
     pip check > /tmp/pc.raw 2>&1 || true; \
-    grep -vE '^WARNING:' /tmp/pc.raw \
-      | grep -vxF 'decord 0.6.0 is not supported on this platform' \
-      > /tmp/pc.out || true; \
+    grep -vE '^WARNING:|^decord 0\\.6\\.0 is not supported on this platform$' \
+      /tmp/pc.raw > /tmp/pc.out || true; \
     if [ -s /tmp/pc.out ]; then \
       echo '[build] pip check found NEW dependency conflicts:'; \
       cat /tmp/pc.out; exit 1; \
