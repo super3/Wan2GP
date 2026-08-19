@@ -21,6 +21,7 @@ from pathlib import Path
 
 import pytest
 
+from runpod_worker.tests import assert_import_is_clean
 from runpod_worker import config as C
 from runpod_worker import media_in, media_out
 from runpod_worker.errors import WorkerError
@@ -796,11 +797,14 @@ def test_find_existing_is_inert_without_a_bucket(sandbox):
 # --------------------------------------------------------------------------
 
 def test_modules_stay_cpu_only():
-    """The split only pays off if these imports never drag in the heavy stack."""
-    for module in ("torch", "wgp", "gradio", "numpy", "boto3"):
-        assert module not in sys.modules or module == "numpy", (
-            f"{module} was imported by media_in/media_out"
-        )
+    """The split only pays off if these imports never drag in the heavy stack.
+
+    boto3 is in the forbidden set because media_out must import it lazily, inside
+    the upload path -- a worker that never uploads (base64 or volume transport)
+    should not pay for it, and the CPU tier does not install it at all.
+    """
+    for module in ("runpod_worker.media_in", "runpod_worker.media_out"):
+        assert_import_is_clean(module, ("torch", "wgp", "gradio", "boto3"))
 
 
 def test_attachment_tables_match_wgp_source():
