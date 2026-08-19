@@ -39,18 +39,22 @@ One JSON object per line, on stdout, forever. Nothing else.
 
 from __future__ import annotations
 
+import atexit
+import collections
 import contextlib
 import contextvars
 import datetime
 import json
 import os
+import queue
 import sys
 import threading
 import time
 import traceback
+import urllib.request
 from typing import Any, Iterator, Mapping, TextIO
 
-__all__ = ["LOG", "Logger", "stdout_handle", "LEVELS"]
+__all__ = ["LOG", "Logger", "stdout_handle", "LEVELS", "ring_tail", "reset_ring"]
 
 
 # ---------------------------------------------------------------------------
@@ -134,6 +138,180 @@ def _static_fields() -> dict[str, Any]:
     return fields
 
 
+# ---------------------------------------------------------------------------
+# Ring buffer.
+#
+# The console worker-log view has no read API (the /v2/{endpoint}/logs route is
+# a worker-key INGEST endpoint), so once a worker terminates its stdout is
+# gone. Every record _emit writes is therefore also kept in a bounded in-memory
+# ring; handler attaches its tail to failed jobs (and to any job that asks with
+# ``runtime.debug``), which makes worker history readable through the job
+# status API -- the only log channel that survives the worker.
+# ---------------------------------------------------------------------------
+_RING_DEFAULT = 200
+_RING: collections.deque[str] | None = None
+_RING_LOCK = threading.Lock()
+
+
+def _ring() -> collections.deque[str] | None:
+    """The ring, sized once from ``WORKER_LOG_RING`` (0 disables)."""
+    global _RING
+    with _RING_LOCK:
+        if _RING is None:
+            try:
+                size = int(os.environ.get("WORKER_LOG_RING", _RING_DEFAULT))
+            except (TypeError, ValueError):
+                size = _RING_DEFAULT
+            _RING = collections.deque(maxlen=max(0, size))
+        return _RING
+
+
+def ring_tail(limit: int | None = None) -> list[str]:
+    """The most recent ``limit`` serialized log records (all if ``None``)."""
+    ring = _ring()
+    if not ring:
+        return []
+    with _RING_LOCK:
+        records = list(ring)
+    if limit is not None and limit >= 0:
+        records = records[-limit:] if limit else []
+    return records
+
+
+def reset_ring() -> None:
+    """Drop the ring and re-read its size. Tests only."""
+    global _RING
+    with _RING_LOCK:
+        _RING = None
+
+
+# ---------------------------------------------------------------------------
+# Log shipper.
+#
+# The ring cannot outlive a worker that dies DURING boot -- the exact failure
+# mode (mmgp pinning killed by the container's locked-memory limit) that made
+# profiles 1/2 undiagnosable from the API. When ``LOG_SHIP_URL`` is set, every
+# emitted record is also queued to a daemon thread that POSTs small JSON
+# batches there, so boot logs land somewhere durable within
+# ``LOG_SHIP_INTERVAL_S`` (default 2 s) of being written. Best effort by
+# design: a SIGKILL can still eat the last partial batch, and any HTTP failure
+# is silently dropped after one direct stderr note -- shipping must never slow
+# down or take down the worker.
+# ---------------------------------------------------------------------------
+_SHIP_QUEUE: "queue.Queue[str | None]" = queue.Queue(maxsize=10000)
+_SHIP_THREAD: threading.Thread | None = None
+_SHIP_LOCK = threading.Lock()
+_SHIP_BATCH_MAX = 50
+_SHIP_WARNED = False
+
+
+def _ship_url() -> str:
+    return str(os.environ.get("LOG_SHIP_URL", "")).strip()
+
+
+def _ship_interval() -> float:
+    try:
+        return max(0.2, float(os.environ.get("LOG_SHIP_INTERVAL_S", "2")))
+    except (TypeError, ValueError):
+        return 2.0
+
+
+def _ship_note_failure(exc: BaseException) -> None:
+    """One direct line on the real stderr, once per process. Never via LOG --
+    a failing shipper logging through _emit would enqueue its own failure."""
+    global _SHIP_WARNED
+    if _SHIP_WARNED:
+        return
+    _SHIP_WARNED = True
+    try:
+        handle = sys.__stderr__ or sys.stderr
+        if handle is not None:
+            handle.write(f"log shipping to LOG_SHIP_URL failed; dropping batches: {exc!r}\n")
+            handle.flush()
+    except Exception:  # noqa: BLE001 - last-resort path
+        pass
+
+
+def _ship_post(url: str, batch: list[str]) -> None:
+    body = json.dumps(
+        {"records": [json.loads(line) for line in batch], **_static_fields()},
+        ensure_ascii=False,
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        url, data=body, headers={"Content-Type": "application/json"}, method="POST"
+    )
+    with urllib.request.urlopen(request, timeout=5):  # noqa: S310 - operator-set URL
+        pass
+
+
+def _ship_loop() -> None:  # pragma: no cover - exercised via the queue in tests
+    while True:
+        batch: list[str] = []
+        try:
+            item = _SHIP_QUEUE.get(timeout=_ship_interval())
+        except queue.Empty:
+            continue
+        if item is None:
+            return
+        batch.append(item)
+        deadline = time.monotonic() + _ship_interval()
+        while len(batch) < _SHIP_BATCH_MAX and time.monotonic() < deadline:
+            try:
+                item = _SHIP_QUEUE.get_nowait()
+            except queue.Empty:
+                break
+            if item is None:
+                break
+            batch.append(item)
+        url = _ship_url()
+        if not url:
+            continue
+        try:
+            _ship_post(url, batch)
+        except Exception as exc:  # noqa: BLE001 - shipping is best effort
+            _ship_note_failure(exc)
+        if item is None:
+            return
+
+
+def _ship_flush_at_exit() -> None:
+    """Drain what is already queued, synchronously, within a small budget."""
+    url = _ship_url()
+    if not url:
+        return
+    batch: list[str] = []
+    while len(batch) < _SHIP_BATCH_MAX:
+        try:
+            item = _SHIP_QUEUE.get_nowait()
+        except queue.Empty:
+            break
+        if item is not None:
+            batch.append(item)
+    if batch:
+        try:
+            _ship_post(url, batch)
+        except Exception as exc:  # noqa: BLE001
+            _ship_note_failure(exc)
+
+
+def _ship_enqueue(line: str) -> None:
+    if not _ship_url():
+        return
+    global _SHIP_THREAD
+    with _SHIP_LOCK:
+        if _SHIP_THREAD is None or not _SHIP_THREAD.is_alive():
+            _SHIP_THREAD = threading.Thread(
+                target=_ship_loop, name="log-shipper", daemon=True
+            )
+            _SHIP_THREAD.start()
+            atexit.register(_ship_flush_at_exit)
+    try:
+        _SHIP_QUEUE.put_nowait(line)
+    except queue.Full:
+        pass
+
+
+
 class Logger:
     """Emits exactly one JSON object per line to the captured stdout."""
 
@@ -174,8 +352,6 @@ class Logger:
         if LEVELS.get(level, LEVELS[_DEFAULT_LEVEL]) < _level_threshold():
             return
         handle = _STDOUT
-        if handle is None:
-            return
         limit = _max_field_chars()
         record: dict[str, Any] = {
             "ts": _now_iso(),
@@ -194,6 +370,13 @@ class Logger:
                 {"ts": record["ts"], "level": "error", "logger": self._name,
                  "event": "log_serialization_failed", "original_event": str(event)}
             )
+        ring = _ring()
+        if ring is not None and ring.maxlen:
+            with _RING_LOCK:
+                ring.append(line)
+        _ship_enqueue(line)
+        if handle is None:
+            return
         try:
             with _WRITE_LOCK:
                 handle.write(line + "\n")
