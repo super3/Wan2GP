@@ -1125,12 +1125,27 @@ def _validate_media_entry(label: str, entry: Any, allow_urls: bool) -> dict[str,
         entry = _expand_media_string(label, entry)
     if not isinstance(entry, Mapping):
         raise WorkerError(BAD_REQUEST, f"media['{label}'] must be an object")
+    unknown = sorted(set(entry) - set(MEDIA_SOURCE_KEYS) - {"range"})
+    if unknown:
+        raise WorkerError(
+            BAD_REQUEST,
+            f"media['{label}'] has unknown fields {unknown}",
+            details=[f"accepted: {sorted(set(MEDIA_SOURCE_KEYS) | {'range'})}"],
+        )
     present = [key for key in MEDIA_SOURCE_KEYS if entry.get(key) not in (None, "")]
     if not present:
         raise WorkerError(
             BAD_REQUEST,
             f"media['{label}'] names no source",
             details=[f"one of {list(MEDIA_SOURCE_KEYS)} is required"],
+        )
+    # media_in._normalize_item refuses more than one source; say so here rather
+    # than after the request has been accepted.
+    if len({"b64" if key == "base64" else key for key in present}) > 1:
+        raise WorkerError(
+            BAD_REQUEST,
+            f"media['{label}'] names {len(present)} sources ({present}); exactly one "
+            f"of b64 / volume / url is allowed",
         )
     if "url" in present and not allow_urls:
         raise WorkerError(
