@@ -237,8 +237,13 @@ def _ship_post(url: str, batch: list[str]) -> None:
         {"records": [json.loads(line) for line in batch], **_static_fields()},
         ensure_ascii=False,
     ).encode("utf-8")
+    # RunPod's proxy (and Cloudflare generally) 403s the default
+    # "Python-urllib/x.y" user agent; send our own.
     request = urllib.request.Request(
-        url, data=body, headers={"Content-Type": "application/json"}, method="POST"
+        url,
+        data=body,
+        headers={"Content-Type": "application/json", "User-Agent": "wangp-worker-logship/1"},
+        method="POST",
     )
     with urllib.request.urlopen(request, timeout=5):  # noqa: S310 - operator-set URL
         pass
