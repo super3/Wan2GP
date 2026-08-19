@@ -30,6 +30,7 @@ __all__ = [
     "TEMPLATE_PATH",
     "REQUIRED_WGP_KEYS",
     "ATTENTION_MODES",
+    "CLI_ATTENTION_MODES",
     "checkpoint_paths",
     "lora_root",
     "attention_mode",
@@ -71,7 +72,15 @@ TEMPLATE_PATH = Path(__file__).resolve().parent / "wgp_config.json.tmpl"
 #: instead lands on the silent-refusal path (wgp.py:6815-6818 does
 #: send_cmd("info", ...); send_cmd("exit"); return True), which surfaces as a
 #: successful generation with zero output files. Reject it here instead.
-ATTENTION_MODES = ("auto", "sdpa", "sage", "sage2", "flash", "xformers")
+#: What ``--attention`` accepts on wgp's CLI (wgp.py:3303). "sol" is NOT here:
+#: the CLI raises "Unknown attention mode 'sol'".
+CLI_ATTENTION_MODES = ("auto", "sdpa", "sage", "sage2", "flash", "xformers")
+
+#: What ``server_config["attention_mode"]`` accepts (wgp.py:3301, read before the
+#: CLI override). Sol sparse attention is reachable ONLY through the config file,
+#: and only for models whose model_def sets ``sol_attention`` (wgp.py:6820 --
+#: minimax_h3_handler.py:199 sets it). It also needs Triton and RTX 40xx+.
+ATTENTION_MODES = CLI_ATTENTION_MODES + ("sol",)
 
 # --------------------------------------------------------------------------
 # THE CONFIG FILE TRAP.
@@ -194,7 +203,16 @@ def attention_mode(cli_args=()) -> str:
     if mode not in ATTENTION_MODES:
         raise RuntimeError(
             f"WANGP_ATTENTION={mode!r} is not one of {list(ATTENTION_MODES)} "
-            f"(the whitelist wgp.py:3303 enforces)"
+            f"(the whitelist wgp.py:3301/3303 enforces)"
+        )
+    if from_cli and from_cli not in CLI_ATTENTION_MODES:
+        # wgp.py:3303-3307 raises on an unknown CLI attention. "sol" is the live
+        # case: it is a valid CONFIG value but never a valid CLI value, so it
+        # must reach wgp through wgp_config.json with no --attention flag.
+        raise RuntimeError(
+            f"--attention {from_cli!r} in WANGP_CLI_ARGS is rejected by wgp.py:3303 "
+            f"(CLI accepts {list(CLI_ATTENTION_MODES)}). Set WANGP_ATTENTION={from_cli!r} "
+            f"and drop --attention from WANGP_CLI_ARGS."
         )
     if explicit and from_cli and explicit != from_cli:
         # Not fatal: wgp.py:3304-3305 makes the CLI value win, and that is the
