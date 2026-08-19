@@ -112,6 +112,28 @@ def main() -> int:
     H.bootstrap()
     boot_s = round(time.monotonic() - boot_started, 2)
 
+    # WanGP degrades to SDPA SILENTLY when the requested kernel is missing or
+    # unsupported (a bench run reported sdpa/sol/sage2 within 0.1 s of each
+    # other -- all three were SDPA). Ask the runtime what it actually holds
+    # instead of trusting the request.
+    effective = installed = supported = None
+    try:
+        from mmgp import offload  # noqa: PLC0415
+        from shared.attention import (  # noqa: PLC0415
+            get_attention_modes,
+            get_supported_attention_modes,
+        )
+        effective = offload.shared_state.get("_attention")
+        installed = list(get_attention_modes())
+        supported = list(get_supported_attention_modes())
+    except Exception as exc:  # noqa: BLE001 - probe must never fail the bench
+        effective = f"probe_failed: {exc!r}"
+    attention_ok = effective == args.attention and (
+        args.attention in (installed or []) or args.attention == "sol")
+    if rank == 0:
+        print(f"BENCH_ATTENTION requested={args.attention} effective={effective} "
+              f"installed={installed} ok={attention_ok}", flush=True)
+
     runs = []
     for seed in [int(s) for s in args.seeds.split(",") if s.strip()]:
         job = {
@@ -164,6 +186,8 @@ def main() -> int:
         del response
 
     summary = {"event": "usp_bench_summary", "tag": tag, "attention": args.attention,
+               "effective_attention": effective, "attention_ok": attention_ok,
+               "installed_attention": installed, "supported_attention": supported,
                "profile": str(args.profile), "world": world, "boot_s": boot_s, "runs": runs}
     if rank == 0:
         print("BENCH_SUMMARY " + json.dumps(summary), flush=True)
