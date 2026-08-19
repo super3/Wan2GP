@@ -116,6 +116,15 @@ def main() -> int:
     # unsupported (a bench run reported sdpa/sol/sage2 within 0.1 s of each
     # other -- all three were SDPA). Ask the runtime what it actually holds
     # instead of trusting the request.
+    def probe_attention():
+        """shared_state['_attention'] is only populated once a generation has
+        configured the model -- probing at bootstrap returns None."""
+        try:
+            from mmgp import offload  # noqa: PLC0415
+            return offload.shared_state.get("_attention")
+        except Exception as exc:  # noqa: BLE001
+            return f"probe_failed: {exc!r}"
+
     effective = installed = supported = None
     try:
         from mmgp import offload  # noqa: PLC0415
@@ -123,16 +132,12 @@ def main() -> int:
             get_attention_modes,
             get_supported_attention_modes,
         )
-        effective = offload.shared_state.get("_attention")
         installed = list(get_attention_modes())
         supported = list(get_supported_attention_modes())
     except Exception as exc:  # noqa: BLE001 - probe must never fail the bench
         effective = f"probe_failed: {exc!r}"
-    attention_ok = effective == args.attention and (
-        args.attention in (installed or []) or args.attention == "sol")
     if rank == 0:
-        print(f"BENCH_ATTENTION requested={args.attention} effective={effective} "
-              f"installed={installed} ok={attention_ok}", flush=True)
+        print(f"BENCH_ATTENTION requested={args.attention} installed={installed}", flush=True)
 
     runs = []
     for seed in [int(s) for s in args.seeds.split(",") if s.strip()]:
@@ -165,26 +170,21 @@ def main() -> int:
             "vram_peak_mb": metrics.get("vram_peak_mb"),
             "phase_marks_s": metrics.get("phase_marks_s"),
         }
-        # A run that silently used another profile is worse than no run: the
-        # VRAM peak is the fingerprint (profile 1/3 keep weights resident,
-        # ~23-25 GB; profile 4 streams them, ~5.6 GB).
-        peak_gb = (run["vram_peak_mb"] or 0) / 1024
-        if run["status"] == "completed":
-            resident = peak_gb > 15
-            if str(args.profile) in ("1", "3") and not resident:
-                run["profile_warning"] = (
-                    f"requested profile {args.profile} but vram_peak {peak_gb:.1f} GB "
-                    f"looks like a streaming profile")
-            if str(args.profile) in ("4", "5") and resident:
-                run["profile_warning"] = (
-                    f"requested profile {args.profile} but vram_peak {peak_gb:.1f} GB "
-                    f"looks like a resident profile")
+        # Do NOT infer the profile from VRAM: measured on a 96 GB PRO 6000,
+        # profile 1 pins every component to reserved RAM and streams from
+        # there, so its VRAM peak (5.6 GB) is indistinguishable from profile
+        # 4's. The profile is proven by mmgp's own "Pinning data of ..." lines
+        # in the shipped stream log (profile 1 pins transformer + text encoder
+        # + VAEs, ~51 GB; profile 4 pins only the transformer, ~20 GB).
+        run["effective_attention"] = probe_attention()
         runs.append(run)
         if rank == 0:
             print("BENCH_RUN " + json.dumps(run), flush=True)
         # Every response references container-shared paths; drop it promptly.
         del response
 
+    effective = runs[-1].get("effective_attention") if runs else None
+    attention_ok = effective == args.attention
     summary = {"event": "usp_bench_summary", "tag": tag, "attention": args.attention,
                "effective_attention": effective, "attention_ok": attention_ok,
                "installed_attention": installed, "supported_attention": supported,
