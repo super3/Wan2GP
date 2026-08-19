@@ -556,3 +556,48 @@ def test_the_torch_triple_matches_the_dockerfile():
             f"constraints.txt pins {name}=={version} but the Dockerfile installs "
             "a different version from download.pytorch.org"
         )
+
+
+# ---------------------------------------------------------------------------
+# hf_transfer reconciliation (regression: real RunPod pod, 2026-08-19)
+# ---------------------------------------------------------------------------
+
+def test_hf_transfer_disabled_when_package_missing(monkeypatch):
+    """HF_HUB_ENABLE_HF_TRANSFER=1 without the package must be forced to "0".
+
+    huggingface_hub raises on EVERY download in that state rather than falling
+    back, which cost a partial 28 GB warm before it was caught.
+    """
+    import builtins
+    from runpod_worker import config
+
+    monkeypatch.setenv("HF_HUB_ENABLE_HF_TRANSFER", "1")
+    real_import = builtins.__import__
+
+    def no_hf_transfer(name, *a, **kw):
+        if name == "hf_transfer":
+            raise ImportError("simulated: not installed")
+        return real_import(name, *a, **kw)
+
+    monkeypatch.setattr(builtins, "__import__", no_hf_transfer)
+    assert config.ensure_hf_transfer_sane() == "disabled"
+    assert os.environ["HF_HUB_ENABLE_HF_TRANSFER"] == "0"
+
+
+def test_hf_transfer_left_alone_when_unset(monkeypatch):
+    from runpod_worker import config
+
+    monkeypatch.delenv("HF_HUB_ENABLE_HF_TRANSFER", raising=False)
+    assert config.ensure_hf_transfer_sane() == "off"
+    assert "HF_HUB_ENABLE_HF_TRANSFER" not in os.environ
+
+
+def test_hf_transfer_kept_when_importable(monkeypatch):
+    """If the package IS importable the fast path must stay enabled."""
+    import sys, types
+    from runpod_worker import config
+
+    monkeypatch.setenv("HF_HUB_ENABLE_HF_TRANSFER", "1")
+    monkeypatch.setitem(sys.modules, "hf_transfer", types.ModuleType("hf_transfer"))
+    assert config.ensure_hf_transfer_sane() == "fast"
+    assert os.environ["HF_HUB_ENABLE_HF_TRANSFER"] == "1"

@@ -25,3 +25,7 @@
 # floor is 1.12.0 because that is the release whose rp_fitness / rp_job / rp_local
 # behaviour this worker was written against.
 runpod>=1.12.0,<2
+# Base images commonly export HF_HUB_ENABLE_HF_TRANSFER=1; huggingface_hub
+# hard-fails every download if the package is then missing. See
+# config.ensure_hf_transfer_sane().
+hf_transfer>=0.1.9,<1
