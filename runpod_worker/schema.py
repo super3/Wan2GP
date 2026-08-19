@@ -164,7 +164,32 @@ LIST_KEYS: frozenset[str] = frozenset({"image_refs"})
 #: Keys a media spec object may carry to name its source. media_in.py owns the
 #: semantics; schema only checks that at least one is present and that ``url``
 #: is permitted by policy (``ALLOW_URL_INPUTS``, default off).
-MEDIA_SOURCE_KEYS: tuple[str, ...] = ("b64", "base64", "data", "volume", "path", "url")
+#:
+#: This tuple MUST stay a superset-free match for ``media_in._normalize_item``'s
+#: ``accepted`` set: a key accepted here and rejected there is a request that
+#: passes validation and then dies in materialization. ``base64`` is the one
+#: alias (media_in renames it to ``b64``). There is deliberately no ``path``
+#: key -- it is the only source form with no scheme, i.e. indistinguishable
+#: from a path on the worker's own filesystem.
+MEDIA_SOURCE_KEYS: tuple[str, ...] = ("b64", "base64", "volume", "url")
+
+#: The ``scheme://`` string shorthands ``media_in._normalize_item`` accepts, and
+#: the source key each one becomes. A *bare* string stays refused: it would name
+#: a path on the worker's filesystem.
+MEDIA_STRING_PREFIXES: tuple[tuple[str, str], ...] = (
+    ("volume://", "volume"),
+    ("http://", "url"),
+    ("https://", "url"),
+    ("data:", "b64"),
+)
+
+#: Hard ceiling on how many attachments one request may carry, over every key.
+#: The byte budget alone cannot stop an entry-count attack: 20k valid 14-byte
+#: GIFs cost 280 KB against a 7 MB budget and 20k inodes on the container disk,
+#: plus a 20k-element ``image_refs`` list handed to WanGP's validator. MiniMax
+#: H3 takes one reference image (FL2VA, ``one_image_ref_only``) or at most nine
+#: (Ref2VA), so a low cap costs nothing real.
+DEFAULT_MAX_MEDIA_ITEMS = 16
 
 
 # ---------------------------------------------------------------------------
@@ -185,8 +210,30 @@ DEFAULT_MODEL_TYPE = "minimax_h3_fl2va_pruned"
 # ``input.media``, where it is materialized into a job-scoped temp directory --
 # ``settings.image_start = "/etc/hostname"`` would otherwise sail through
 # ``_absolutize_setting_path`` (``shared/api.py:1028-1043``) into WanGP.
-FORBIDDEN_KEYS: frozenset[str] = frozenset(ATTACHMENT_KEYS) | frozenset(
-    {"mode", "_api", "client_id", "state", "type", "base_model_type", "priority"}
+#: Post-processing selectors a caller may never set. Every one of them is read
+#: by ``download_requested_postprocessing_assets`` (``wgp.py:3532-3539``), which
+#: ``generate_media`` calls ON THE REQUEST PATH at ``wgp.py:6786`` -- after the
+#: model is loaded and the clock is running. A caller could therefore reintroduce
+#: a multi-GB download plus a second model load into a billed generation, which
+#: is exactly what the boot-time weight gate exists to prevent
+#: (``engine.assert_weights_complete`` proves only the pinned model's core files).
+#: ``prompt_enhancer`` is here for the same reason plus a privacy one: WanGP
+#: prints the enhanced prompt to stdout (``wgp.py:7276``), which
+#: ``WANGP_CONSOLE=1`` routes to the container log.
+POSTPROCESS_KEYS: frozenset[str] = frozenset(
+    {
+        "postprocess_audio",
+        "prompt_enhancer",
+        "replace_voice_method",
+        "spatial_upsampling",
+        "temporal_upsampling",
+    }
+)
+
+FORBIDDEN_KEYS: frozenset[str] = (
+    frozenset(ATTACHMENT_KEYS)
+    | frozenset({"mode", "_api", "client_id", "state", "type", "base_model_type", "priority"})
+    | POSTPROCESS_KEYS
 )
 
 #: Substrings that mean the CUDA context is poisoned rather than the request
@@ -597,16 +644,36 @@ def is_legal_frame_count(value: int, model_def: Mapping[str, Any] | None) -> boo
 #
 # WanGP encodes modes as letter soups. The legal alphabet per model is declared
 # in model_def, not hard-coded: ``image_prompt_types_allowed`` (checked at
-# wgp.py:1396-1398 and :1421-1423), and the ``letters_filter`` of
-# ``guide_custom_choices`` / ``image_ref_choices`` / ``audio_prompt_type_sources``
-# (minimax_h3_handler.py:265-341). An illegal letter is not always an error
-# upstream -- some are silently dropped -- so rejecting here is strictly more
-# informative than letting it through.
+# wgp.py:1396-1398 and :1421-1423), and the letters of the FOUR video groups
+# wgp.py builds the video_prompt_type dropdowns from:
+#
+#   group                    filter / source                       wgp.py
+#   guide_custom_choices     model_def["letters_filter"]           11542
+#   custom_video_selection   model_def["letters_filter"]           11568
+#   mask_preprocessing       model_def["selection"] & "XYZWNA"     11602
+#   image_ref_choices        model_def["letters_filter"]           11630
+#
+# Omitting any of them makes a documented mode unreachable: FL2VA declares
+# ``mask_preprocessing: {"selection": ["", "A", "NA"]}``
+# (minimax_h3_handler.py:322) -> "Masked Area" / "Non Masked Area"
+# (wgp.py:11580-11582), which wgp.py:1350-1356 then enforces with
+# "You must provide a Video Mask".
+#
+# "U" ("identity", wgp.py:4584) is deliberately NOT allowed: it belongs to the
+# ``guide_preprocessing`` group, which neither MiniMax H3 variant declares, so it
+# is unreachable from the UI for these models. It only ever appears as the opt-out
+# half of ``"A" in vpt and not "U" in vpt``; allowing it would let a caller ask for
+# masked processing and then suppress the mask requirement WanGP enforces.
+#
+# An illegal letter is not always an error upstream -- some are silently dropped
+# -- so rejecting here is strictly more informative than letting it through.
 
 _FALLBACK_LETTERS: dict[str, dict[str, str]] = {
     "fl2va": {
         "image_prompt_type": "TSEVL",
-        "video_prompt_type": "GVKFI",
+        # "GVKFI" from guide_custom_choices + "AN" from mask_preprocessing
+        # (selection ["", "A", "NA"], filtered through wgp.py:11602's "XYZWNA").
+        "video_prompt_type": "GVKFIAN",
         "audio_prompt_type": "AK2",
     },
     "ref2va": {
@@ -615,6 +682,11 @@ _FALLBACK_LETTERS: dict[str, dict[str, str]] = {
         "audio_prompt_type": "ABK",
     },
 }
+
+
+#: ``mask_letter_filter`` at wgp.py:11602. A mask ``selection`` entry may only
+#: contribute letters from this set.
+_MASK_LETTERS = "XYZWNA"
 
 
 def _dedupe(text: str) -> str:
@@ -634,10 +706,16 @@ def letters_allowed(model_type: str, model_def: Mapping[str, Any] | None = None)
     image = str(md.get("image_prompt_types_allowed") or "") or fallback["image_prompt_type"]
 
     video = ""
-    for group_key in ("guide_custom_choices", "image_ref_choices"):
+    for group_key in ("guide_custom_choices", "custom_video_selection", "image_ref_choices"):
         group = md.get(group_key)
         if isinstance(group, Mapping):
             video += str(group.get("letters_filter") or "")
+    # The mask group names whole *modes* ("", "A", "NA"), not a letter filter;
+    # wgp.py:11602 constrains them with "XYZWNA" on the way in.
+    mask = md.get("mask_preprocessing")
+    if isinstance(mask, Mapping):
+        for choice in mask.get("selection") or ():
+            video += "".join(char for char in str(choice) if char in _MASK_LETTERS)
     video = _dedupe(video) or fallback["video_prompt_type"]
 
     audio_group = md.get("audio_prompt_type_sources")
@@ -933,13 +1011,31 @@ def _load_accel_profile(model_def: Mapping[str, Any], name: str) -> dict[str, An
 # ---------------------------------------------------------------------------
 
 
+def _max_media_items(cfg: Any) -> int:
+    raw = getattr(cfg, "max_media_items", None)
+    if raw in (None, ""):
+        raw = os.environ.get("WANGP_MAX_MEDIA_ITEMS", DEFAULT_MAX_MEDIA_ITEMS)
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_MAX_MEDIA_ITEMS
+    return value if value > 0 else DEFAULT_MAX_MEDIA_ITEMS
+
+
 def _validate_media(media: Any, cfg: Any) -> dict[str, Any]:
     """Structural validation of ``input.media``. Materialization is media_in's job.
 
-    A bare string is refused on purpose: ``{"image_start": "/etc/hostname"}``
+    A *bare* string is refused on purpose: ``{"image_start": "/etc/hostname"}``
     would otherwise be indistinguishable from a legitimate path once media_in
     normalized it, and ``_absolutize_setting_path`` (``shared/api.py:1028-1043``)
-    would happily hand it to WanGP.
+    would happily hand it to WanGP. The ``scheme://`` shorthands
+    (``MEDIA_STRING_PREFIXES``) are accepted and rewritten into their object
+    form here, so exactly one contract reaches media_in.
+
+    The attachment COUNT is capped (``WANGP_MAX_MEDIA_ITEMS``): the byte budget
+    in media_in counts bytes, not entries, so thousands of tiny valid images fit
+    inside it and would still cost thousands of files on the container disk and
+    a list of the same length handed to WanGP's validator.
     """
     if media is None:
         return {}
@@ -947,6 +1043,8 @@ def _validate_media(media: Any, cfg: Any) -> dict[str, Any]:
         raise WorkerError(BAD_REQUEST, "input.media must be an object")
 
     allow_urls = _flag(cfg, "allow_url_inputs", "ALLOW_URL_INPUTS", "0")
+    item_cap = _max_media_items(cfg)
+    total_items = 0
     out: dict[str, Any] = {}
 
     for key, value in media.items():
@@ -960,13 +1058,31 @@ def _validate_media(media: Any, cfg: Any) -> dict[str, Any]:
         if value is None:
             continue
         if name in LIST_KEYS:
-            items = value if isinstance(value, (list, tuple)) else [value]
+            items = list(value if isinstance(value, (list, tuple)) else [value])
+            total_items += len(items)
+            if total_items > item_cap:
+                raise WorkerError(
+                    BAD_REQUEST,
+                    f"input.media carries more than {item_cap} attachments",
+                    details=[
+                        f"media['{name}'] alone has {len(items)}",
+                        "raise WANGP_MAX_MEDIA_ITEMS if this endpoint really needs more",
+                    ],
+                )
             entries = [_validate_media_entry(f"{name}[{i}]", item, allow_urls)
-                       for i, item in enumerate(list(items))]
+                       for i, item in enumerate(items)]
             if not entries:
                 continue
             out[name] = entries
         else:
+            total_items += 1
+            if total_items > item_cap:
+                raise WorkerError(
+                    BAD_REQUEST,
+                    f"input.media carries more than {item_cap} attachments",
+                    details=["raise WANGP_MAX_MEDIA_ITEMS if this endpoint really "
+                             "needs more"],
+                )
             if isinstance(value, (list, tuple)):
                 raise WorkerError(
                     BAD_REQUEST,
@@ -977,14 +1093,36 @@ def _validate_media(media: Any, cfg: Any) -> dict[str, Any]:
     return out
 
 
+def _expand_media_string(label: str, text: str) -> dict[str, Any]:
+    """Rewrite a ``scheme://`` shorthand into the object form media_in expects.
+
+    Mirrors ``media_in._normalize_item``'s string branch exactly, so the two
+    modules cannot disagree about which strings are legal.
+    """
+    stripped = text.strip()
+    lowered = stripped.lower()
+    for prefix, source in MEDIA_STRING_PREFIXES:
+        if lowered.startswith(prefix):
+            if source == "volume":
+                return {"volume": stripped[len(prefix):]}
+            return {source: stripped}
+    raise WorkerError(
+        BAD_REQUEST,
+        f"media['{label}'] must be an object such as "
+        f'{{"b64": "..."}} or {{"volume": "clips/plate.mp4"}}, or a string starting '
+        f"with {', '.join(prefix for prefix, _ in MEDIA_STRING_PREFIXES)}",
+        details=["a bare string would name a path on the worker's filesystem"],
+    )
+
+
 def _validate_media_entry(label: str, entry: Any, allow_urls: bool) -> dict[str, Any]:
-    if isinstance(entry, (str, bytes)):
+    if isinstance(entry, bytes):
         raise WorkerError(
             BAD_REQUEST,
-            f"media['{label}'] must be an object such as "
-            f'{{"b64": "..."}} or {{"volume": "clips/plate.mp4"}}, not a bare string',
-            details=["a bare string would name a path on the worker's filesystem"],
+            f"media['{label}'] must be an object or a string, not raw bytes",
         )
+    if isinstance(entry, str):
+        entry = _expand_media_string(label, entry)
     if not isinstance(entry, Mapping):
         raise WorkerError(BAD_REQUEST, f"media['{label}'] must be an object")
     present = [key for key in MEDIA_SOURCE_KEYS if entry.get(key) not in (None, "")]
@@ -1000,17 +1138,9 @@ def _validate_media_entry(label: str, entry: Any, allow_urls: bool) -> dict[str,
             f"media['{label}'] uses a URL, but URL inputs are disabled on this endpoint",
             details=["set ALLOW_URL_INPUTS=1 to enable them, or send b64/volume instead"],
         )
-    if entry.get("path") not in (None, "") and os.path.isabs(str(entry.get("path"))):
-        raise WorkerError(
-            BAD_REQUEST,
-            f"media['{label}'].path must be relative; absolute worker paths are not accepted",
-        )
-    for key in ("volume", "path"):
-        value = entry.get(key)
-        if value not in (None, "") and ".." in str(value).split("|", 1)[0].split("/"):
-            raise WorkerError(
-                BAD_REQUEST, f"media['{label}'].{key} may not contain '..'"
-            )
+    value = entry.get("volume")
+    if value not in (None, "") and ".." in str(value).split("|", 1)[0].split("/"):
+        raise WorkerError(BAD_REQUEST, f"media['{label}'].volume may not contain '..'")
     return dict(entry)
 
 
@@ -1028,16 +1158,20 @@ def _media_count(media: Mapping[str, Any], key: str) -> int:
 # ---------------------------------------------------------------------------
 
 #: ``letter in <setting>`` -> the media slot WanGP then demands. Every entry is a
-#: literal transcription of a ``return err(...)`` in ``validate_settings``.
-_REQUIRED_MEDIA: tuple[tuple[str, str, str, str], ...] = (
-    ("image_prompt_type", "S", "image_start", "wgp.py:1409"),
-    ("image_prompt_type", "E", "image_end", "wgp.py:1425"),
-    ("image_prompt_type", "V", "video_source", "wgp.py:1294-1295"),
-    ("video_prompt_type", "I", "image_refs", "wgp.py:1330-1331"),
-    ("video_prompt_type", "V", "video_guide", "wgp.py:1341-1346"),
-    ("video_prompt_type", "+", "video_guide2", "wgp.py:1347-1348"),
-    ("audio_prompt_type", "A", "audio_guide", "wgp.py:1302-1304"),
-    ("audio_prompt_type", "B", "audio_guide2", "wgp.py:1310-1312"),
+#: literal transcription of a ``return err(...)`` in ``validate_settings``. The
+#: fifth field is a letter that must ALSO be present for the rule to apply,
+#: because upstream nests the check: ``"+" -> video_guide2`` lives inside
+#: ``if "V" in video_prompt_type:`` (wgp.py:1341/1347), so a "+" without a "V"
+#: is never reached there and must not be rejected here either.
+_REQUIRED_MEDIA: tuple[tuple[str, str, str, str, str], ...] = (
+    ("image_prompt_type", "S", "image_start", "wgp.py:1409", ""),
+    ("image_prompt_type", "E", "image_end", "wgp.py:1425", ""),
+    ("image_prompt_type", "V", "video_source", "wgp.py:1294-1295", ""),
+    ("video_prompt_type", "I", "image_refs", "wgp.py:1330-1331", ""),
+    ("video_prompt_type", "V", "video_guide", "wgp.py:1341-1346", ""),
+    ("video_prompt_type", "+", "video_guide2", "wgp.py:1347-1348", "V"),
+    ("audio_prompt_type", "A", "audio_guide", "wgp.py:1302-1304", ""),
+    ("audio_prompt_type", "B", "audio_guide2", "wgp.py:1310-1312", ""),
 )
 
 
@@ -1181,9 +1315,11 @@ def _check_media_requirements(
         for key, letters in letters_allowed(model_type, model_def).items()
     }
 
-    for setting_key, letter, media_key, citation in _REQUIRED_MEDIA:
+    for setting_key, letter, media_key, citation, prereq in _REQUIRED_MEDIA:
         if letter not in legal[setting_key]:
             continue  # this variant has no such mode at all
+        if prereq and prereq not in values[setting_key]:
+            continue  # upstream nests this check under `prereq`; so do we
         wanted = letter in values[setting_key]
         supplied = _media_count(media, media_key) > 0
         if wanted and not supplied:
@@ -1198,13 +1334,22 @@ def _check_media_requirements(
                 f"'{letter}' ({citation})"
             )
 
-    # wgp.py:1350-1358 -- masked inpainting needs a mask; "U" opts out.
+    # wgp.py:1350-1358 -- masked inpainting needs a mask; "U" opts out. Nested
+    # under "V" upstream (wgp.py:1341), so the mask is only demanded when a
+    # control video is in play.
     vpt = values["video_prompt_type"]
+    masked = "V" in vpt and "A" in vpt and "U" not in vpt
     if "A" in legal["video_prompt_type"]:
-        if "A" in vpt and "U" not in vpt and not media.get("video_mask"):
+        if masked and not media.get("video_mask"):
             raise WorkerError(
                 INVALID_SETTING,
-                "video_prompt_type contains 'A', so media.video_mask is required (wgp.py:1350-1356)",
+                "video_prompt_type contains 'A', so media.video_mask is required "
+                "(wgp.py:1350-1356)",
+            )
+        if media.get("video_mask") and not masked:
+            warnings.append(
+                "media.video_mask will be ignored: video_prompt_type does not select "
+                "masked processing (needs 'V' and 'A', without 'U') (wgp.py:1350-1358)"
             )
     elif media.get("video_mask"):
         warnings.append(
@@ -1405,6 +1550,7 @@ def parse(
 
     profile_name = payload.get("profile")
     profile_loras: set[str] = set()
+    profile_lora_entries: set[str] = set()
     if profile_name not in (None, ""):
         loader = profile_loader
         fragment = (
@@ -1421,6 +1567,14 @@ def parse(
             )
         for entry in fragment.get("activated_loras") or []:
             profile_loras.add(os.path.basename(str(entry).split("|")[0]))
+            # The FULL entry too, verbatim: the shipped MiniMax H3 turbo profiles
+            # name their LoRA by https:// URL, which get_lora_local_path
+            # (wgp.py:3670-3677) maps to <lora_dir>/<basename(url)> so a staged
+            # file resolves with zero network. Only an exact match is honoured --
+            # a basename match would let a caller point the same filename at their
+            # own host (check_loras_exist downloads when the local file is absent,
+            # wgp.py:3697-3706).
+            profile_lora_entries.add(str(entry))
         settings.update(fragment)
         warnings.append(f"accelerator profile '{profile_name}' applied before input.settings")
 
@@ -1448,7 +1602,8 @@ def parse(
     _validate_resolution(settings, mdef)
     _validate_solver_and_steps(settings, user, mdef, warnings)
     _validate_cache(settings, mdef)
-    _validate_loras(settings, mdef, cfg, profile_loras)
+    _validate_loras(settings, mdef, cfg, profile_loras,
+                    profile_entries=profile_lora_entries, warnings=warnings)
     _note_inert_settings(settings, user, mdef, warnings)
 
     settings["seed"] = resolve_seed(settings.get("seed"), warnings=warnings)
@@ -1481,7 +1636,7 @@ def parse(
     req.runtime = runtime
     req.profile = str(profile_name) if profile_name not in (None, "") else None
     req.budget_s = _resolve_budget(runtime.get("timeout_s"), cfg, warnings)
-    req.priority = _resolve_priority(runtime.get("priority"))
+    req.priority = _resolve_priority(runtime.get("priority"), warnings)
     req.idempotency_key = _resolve_idempotency_key(runtime.get("idempotency_key"))
     req.warnings = warnings
     req.resolved = {key: settings[key] for key in RESOLVED_ECHO_KEYS if key in settings}
@@ -1540,6 +1695,33 @@ def _apply_config_selection(
         settings["config"] = normalized
 
 
+#: ``WANGP_MAX_FRAMES`` when it is unset or unusable. 362 frames is ~15.1 s at
+#: 24 fps -- the longest clip either MiniMax H3 variant is documented for.
+DEFAULT_MAX_FRAMES = 362
+
+
+def _worker_frame_cap(cfg: Any) -> int:
+    """The endpoint's ``video_length`` ceiling, never 0.
+
+    ``0`` is NOT "unlimited": FL2VA declares no ``frames_maximum`` anywhere in
+    the headless path, so an uncapped endpoint lets one request schedule
+    hundreds of sliding windows on a billed GPU. A non-positive or unparseable
+    value therefore falls back to :data:`DEFAULT_MAX_FRAMES` rather than
+    collapsing the cap to ``frames_minimum`` (which is what
+    ``int(cfg.max_frames or os.environ[...])`` used to do for ``0``: falsy ->
+    env -> ``"0"`` -> a 107-frame endpoint that rejects the model's own default
+    ``video_length``).
+    """
+    raw = getattr(cfg, "max_frames", None)
+    if raw in (None, ""):
+        raw = os.environ.get("WANGP_MAX_FRAMES", DEFAULT_MAX_FRAMES)
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_MAX_FRAMES
+    return value if value > 0 else DEFAULT_MAX_FRAMES
+
+
 def _validate_frames(
     settings: dict[str, Any],
     user: Mapping[str, Any],
@@ -1562,9 +1744,10 @@ def _validate_frames(
     """
     minimum, step, offset = frame_lattice(mdef)
     fps = float(mdef.get("fps", 24) or 24)
-    worker_max = int(getattr(cfg, "max_frames", 0) or os.environ.get("WANGP_MAX_FRAMES", 362))
-    hard_max = int(mdef.get("frames_maximum") or worker_max)
-    cap = floor_frames(max(minimum, min(hard_max, worker_max)), minimum, step, offset)
+    worker_max = _worker_frame_cap(cfg)
+    model_max = int(mdef.get("frames_maximum") or 0)
+    hard_max = min(model_max, worker_max) if model_max > 0 else worker_max
+    cap = floor_frames(max(minimum, hard_max), minimum, step, offset)
 
     raw = settings.get("video_length", _DEFAULT_VIDEO_LENGTH)
     requested = _as_int(raw, "settings.video_length")
@@ -1595,14 +1778,33 @@ def _validate_frames(
     swd = mdef.get("sliding_window_defaults") or {}
     if "sliding_window_size" in settings and swd:
         requested_window = _as_int(settings["sliding_window_size"], "settings.sliding_window_size")
-        if requested_window == 0:
-            window = 0  # wgp.py:6930 leaves 0 alone: sliding windows disabled
-        else:
-            window = floor_frames(requested_window, minimum, step, offset)
-            window = max(
-                int(swd.get("window_min", minimum)),
-                min(window, int(swd.get("window_max", cap))),
+        if requested_window <= 0:
+            # 0 does NOT disable sliding windows. wgp.py:6930 only skips the
+            # FLOORING for 0; whether windows run is decided by
+            # test_any_sliding_window(model_type), which reads
+            # model_def["sliding_window"] -- True for both MiniMax H3 variants
+            # (minimax_h3_handler.py:249, :304). With size 0 upstream computes
+            # default_reuse_frames = min(0 - latent_size, overlap) = -17
+            # (wgp.py:7158), sliding_window = video_length > 0 -> True
+            # (wgp.py:7164), and then
+            # compute_sliding_window_no(124, 0, 0, -17) = 9 windows of
+            # current_video_length = 0 (wgp.py:7196-7197). Nine zero-length
+            # windows on a billed GPU.
+            raise WorkerError(
+                INVALID_SETTING,
+                "sliding_window_size=0 does not disable sliding windows; this model "
+                "always uses them (model_def['sliding_window'] is true)",
+                details=[
+                    f"legal window sizes are {int(swd.get('window_min', minimum))}.."
+                    f"{int(swd.get('window_max', cap))} on the {offset} mod {step} lattice",
+                    "to generate a single window, set video_length <= sliding_window_size",
+                ],
             )
+        window = floor_frames(requested_window, minimum, step, offset)
+        window = max(
+            int(swd.get("window_min", minimum)),
+            min(window, int(swd.get("window_max", cap))),
+        )
         if window != requested_window:
             warnings.append(f"sliding_window_size {requested_window} -> {window}")
         settings["sliding_window_size"] = window
@@ -1760,6 +1962,9 @@ def _validate_loras(
     mdef: Mapping[str, Any],
     cfg: Any,
     profile_loras: set[str],
+    *,
+    profile_entries: set[str] | None = None,
+    warnings: list[str] | None = None,
 ) -> None:
     """Only basenames that are staged on this endpoint.
 
@@ -1798,14 +2003,56 @@ def _validate_loras(
         if os.path.isabs(head) or head.startswith("\\\\") or (len(head) > 1 and head[1] == ":"):
             raise WorkerError(BAD_REQUEST, "absolute LoRA paths are not allowed")
         lowered = head.lower()
-        if "://" in lowered and not lowered.startswith(("http://", "https://")):
-            raise WorkerError(BAD_REQUEST, f"unsupported LoRA URL scheme in {head!r}")
+        if ("://" in lowered or lowered.startswith(("http:", "https:"))) and \
+                text not in (profile_entries or set()):
+            # NOT a naming quibble: an http(s) entry is a caller-steered fetch
+            # primitive. validate_settings -> update_loras_url_cache
+            # (wgp.py:1181-1182, :9980-9996) files the URL in loras_url_cache,
+            # then check_loras_exist(..., download=True) (wgp.py:6901, :3689-3706)
+            # calls download_file -> urlretrieve (shared/utils/download.py:241)
+            # with no scheme, IP, port or redirect validation -- from inside the
+            # RunPod network, bypassing every control media_in.check_url_target
+            # implements, and writing attacker-chosen bytes to
+            # <lora_dir>/<basename(url)> on the SHARED network volume, where the
+            # next job loads them as model weights. The worker never needs a
+            # remote LoRA: scripts/prefetch_weights.py stages them.
+            raise WorkerError(
+                BAD_REQUEST,
+                f"remote LoRA URLs are not accepted: {head!r}",
+                details=["stage the LoRA on the volume and name it by basename",
+                         "see runpod_worker/scripts/prefetch_weights.py",
+                         "the only exception is a URL contributed verbatim by a "
+                         "shipped accelerator profile (input.profile)"],
+            )
+        if "://" in lowered:
+            # A profile URL, i.e. repo-controlled. Still worth saying out loud:
+            # if the file is not staged, check_loras_exist downloads it inside
+            # the billed generation (wgp.py:3697-3706).
+            if warnings is not None:
+                warnings.append(
+                    f"LoRA '{os.path.basename(head)}' is named by URL; it must be "
+                    f"staged in the loras directory or WanGP will download it "
+                    f"during the generation"
+                )
         if ".." in head.replace("\\", "/").split("/"):
             raise WorkerError(BAD_REQUEST, "LoRA paths may not contain '..'")
         name = os.path.basename(head)
         if not name:
             raise WorkerError(BAD_REQUEST, f"LoRA entry {text!r} names no file")
-        if allowed and name not in allowed and name not in profile_loras:
+        if name in profile_loras:
+            continue
+        # An EMPTY allow-list means "no caller-supplied LoRAs", not "any LoRA".
+        # The permissive reading made the shipped default (WANGP_ALLOWED_LORAS
+        # unset, per the Dockerfile) accept every name a caller invented.
+        if not allowed:
+            raise WorkerError(
+                BAD_REQUEST,
+                "this endpoint accepts no caller-supplied LoRAs",
+                details=["set WANGP_ALLOWED_LORAS to the basenames staged on the "
+                         "volume, or select a baked accelerator profile with "
+                         "input.profile"],
+            )
+        if name not in allowed:
             raise WorkerError(
                 BAD_REQUEST,
                 f"LoRA '{name}' is not staged on this endpoint",
@@ -1839,11 +2086,6 @@ def _note_inert_settings(
         "keep_frames_video_guide"
     ):
         warnings.append("keep_frames_video_guide is not supported by this model")
-    if settings.get("prompt_enhancer"):
-        warnings.append(
-            "prompt_enhancer loads a second model on the same GPU; it is not part of the "
-            "measured cold-start budget"
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -1904,12 +2146,26 @@ def _resolve_budget(raw: Any, cfg: Any, warnings: list[str]) -> int:
     return budget
 
 
-def _resolve_priority(raw: Any) -> int:
+def _resolve_priority(raw: Any, warnings: list[str] | None = None) -> int:
+    """Range-check ``runtime.priority``. It is INERT on this worker.
+
+    WanGP only reads a task ``priority`` on the webui-queue path
+    (``WanGPSession._ensure_task_client_ids``, ``shared/api.py:686-692``), which
+    this worker never uses -- and ``priority`` is in :data:`FORBIDDEN_KEYS` as a
+    settings key anyway. At concurrency 1 there is no queue to order, so the
+    field is accepted, validated and then ignored; say so rather than let a
+    caller believe it did something.
+    """
     if raw in (None, ""):
         return 0
     priority = _as_int(raw, "runtime.priority", code=BAD_REQUEST)
     if not 0 <= priority <= 9:
         raise WorkerError(BAD_REQUEST, "runtime.priority must be between 0 and 9")
+    if warnings is not None:
+        warnings.append(
+            "runtime.priority is inert on this endpoint: one generation per worker "
+            "means there is no queue to order (scale with max_workers instead)"
+        )
     return priority
 
 

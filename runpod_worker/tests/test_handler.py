@@ -27,7 +27,7 @@ from pathlib import Path
 import pytest
 
 from runpod_worker import config as C
-from runpod_worker import engine, handler, schema
+from runpod_worker import engine, handler, media_in, schema
 from runpod_worker.errors import (
     BACKEND_FATAL,
     BAD_REQUEST,
@@ -658,8 +658,14 @@ def test_url_media_is_refused_unless_allowed(h, monkeypatch):
     assert h.run_calls == []
 
 
-def test_volume_media_is_resolved_under_the_volume_root(h):
-    source = h.volume / "refs" / "plate.mp4"
+def test_volume_media_is_resolved_under_the_volume_input_dir(h):
+    """Inputs live under <volume>/inputs, NOT the volume root.
+
+    The volume is shared and also carries ckpts/, loras/ and (when `volume` is in
+    the output chain) outputs/<key>.mp4 at a caller-influenced key -- so
+    resolving inputs against the root let one request read another's delivery.
+    """
+    source = h.volume / media_in.DEFAULT_VOLUME_INPUT_SUBDIR / "refs" / "plate.mp4"
     source.parent.mkdir(parents=True, exist_ok=True)
     source.write_bytes(MP4_BYTES)
     body = h.submit(
@@ -688,3 +694,191 @@ def test_volume_media_cannot_escape_the_volume_root(h):
     )
     assert body["error_code"] in (BAD_REQUEST, "media_fetch_failed")
     assert h.run_calls == []
+
+
+# ---------------------------------------------------------------------------
+# Review fixes: cancellation, the failure budget, and idempotency scoping
+# ---------------------------------------------------------------------------
+
+
+def test_validation_failures_do_not_burn_the_recycle_budget(h, monkeypatch):
+    """A request WanGP rejects says nothing about this worker's health.
+
+    ``wangp_validation`` is exactly the class ``schema.parse`` cannot pre-empt
+    (reference-video / audio duration, control-video soundtrack presence --
+    ``minimax_h3_handler.py:389-445`` all need ffprobe or librosa on the real
+    file), so counting it let three bad client uploads in a row kill a worker
+    that was working perfectly.
+    """
+    monkeypatch.setenv("WORKER_FAILURE_BUDGET", "2")
+    monkeypatch.setattr(C, "CONFIG", C.WorkerConfig())
+    h.outcome_factory = lambda settings, **kw: engine.RunOutcome(
+        result=FakeGenerationResult(
+            success=False, errors=[gen_error("validation", "reference video is too short")]
+        ),
+        errors=["[validation] reference video is too short"],
+        stages=("validation",),
+    )
+    for _ in range(4):
+        body = h.submit(base_input())
+        assert body["error_code"] == WANGP_VALIDATION
+        assert "refresh_worker" not in body
+    assert handler.consecutive_failures() == 0
+    assert engine.should_recycle() is False
+
+
+def test_a_success_clears_the_soft_failure_budget(h, monkeypatch):
+    """The budget verdict must not latch: it is a *consecutive*-failure counter.
+
+    Latching it meant every later response -- successes included -- carried
+    ``refresh_worker: True`` and paid a 150-250 s weight reload.
+    """
+    monkeypatch.setenv("WORKER_FAILURE_BUDGET", "2")
+    monkeypatch.setattr(C, "CONFIG", C.WorkerConfig())
+    failing = lambda settings, **kw: engine.RunOutcome(  # noqa: E731
+        result=FakeGenerationResult(success=False, errors=[gen_error("generation", "boom")]),
+        errors=["[generation] boom"],
+        stages=("generation",),
+    )
+    h.outcome_factory = failing
+    h.submit(base_input())
+    assert h.submit(base_input())["refresh_worker"] is True
+    assert handler.consecutive_failures() == 2
+
+    h.outcome_factory = h.default_outcome
+    body = h.submit(base_input())
+    assert body["status"] == "completed"
+    assert "refresh_worker" not in body, "a success must clear the soft budget"
+    assert handler.consecutive_failures() == 0
+    assert handler.should_recycle() is False
+
+
+def test_a_poisoned_worker_stays_poisoned_after_a_success(h):
+    """The hard latch is the opposite case and must survive."""
+    engine.mark_poisoned("cancel did not land")
+    body = h.submit(base_input())
+    assert body["status"] == "completed"
+    assert body["refresh_worker"] is True
+    assert engine.recycle_reason() == "cancel did not land"
+
+
+def test_cancel_signals_the_engine_instead_of_leaking_the_thread(h):
+    """A platform /cancel must reach ``engine.run``'s ``cancel_check``.
+
+    ``JobScaler.stop_job`` (rp_scale.py:321-338) cancels the asyncio task and
+    ``handle_job``'s finally (rp_scale.py:341-368) frees the concurrency slot
+    immediately -- but ``asyncio.to_thread`` cannot cancel a running thread. With
+    no cooperative signal the generation runs to the full budget on a billed GPU
+    and the next jobs fail against ``_JOB_LOCK`` with ``worker_busy``.
+    """
+    import asyncio
+    import threading as _threading
+    import time as _time
+
+    started = _threading.Event()
+    observed: list[bool] = []
+
+    def slow_run(settings, **kwargs):
+        check = kwargs.get("cancel_check")
+        assert callable(check), "engine.run was called without a cancel_check"
+        started.set()
+        for _ in range(200):  # <= 2 s; the test cancels long before that
+            if check():
+                observed.append(True)
+                break
+            _time.sleep(0.01)
+        return engine.RunOutcome(
+            result=FakeGenerationResult(success=False, cancelled=True), errors=[],
+        )
+
+    h.outcome_factory = None
+    monkey_run = lambda settings, **kwargs: slow_run(settings, **kwargs)  # noqa: E731
+    h.monkeypatch.setattr(engine, "run", monkey_run)
+
+    async def drive():
+        task = asyncio.ensure_future(handler.handler(h.job(base_input(), "cancel-1")))
+        await asyncio.get_event_loop().run_in_executor(None, started.wait, 5.0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(drive())
+    assert observed == [True], "the worker thread never saw the cancel"
+
+
+def test_idempotency_is_scoped_to_the_request_not_just_the_key(h):
+    """A caller-chosen key must not be able to fetch someone else's video.
+
+    The key namespace is the whole endpoint, so without a request digest a
+    guessed or reused ``idempotency_key`` returned another caller's URL, size and
+    sha256 for free -- and described it with the NEW request's parameters.
+    """
+    payload = base_input(output={"mode": "volume"})
+    payload["runtime"] = {"idempotency_key": "shared-key"}
+    first = h.submit(payload, job_id="attempt-a")
+    assert first["status"] == "completed"
+
+    other = base_input(output={"mode": "volume"})
+    other["runtime"] = {"idempotency_key": "shared-key"}
+    other["prompt"] = "integrated_multimodal_description: a completely different shot"
+    h.run_calls.clear()
+    second = h.submit(other, job_id="attempt-b")
+    assert second["status"] == "completed"
+    assert second["metrics"].get("idempotent_hit") is None, "cross-request cache hit"
+    assert len(h.run_calls) == 1
+    assert second["video"]["key"] != first["video"]["key"]
+
+
+def test_idempotent_hit_is_not_returned_for_a_transport_it_cannot_carry(h):
+    """A volume object is not an answer for a caller who asked for base64."""
+    payload = base_input(output={"mode": "volume"})
+    payload["runtime"] = {"idempotency_key": "same-request"}
+    first = h.submit(payload, job_id="a")
+    assert first["video"]["transport"] == "volume"
+
+    payload_b64 = dict(payload)
+    payload_b64["output"] = {"mode": "base64"}
+    h.run_calls.clear()
+    second = h.submit(payload_b64, job_id="b")
+    assert second["video"]["transport"] == "base64"
+    assert second["metrics"].get("idempotent_hit") is None
+    assert len(h.run_calls) == 1
+
+
+def test_a_cached_hit_does_not_report_a_seed_it_cannot_know(h):
+    payload = {"prompt": base_input()["prompt"],
+               "settings": {"resolution": "832x480", "video_length": 124},
+               "output": {"mode": "volume"},
+               "runtime": {"idempotency_key": "no-seed"}}
+    first = h.submit(payload, job_id="seed-a")
+    assert isinstance(first["seed"], int)
+    h.run_calls.clear()
+    second = h.submit(payload, job_id="seed-b")
+    assert second["metrics"]["idempotent_hit"] is True
+    assert second["seed"] is None
+    assert any("cached delivery" in item for item in second["warnings"])
+
+
+def test_error_object_flag_stays_a_string_on_the_wire(h, monkeypatch):
+    """``rp_job`` assigns ``run_result["error"] = error_msg`` with no ``str()``
+    (rp_job.py:266-273), so a dict would reach the result endpoint as a JSON
+    object in a field that is a string everywhere else in the API."""
+    monkeypatch.setenv("WORKER_ERROR_OBJECT", "1")
+    body = handler.error_response("job-x", BAD_REQUEST, "nope", details=["a"])
+    assert isinstance(body["error"], str)
+    assert json.loads(body["error"])["code"] == BAD_REQUEST
+
+
+def test_base64_only_endpoint_warns_before_the_gpu_runs(h, monkeypatch):
+    """``deliver`` finds this out AFTER a multi-minute generation; the pre-flight
+    says it in the first second instead."""
+    monkeypatch.setenv("WANGP_OUTPUT_CHAIN", "presigned,rp_bucket,base64")
+    monkeypatch.setattr(C, "CONFIG", C.WorkerConfig())
+    body = h.submit(base_input(output={"mode": "auto"}))
+    assert body["status"] == "completed"
+    assert any("only return outputs under" in item for item in body["warnings"])
+
+    monkeypatch.setenv("WORKER_REQUIRE_DELIVERABLE", "1")
+    strict = h.submit(base_input(output={"mode": "auto"}))
+    assert strict["error_code"] == "output_too_large"
+    assert strict["metrics"]["validate_ms"] < 5000

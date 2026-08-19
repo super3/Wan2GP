@@ -315,13 +315,19 @@ def sniff_file(path: str | os.PathLike[str]) -> SniffResult | None:
 def _require_kind(key: str, expected: str, head: bytes, *, source: str) -> SniffResult:
     result = sniff(head)
     if result is None:
-        reason = _unsupported_reason(head) or (
-            f"unrecognised magic bytes {head[:8].hex() or '(empty file)'}"
-        )
+        # The raw leading bytes stay OUT of the client-facing message: for a
+        # `volume` input those bytes come from a file on the shared volume, so
+        # echoing them turns "wrong file type" into an 8-byte read oracle over
+        # anything the input directory can reach. The log keeps them.
+        detail = _unsupported_reason(head)
+        if detail is None:
+            LOG.warn("media_unrecognised", key=key, source=source,
+                     head_hex=head[:8].hex() or "(empty)")
+            detail = "unrecognised file format" if head else "the file is empty"
         raise WorkerError(
             MEDIA_UNSUPPORTED,
             f"media.{key}: could not identify the content as {expected}",
-            details=[reason, f"source: {source}",
+            details=[detail, f"source: {source}",
                      f"accepted {expected} extensions: {sorted(EXTS_BY_KIND[expected])}"],
         )
     if result.kind != expected:
@@ -680,12 +686,48 @@ def _volume_root() -> Path:
     return Path(os.environ.get("WANGP_VOLUME_ROOT") or C.VOLUME_ROOT)
 
 
+#: Sub-directory of the network volume that ``volume`` inputs are confined to.
+#: The volume is SHARED: it also carries ``ckpts/``, ``loras/`` and -- when
+#: ``volume`` is in the output chain -- ``outputs/<key>.mp4``, at a key derived
+#: from a caller-choosable idempotency key. Resolving inputs against the volume
+#: ROOT therefore let one request read another tenant's delivered video (and,
+#: with ``image_prompt_type`` containing "V", continue it). Set
+#: ``WANGP_VOLUME_INPUT_SUBDIR=""`` to restore whole-volume access; that is a
+#: single-tenant-only configuration.
+DEFAULT_VOLUME_INPUT_SUBDIR = "inputs"
+
+
+def volume_input_subdir() -> str:
+    raw = os.environ.get("WANGP_VOLUME_INPUT_SUBDIR")
+    if raw is None:
+        return DEFAULT_VOLUME_INPUT_SUBDIR
+    return raw.strip().strip("/")
+
+
+def volume_input_root() -> Path:
+    """The directory ``volume`` inputs resolve against."""
+    subdir = volume_input_subdir()
+    return _volume_root() / subdir if subdir else _volume_root()
+
+
 def volume_item_max() -> int:
     """Per-file ceiling for ``volume`` inputs (they are not inline bytes)."""
     try:
         return int(os.environ.get("WANGP_VOLUME_IN_MAX", str(2 * 1024 ** 3)))
     except (TypeError, ValueError):
         return 2 * 1024 ** 3
+
+
+def volume_total_max() -> int:
+    """Ceiling on the SUM of ``volume`` input bytes for one request.
+
+    ``volume_item_max`` is per file; ``image_refs`` takes a list, so N entries
+    could otherwise copy N x 2 GiB into the container-local job dir.
+    """
+    try:
+        return int(os.environ.get("WANGP_VOLUME_TOTAL_MAX", str(8 * 1024 ** 3)))
+    except (TypeError, ValueError):
+        return 8 * 1024 ** 3
 
 
 def _hash_max() -> int:
@@ -710,10 +752,14 @@ def job_dir_for(job_id: str) -> Path:
 def resolve_volume_path(relative: str) -> Path:
     """Resolve a caller-supplied ``volume`` path, refusing anything that escapes.
 
-    The check is done on the **realpath**, so ``a/../../etc/passwd``, a symlink
-    planted inside the volume that points at ``/etc``, and an absolute path are
-    all rejected — the first two only show up after symlink resolution, which is
-    why a lexical ``..`` scan is not enough.
+    Paths are relative to :func:`volume_input_root` — ``<volume>/inputs`` by
+    default, NOT the volume root, so ``outputs/``, ``ckpts/`` and ``loras/`` are
+    out of reach of a request.
+
+    The containment check is done on the **realpath**, so ``a/../../etc/passwd``,
+    a symlink planted inside the input directory that points at ``/etc``, and an
+    absolute path are all rejected — the first two only show up after symlink
+    resolution, which is why a lexical ``..`` scan is not enough.
     """
     raw = _VOLUME_PREFIX_RE.sub("", str(relative or "").strip())
     if not raw:
@@ -737,22 +783,25 @@ def resolve_volume_path(relative: str) -> Path:
             details=['use the "range" object for start_frame/end_frame instead'],
         )
 
-    root = Path(os.path.realpath(_volume_root()))
+    root = Path(os.path.realpath(volume_input_root()))
     candidate = Path(os.path.realpath(root / raw))
     try:
         candidate.relative_to(root)
     except ValueError as exc:
         raise WorkerError(
             BAD_REQUEST,
-            f"media volume path escapes the volume root: {raw!r}",
-            details=[f"resolved to {candidate}", f"volume root: {root}"],
+            f"media volume path escapes the input directory: {raw!r}",
+            details=[f"resolved to {candidate}", f"input root: {root}"],
             cause=exc,
         ) from exc
     if not candidate.is_file():
+        subdir = volume_input_subdir()
+        where = f"$WANGP_VOLUME_ROOT/{subdir}" if subdir else "$WANGP_VOLUME_ROOT"
         raise WorkerError(
             MEDIA_FETCH_FAILED,
             f"no such file on the network volume: {raw!r}",
-            details=[f"looked in {root}"],
+            details=[f"looked in {root}",
+                     f"volume inputs are relative to {where}"],
         )
     return candidate
 
@@ -838,14 +887,46 @@ class MaterializedMedia:
 
 
 class _Budget:
-    """Running total for inline bytes, checked before every write."""
+    """Running totals, checked before every write.
 
-    __slots__ = ("item_max", "total_max", "used")
+    Two independent ledgers: ``used`` for inline (base64/URL) bytes, which land
+    in the RunPod request envelope, and ``volume_used`` for bytes copied off the
+    network volume, which do not but still fill the container disk.
+    """
 
-    def __init__(self, item_max: int, total_max: int) -> None:
+    __slots__ = ("item_max", "total_max", "used", "volume_item_max", "volume_total_max",
+                 "volume_used")
+
+    def __init__(self, item_max: int, total_max: int, *, vol_item_max: int | None = None,
+                 vol_total_max: int | None = None) -> None:
         self.item_max = int(item_max)
         self.total_max = int(total_max)
         self.used = 0
+        self.volume_item_max = int(vol_item_max if vol_item_max is not None
+                                   else volume_item_max())
+        self.volume_total_max = int(vol_total_max if vol_total_max is not None
+                                    else volume_total_max())
+        self.volume_used = 0
+
+    def check_volume_item(self, key: str, size: int, *, path: str) -> None:
+        if size > self.volume_item_max:
+            raise WorkerError(
+                MEDIA_TOO_LARGE,
+                f"media.{key} is {size} B on the volume, over the "
+                f"{self.volume_item_max} B cap",
+                details=[f"file: {path}", "raise WANGP_VOLUME_IN_MAX"],
+            )
+        if self.volume_used + size > self.volume_total_max:
+            raise WorkerError(
+                MEDIA_TOO_LARGE,
+                f"volume inputs total {self.volume_used + size} B, over the "
+                f"{self.volume_total_max} B cap for one request",
+                details=[f"media.{key} pushed it over ({size} B)",
+                         "raise WANGP_VOLUME_TOTAL_MAX"],
+            )
+
+    def spend_volume(self, size: int) -> None:
+        self.volume_used += size
 
     def check_item(self, key: str, size: int, *, what: str) -> None:
         if size > self.item_max:
@@ -867,6 +948,28 @@ class _Budget:
 
     def spend(self, size: int) -> None:
         self.used += size
+
+
+def _read_head_nofollow(key: str, source: Path) -> bytes:
+    """First ``_HEAD_BYTES`` of ``source``, refusing to follow a symlink."""
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(source, flags)
+    except OSError as exc:
+        raise WorkerError(
+            MEDIA_FETCH_FAILED,
+            f"media.{key}: could not read {source.name} from the volume: "
+            f"{exc.__class__.__name__}",
+            details=["the file changed between validation and use, or is a symlink"],
+            cause=exc,
+        ) from exc
+    try:
+        with os.fdopen(fd, "rb") as handle:
+            return handle.read(_HEAD_BYTES)
+    except OSError as exc:  # pragma: no cover - fdopen owns the fd from here
+        raise WorkerError(
+            MEDIA_FETCH_FAILED, f"media.{key}: could not read {source.name}", cause=exc
+        ) from exc
 
 
 def _decode_b64(key: str, payload: Any, budget: _Budget) -> bytes:
@@ -1051,17 +1154,13 @@ def _materialize_one(
     if item.get("volume") not in (None, ""):
         source = resolve_volume_path(str(item["volume"]))
         size = source.stat().st_size
-        ceiling = volume_item_max()
-        if size > ceiling:
-            raise WorkerError(
-                MEDIA_TOO_LARGE,
-                f"media.{key} is {size} B on the volume, over the {ceiling} B cap",
-                details=[f"file: {source}", "raise WANGP_VOLUME_IN_MAX"],
-            )
+        budget.check_volume_item(key, size, path=str(source))
         if size == 0:
             raise WorkerError(MEDIA_FETCH_FAILED, f"media.{key}: {source} is empty")
-        with open(source, "rb") as handle:
-            head = handle.read(_HEAD_BYTES)
+        # O_NOFOLLOW closes the TOCTOU window between resolve_volume_path()'s
+        # realpath check and this open: anyone able to write to the volume could
+        # otherwise swap the checked file for a symlink pointing anywhere.
+        head = _read_head_nofollow(key, source)
         result = _require_kind(key, kind, head, source=f"volume:{item['volume']}")
 
         copied = True
@@ -1082,9 +1181,12 @@ def _materialize_one(
                 # A hardlink keeps Path.resolve() (shared/api.py:1039) pointing at
                 # OUR filename. A symlink would resolve back to the volume file
                 # and hand WanGP the caller's extension again.
-                os.link(source, dest)
-            except OSError:
+                # follow_symlinks=False: same TOCTOU window as the read above --
+                # never link through a symlink that appeared after the check.
+                os.link(source, dest, follow_symlinks=False)
+            except (OSError, NotImplementedError):
                 shutil.copyfile(source, dest)
+        budget.spend_volume(size)
         digest = _sha256_file(dest) if size <= _hash_max() else None
         return MediaItem(key=key, index=index, kind=kind, source="volume", path=dest,
                          value=_build_value(dest, item.get("range"), key, kind),

@@ -484,3 +484,75 @@ def test_config_module_is_cpu_only():
             f"{module} was imported by the runpod_worker test session; the CPU tier "
             f"must stay importable on a plain runner"
         )
+
+
+# --------------------------------------------------------------------------
+# constraints.txt vs requirements.txt
+#
+# constraints.txt mirrors a dozen pins from the repo's requirements.txt BY HAND
+# so the `runpod` install layer cannot re-resolve the WanGP stack underneath
+# itself. Nothing kept the two files agreeing: a bump in requirements.txt left a
+# stale pin here, which either fails `pip check` an hour into the image build or
+# -- worse -- pins the OLD version and nothing notices until `import wgp`.
+# --------------------------------------------------------------------------
+
+CONSTRAINTS = Path(__file__).resolve().parents[1] / "constraints.txt"
+REQUIREMENTS = REPO_ROOT / "requirements.txt"
+
+#: Pins that deliberately do NOT come from requirements.txt. The torch triple is
+#: installed from download.pytorch.org in an earlier Docker layer, so its
+#: authority is the Dockerfile, not requirements.txt.
+_NOT_FROM_REQUIREMENTS = {"torch", "torchvision", "torchaudio"}
+
+
+def _pins(text: str) -> dict[str, str]:
+    pins: dict[str, str] = {}
+    for line in text.splitlines():
+        line = line.split("#", 1)[0].strip()
+        if not line or line.startswith("-"):
+            continue
+        match = re.match(r"^([A-Za-z0-9][A-Za-z0-9._-]*)\s*==\s*([^\s;]+)$", line)
+        if match:
+            pins[match.group(1).lower().replace("_", "-")] = match.group(2)
+    return pins
+
+
+def test_constraints_agree_with_requirements():
+    constraints = _pins(CONSTRAINTS.read_text(encoding="utf-8"))
+    requirements = _pins(REQUIREMENTS.read_text(encoding="utf-8"))
+    assert constraints, "constraints.txt parsed to nothing"
+
+    mismatched = {
+        name: (version, requirements[name])
+        for name, version in constraints.items()
+        if name not in _NOT_FROM_REQUIREMENTS
+        and name in requirements
+        and requirements[name] != version
+    }
+    assert not mismatched, (
+        "runpod_worker/constraints.txt disagrees with requirements.txt "
+        f"(name: constraints, requirements): {mismatched}"
+    )
+
+    unknown = sorted(
+        name for name in constraints
+        if name not in _NOT_FROM_REQUIREMENTS and name not in requirements
+    )
+    assert not unknown, (
+        f"constraints.txt pins {unknown}, which requirements.txt does not pin at "
+        "all; either the package was dropped upstream or the name drifted"
+    )
+
+
+def test_the_torch_triple_matches_the_dockerfile():
+    dockerfile = (Path(__file__).resolve().parents[1] / "Dockerfile").read_text(
+        encoding="utf-8"
+    )
+    constraints = _pins(CONSTRAINTS.read_text(encoding="utf-8"))
+    for name in sorted(_NOT_FROM_REQUIREMENTS):
+        version = constraints.get(name)
+        assert version, f"constraints.txt no longer pins {name}"
+        assert f"{name}=={version}+cu128" in dockerfile, (
+            f"constraints.txt pins {name}=={version} but the Dockerfile installs "
+            "a different version from download.pytorch.org"
+        )
