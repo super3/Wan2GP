@@ -1447,3 +1447,14 @@ def test_media_entry_rejects_unknown_fields_and_double_sources(cfg):
                    {"settings": {"prompt": DEMO_PROMPT},
                     "media": {"image_start": {"b64": "AAAA", "volume": "x.png"}}}, cfg=cfg)
     assert "exactly one" in error.message
+
+
+def test_the_frame_lattice_step_follows_latent_size_when_declared():
+    """wgp.py:6929 floors video_length with `latent_size`, which
+    get_model_min_frames_and_step defaults to frames_steps (wgp.py:2853). The two
+    are equal for every MiniMax H3 type, so this is a guard against a future
+    model that separates them, not a live difference."""
+    mdef = S.fallback_model_def(FL2VA_PRUNED)
+    assert "latent_size" not in mdef
+    assert S.frame_lattice(mdef) == (107, 17, 5)
+    assert S.frame_lattice({**mdef, "latent_size": 4})[1] == 4
