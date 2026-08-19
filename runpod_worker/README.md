@@ -328,6 +328,48 @@ inferred.
   cents/clip on the PRO 6000 -- production-MIG cost, half the latency. GPU
   value table (warm, profile 3 unless noted): H100 p1 22.9 s / PRO 6000 p1
   24.2 s / H100 p3 39.5 s / MIG 2g.48gb p3 46.7 s / A40 p3 67.0 s.
+- **Multi-GPU sequence parallelism works and is worth 1.31x, no more.**
+  `models/minimax_h3/usp.py` adds Ulysses sequence parallelism (an all-to-all
+  around each block's attention so every rank holds the full sequence for
+  `heads / world_size` heads) via plain `torch.distributed` -- no xfuser, no
+  ray. Measured on ONE 2x A40 pod, same clip, profile 4, warm second job:
+  **70.86 s on 1 GPU -> 53.89 s on 2 GPUs (1.31x)**; cold 121.7 s -> 92.3 s.
+  That is Amdahl's law, not an implementation defect: of the 70.86 s, only
+  ~33 s is denoise (the parallel part) and ~38 s is serial text encode + VAE
+  decode + mux, so perfect scaling predicts 54.5 s and we measured 53.89 s --
+  i.e. the denoise phase parallelized at ~100% efficiency and the all-to-all
+  overhead is in the noise. Correctness is proven before timing: the gloo
+  suite (`runpod_worker/scripts/test_usp_gloo.py`) shows USP attention is
+  numerically identical to full-sequence SDPA, and it is re-run on the bench
+  host before any GPU work. Sol sparse attention and the skip-steps caches
+  raise under USP (both are global-sequence constructs).
+  **Cost, however, moves the wrong way**: 2 GPUs bill 2x for 1.31x, so
+  cents/clip goes 0.87 -> 1.32. Multi-GPU buys latency only. A single full
+  RTX PRO 6000 beats 2x A40 on both axes (22.5 s, 1.06 cents/clip). Reach for
+  USP only when one card cannot go fast enough, or for long/high-res clips
+  where denoise dominates and the parallel fraction grows.
+- **The memory profile does not affect speed on capable hosts; it decides
+  whether you fit.** Same clip, warm, same host: full RTX PRO 6000 profile 1
+  22.54 s vs profile 4 22.98 s; A40 profile 1 71.14 s vs profile 4 70.86 s --
+  both inside the +/-0.4 s run-to-run variance measured across five identical
+  SDPA legs. The earlier "profile 1 is ~2x faster" reading was the full card
+  vs the MIG slice, not the profile. Worse, profile 1 is actively dangerous on
+  a RAM-tight host: it pins every component to reserved RAM (~51 GB:
+  transformer 20.1 + text encoder 24.7 + VAEs/encoders) and where that does
+  not fit it does not fail -- one PRO 6000 host ran profile 1 legs at 113-117 s
+  against 22.5 s on a roomier host of the same GPU model, a 5x silent
+  degradation. Keep profile 4: same speed, ~5.6 GB VRAM, no RAM cliff.
+- **Attention accelerators need verification, not configuration.** WanGP falls
+  back to SDPA silently. A first sweep reported sdpa/sol/sage2 within 0.1 s of
+  each other -- all three were SDPA (no sage wheel installed; sol inert).
+  Two traps: `sage2` needs the compiled wheel actually present (check
+  `get_attention_modes()` lists it), and **sol is not a global attention mode
+  at all** -- `shared/attention.py:28-33` keeps it in
+  `ATTENTION_MODE_AVAILABILITY`, "exposed only by per-generation overrides",
+  so it must be passed as the per-job `override_attention` setting; set
+  globally it is ignored without warning. `usp_bench.py` now probes
+  `offload.shared_state["_attention"]` after a generation and reports
+  `attention_ok` so a fallback can never be reported as a measurement.
 - **Worker container logs have no read API** (the console view is the only
   reader; `/v2/{endpoint}/logs` is a worker-key ingest route), so the worker
   keeps its own history reachable through the job status API: every response to
