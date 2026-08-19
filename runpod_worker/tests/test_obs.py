@@ -194,3 +194,17 @@ def test_shipper_disabled_without_url():
     before = obs._SHIP_QUEUE.qsize()
     obs.LOG.info("not_shipped")
     assert obs._SHIP_QUEUE.qsize() == before
+
+
+def test_stream_events_reach_ring_at_debug_level(monkeypatch):
+    """The engine tees WanGP stream lines into LOG at debug level, so with
+    WORKER_LOG_LEVEL=debug (+ LOG_SHIP_URL) mmgp's pinning prints become
+    shippable. At the default level they must stay out of the ring."""
+    monkeypatch.setenv("WORKER_LOG_LEVEL", "debug")
+    obs.reset_ring()
+    obs.LOG.debug("wangp_stream", line="stdout: Pinning data of 'text_encoder' to reserved RAM")
+    assert any("Pinning data" in line for line in obs.ring_tail())
+    monkeypatch.setenv("WORKER_LOG_LEVEL", "info")
+    obs.reset_ring()
+    obs.LOG.debug("wangp_stream", line="stdout: quiet")
+    assert obs.ring_tail() == []
