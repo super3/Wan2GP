@@ -504,6 +504,13 @@ REQUIREMENTS = REPO_ROOT / "requirements.txt"
 #: authority is the Dockerfile, not requirements.txt.
 _NOT_FROM_REQUIREMENTS = {"torch", "torchvision", "torchaudio"}
 
+#: Pins that are legitimately absent from requirements.txt because they are
+#: TRANSITIVE, but must still be constrained or the runpod layer moves them.
+#: tomlkit: gradio 5.29.0 requires tomlkit<0.14.0,>=0.12.0 and requirements.txt
+#: resolves 0.13.3; the runpod closure pulls 0.15.1 and breaks gradio. Caught by
+#: the Dockerfile's `pip check` gate on the first real image build, 2026-08-19.
+_TRANSITIVE_PINS = {"tomlkit"}
+
 
 def _pins(text: str) -> dict[str, str]:
     pins: dict[str, str] = {}
@@ -526,6 +533,7 @@ def test_constraints_agree_with_requirements():
         name: (version, requirements[name])
         for name, version in constraints.items()
         if name not in _NOT_FROM_REQUIREMENTS
+        and name not in _TRANSITIVE_PINS
         and name in requirements
         and requirements[name] != version
     }
@@ -536,7 +544,9 @@ def test_constraints_agree_with_requirements():
 
     unknown = sorted(
         name for name in constraints
-        if name not in _NOT_FROM_REQUIREMENTS and name not in requirements
+        if name not in _NOT_FROM_REQUIREMENTS
+        and name not in _TRANSITIVE_PINS
+        and name not in requirements
     )
     assert not unknown, (
         f"constraints.txt pins {unknown}, which requirements.txt does not pin at "
@@ -647,3 +657,42 @@ def test_hf_transfer_kept_when_importable(monkeypatch):
     monkeypatch.setitem(sys.modules, "hf_transfer", types.ModuleType("hf_transfer"))
     assert config.ensure_hf_transfer_sane() == "fast"
     assert os.environ["HF_HUB_ENABLE_HF_TRANSFER"] == "1"
+
+
+def test_pip_check_layer_cannot_swallow_install_failure():
+    """The pip-check layer must abort on a failed install, not continue.
+
+    Regression, 2026-08-19: the layer was written as
+    ``pip install ... && { pip check ...; } ; if [ -s file ]``. When the install
+    failed, `&&` short-circuited, the `;` ran the `if` against a file that never
+    got created, and the RUN exited 0 -- producing an image with no runpod SDK
+    that looked like a clean build.
+    """
+    dockerfile = (Path(__file__).resolve().parents[1] / "Dockerfile").read_text(
+        encoding="utf-8"
+    )
+    # A RUN block ends at the first line that is not part of the command
+    # (comments after it belong to the NEXT layer, and one of them mentions
+    # "pip check", which is what an earlier version of this test matched on).
+    def command_of(block):
+        out = []
+        for line in block.splitlines():
+            out.append(line)
+            if not line.rstrip().endswith("\\"):
+                break
+        return "\n".join(out)
+
+    layers = [
+        command_of(b) for b in dockerfile.split("\nRUN ")[1:]
+        if "pip check" in command_of(b)
+    ]
+    assert layers, "no pip check layer found in the Dockerfile"
+    layer = layers[0]
+    assert layer.lstrip().startswith("set -e"), (
+        "the pip check layer must start with `set -e` so a failed pip install "
+        "aborts the build instead of falling through to the check"
+    )
+    assert "import runpod, gradio, tomlkit" in layer, (
+        "the layer should prove at build time that runpod and gradio actually "
+        "coexist, not just that pip check was quiet"
+    )
