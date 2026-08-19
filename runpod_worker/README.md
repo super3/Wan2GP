@@ -305,10 +305,14 @@ inferred.
   loop that bills while going nowhere. Only CUDA >= 13.0 hosts work. The gate is
   the fix; rebuilding on cu12.8 wheels would widen the eligible fleet (A40/A6000
   Ampere hosts) at the cost of a rebuild.
-- **mmgp profiles 1 and 2 are unusable in these containers.** Both pin the full
-  model set (~45 GB) into page-locked RAM; the container's locked-memory limit
-  kills the process partway through pinning the 25 GB text encoder -- silently,
-  no traceback, followed by a crash loop. Profile 4 pins only the ~20 GB
+- **mmgp profiles 1 and 2 are unusable in these containers -- CONFIRMED, not
+  inferred.** Both pin the full model set (~45 GB) into page-locked RAM, and
+  serverless containers get a ~46.6 GiB memory limit; the RunPod worker log
+  shows the kill directly: `high memory utilization - 42.35GiB / 46.57GiB
+  (90%)` -> `container is unhealthy: exit code 137 ... triggered memory limits
+  (OOM)`, partway through pinning the 25 GB text encoder -- silent from inside
+  the process (no traceback), followed by a crash loop. A 64 GB desktop clears
+  the same load fine. Profile 4 pins only the ~20 GB
   transformer and works. Profile 3 works (VRAM-resident, ~24.9 GB peak) and a
   controlled A/B on identical hardware (two endpoints, both NVIDIA A40 @
   EU-SE-1, same image and payloads, seeds 12345/5555) measured it ~7% faster
