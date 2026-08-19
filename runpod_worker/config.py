@@ -36,6 +36,7 @@ __all__ = [
     "render_wgp_config",
     "authoritative_keys",
     "ensure_wgp_config",
+    "ensure_hf_transfer_sane",
     "WorkerConfig",
     "CONFIG",
     "reload_config",
@@ -288,6 +289,40 @@ def authoritative_keys(cli_args=()) -> dict:
         "audio_save_path": str(OUTPUT_DIR),
     }
 
+
+
+def ensure_hf_transfer_sane() -> str:
+    """Reconcile ``HF_HUB_ENABLE_HF_TRANSFER`` with whether ``hf_transfer`` exists.
+
+    Observed on a real RunPod pod (2026-08-19): the base image exports
+    ``HF_HUB_ENABLE_HF_TRANSFER=1`` but does NOT ship the ``hf_transfer``
+    package. ``huggingface_hub`` does not degrade gracefully there -- every
+    download raises
+
+        ValueError: Fast download using 'hf_transfer' is enabled
+        (HF_HUB_ENABLE_HF_TRANSFER=1) but 'hf_transfer' package is not
+        available in your environment.
+
+    which surfaced as a partial 28 GB warm and four confusing failures rather
+    than one clear error. The variable can come from the base image, the RunPod
+    endpoint's env, or a template -- none of which this repo controls -- so the
+    check belongs at every entry point, not in the Dockerfile alone.
+
+    Returns one of ``"fast"`` (hf_transfer importable, flag left on),
+    ``"disabled"`` (flag was on and unusable, forced to "0"), or ``"off"``
+    (flag was not set; nothing to do).
+    """
+    flag = os.environ.get("HF_HUB_ENABLE_HF_TRANSFER", "")
+    if flag.strip().lower() not in ("1", "true", "yes", "on"):
+        return "off"
+    try:
+        import hf_transfer  # noqa: F401
+    except Exception:
+        # Force the string "0": huggingface_hub reads the env var, and an unset
+        # variable is not the same as a falsy one in every version.
+        os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
+        return "disabled"
+    return "fast"
 
 def ensure_wgp_config(cli_args=()) -> Path:
     """Write ``<CONFIG_DIR>/wgp_config.json`` and return its path.
