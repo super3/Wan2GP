@@ -320,6 +320,14 @@ inferred.
   Worth switching if workers are on >=32 GB cards; profile 4 remains the safe
   default (5.6 GB VRAM peak, runs on any tier). (Desktops without cgroup limits run profile 1 fine -- this is a
   container limit, not a model or VRAM limit.)
+- **Profile 1 works on big-GPU tiers and roughly halves warm latency.** The
+  ~46.6 GiB container limit is a 48 GB-class artifact; H100 80GB and full RTX
+  PRO 6000 (96 GB) containers survive the ~45 GB pin. Measured warm (832x480,
+  124f, 4 steps): H100 profile 1 = 22.9 s (vs 39.5 s profile 3 on the same
+  card); full PRO 6000 profile 1 = 24.2 s. At pod-tier prices that is ~1.4
+  cents/clip on the PRO 6000 -- production-MIG cost, half the latency. GPU
+  value table (warm, profile 3 unless noted): H100 p1 22.9 s / PRO 6000 p1
+  24.2 s / H100 p3 39.5 s / MIG 2g.48gb p3 46.7 s / A40 p3 67.0 s.
 - **Worker container logs have no read API** (the console view is the only
   reader; `/v2/{endpoint}/logs` is a worker-key ingest route), so the worker
   keeps its own history reachable through the job status API: every response to
