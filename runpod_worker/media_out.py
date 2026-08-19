@@ -512,8 +512,15 @@ def _upload_via_boto3(path: Path, key: str, content_type: str) -> str:
     if not bucket:
         raise WorkerError(UPLOAD_FAILED, "BUCKET_NAME is not set")
     client = _boto3_client()
+    extra: dict[str, Any] = {"ContentType": content_type}
     try:
-        client.upload_file(str(path), bucket, key, ExtraArgs={"ContentType": content_type})
+        # Stored so an idempotent cache hit can carry the same sha256 the live
+        # response does; a client verifying integrity must not break on a hit.
+        extra["Metadata"] = {"sha256": sha256_file(path)}
+    except OSError:  # pragma: no cover - the file was just stat()ed
+        pass
+    try:
+        client.upload_file(str(path), bucket, key, ExtraArgs=extra)
     except Exception as exc:  # noqa: BLE001 - botocore raises a wide family
         raise WorkerError(
             UPLOAD_FAILED, f"S3 upload failed: {type(exc).__name__}: {exc}", cause=exc
@@ -534,7 +541,9 @@ def _upload_via_boto3(path: Path, key: str, content_type: str) -> str:
     return url
 
 
-def find_existing(key: str, *, cfg=None) -> dict[str, Any] | None:
+def find_existing(
+    key: str, *, cfg=None, request_opts: Mapping[str, Any] | None = None
+) -> dict[str, Any] | None:
     """A previously delivered object for ``key``, or ``None``.
 
     The idempotency probe (failure mode 23): a client retry or RunPod's own
@@ -542,12 +551,36 @@ def find_existing(key: str, *, cfg=None) -> dict[str, Any] | None:
     in milliseconds having burned zero GPU seconds. Any error is swallowed into
     ``None`` — a probe must never be able to fail a job.
 
-    Both durable transports are probed, bucket first: an endpoint running the
-    documented phase-1 shape (network volume, no BUCKET_* credentials) has no
-    bucket to HEAD, and probing only the bucket there would silently re-run
-    every retried generation at full GPU cost.
+    ``request_opts`` is the request's ``input.output`` block, and it is not
+    optional in spirit: a cache hit must be something THIS caller can actually
+    consume. Without it the probe could hand a ``volume_path`` to a caller who
+    asked for ``base64`` or supplied a presigned PUT URL — the "hands a remote
+    caller a path they have no way to read" failure the default chain exists to
+    avoid. So:
+
+    * ``mode: "presigned"`` — never a hit. The caller wants the bytes PUT to
+      *their* URL; an object sitting in our bucket does not satisfy that.
+    * ``mode: "base64"`` — never a hit. We would have to fetch the bytes back to
+      inline them, which is not cheaper than the probe being a miss.
+    * ``mode: "rp_bucket"`` / ``"volume"`` — only that transport is probed.
+    * ``mode: "auto"`` — only transports actually enabled in
+      :func:`default_chain` are probed. In particular the volume probe is dead
+      weight unless ``volume`` is in the chain: nothing else ever writes
+      ``outputs/<key>``.
     """
-    return _find_in_bucket(key, cfg=cfg) or _find_on_volume(key)
+    opts: Mapping[str, Any] = request_opts or {}
+    mode = _MODE_ALIASES.get(str(opts.get("mode") or "auto").strip().lower(), "auto")
+    if mode in ("presigned", "base64"):
+        return None
+    if mode == "rp_bucket":
+        return _find_in_bucket(key, cfg=cfg)
+    if mode == "volume":
+        return _find_on_volume(key)
+    chain = default_chain()
+    found = _find_in_bucket(key, cfg=cfg) if "rp_bucket" in chain else None
+    if found is None and "volume" in chain:
+        found = _find_on_volume(key)
+    return found
 
 
 def _find_on_volume(key: str) -> dict[str, Any] | None:
@@ -597,6 +630,7 @@ def _find_in_bucket(key: str, *, cfg=None) -> dict[str, Any] | None:
     if not isinstance(url, str) or not url.lower().startswith("http"):
         return None
     size = head.get("ContentLength")
+    metadata = head.get("Metadata") or {}
     result = {
         "transport": "rp_bucket",
         "kind": "url",
@@ -604,6 +638,9 @@ def _find_in_bucket(key: str, *, cfg=None) -> dict[str, Any] | None:
         "expires_in_s": None if _public_url(key) else _expires_in(),
         "content_type": head.get("ContentType") or "video/mp4",
         "key": key,
+        # Present only when the object was uploaded by the boto3 path, which
+        # stores it as user metadata; rp_upload cannot set it.
+        "sha256": metadata.get("sha256") if isinstance(metadata, Mapping) else None,
         "cached": True,
     }
     if isinstance(size, int):
@@ -838,6 +875,10 @@ def deliver(
             "WANGP_B64_OUT_MAX (currently "
             f"{cfg.b64_out_max} B) if the result really fits in RunPod's 10 MB "
             "response envelope",
+            f"current chain: {','.join(order)}. Adding 'volume' to "
+            "WANGP_OUTPUT_CHAIN writes the file to the network volume instead — "
+            "the response then carries volume_path, not a URL, so only add it if "
+            "the caller can read that volume out of band",
         ],
         retryable=False,
     )

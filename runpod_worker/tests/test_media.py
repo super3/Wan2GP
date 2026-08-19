@@ -48,11 +48,19 @@ def b64(data: bytes) -> str:
 
 @pytest.fixture()
 def sandbox(tmp_path, monkeypatch):
-    """A private job root, volume root and worker config for one test."""
+    """A private job root, volume root and worker config for one test.
+
+    ``sandbox.volume`` is the volume ROOT (where outputs/, ckpts/ and loras/
+    would live) and ``sandbox.inputs`` is ``<volume>/inputs``, the only place a
+    request may read from -- see ``media_in.volume_input_root``.
+    """
     jobs = tmp_path / "jobs"
     volume = tmp_path / "volume"
     jobs.mkdir()
     volume.mkdir()
+    inputs = volume / media_in.DEFAULT_VOLUME_INPUT_SUBDIR
+    inputs.mkdir()
+    monkeypatch.delenv("WANGP_VOLUME_INPUT_SUBDIR", raising=False)
     monkeypatch.setenv("WANGP_JOB_ROOT", str(jobs))
     monkeypatch.setenv("WANGP_VOLUME_ROOT", str(volume))
     monkeypatch.delenv("ALLOW_URL_INPUTS", raising=False)
@@ -63,7 +71,8 @@ def sandbox(tmp_path, monkeypatch):
         monkeypatch.delenv(key, raising=False)
     monkeypatch.setenv("WANGP_FFPROBE", str(tmp_path / "no-such-ffprobe"))
     cfg = C.WorkerConfig()
-    return types.SimpleNamespace(jobs=jobs, volume=volume, cfg=cfg, tmp=tmp_path)
+    return types.SimpleNamespace(jobs=jobs, volume=volume, inputs=inputs, cfg=cfg,
+                                 tmp=tmp_path)
 
 
 # --------------------------------------------------------------------------
@@ -197,7 +206,7 @@ def test_unknown_attachment_key_and_shapes(sandbox):
 # --------------------------------------------------------------------------
 
 def test_volume_input_referenced_in_place_when_extension_agrees(sandbox):
-    clip = sandbox.volume / "clips" / "plate.mp4"
+    clip = sandbox.inputs / "clips" / "plate.mp4"
     clip.parent.mkdir(parents=True)
     clip.write_bytes(MP4)
     out = media_in.materialize({"video_guide": {"volume": "clips/plate.mp4"}},
@@ -208,7 +217,7 @@ def test_volume_input_referenced_in_place_when_extension_agrees(sandbox):
 
 def test_volume_input_relabelled_when_extension_lies(sandbox):
     """A WAV named .mp4 must not reach WanGP under that name."""
-    liar = sandbox.volume / "liar.mp4"
+    liar = sandbox.inputs / "liar.mp4"
     liar.write_bytes(WAV)
     out = media_in.materialize({"audio_guide": {"volume": "liar.mp4"}},
                                job_id="vol-2", cfg=sandbox.cfg)
@@ -270,11 +279,11 @@ def test_volume_symlink_escape_is_rejected(sandbox, tmp_path):
     secret = tmp_path / "outside"
     secret.mkdir()
     (secret / "passwd").write_bytes(b"root:x:0:0")
-    (sandbox.volume / "escape").symlink_to(secret)
+    (sandbox.inputs / "escape").symlink_to(secret)
     with pytest.raises(WorkerError) as excinfo:
         media_in.resolve_volume_path("escape/passwd")
     assert excinfo.value.code == "bad_request"
-    assert "escapes the volume root" in str(excinfo.value)
+    assert "escapes the input directory" in str(excinfo.value)
 
 
 def test_volume_path_may_not_contain_a_pipe(sandbox):
@@ -295,7 +304,7 @@ def test_volume_missing_file(sandbox):
 # --------------------------------------------------------------------------
 
 def test_range_builds_the_virtual_media_suffix(sandbox):
-    clip = sandbox.volume / "plate.mp4"
+    clip = sandbox.inputs / "plate.mp4"
     clip.write_bytes(MP4)
     out = media_in.materialize(
         {"video_guide": {"volume": "plate.mp4",
@@ -313,7 +322,7 @@ def test_range_rejected_on_non_video_and_when_inverted(sandbox):
     with pytest.raises(WorkerError):
         media_in.materialize({"image_start": {"b64": b64(PNG), "range": {"end_frame": 3}}},
                              job_id="range-2", cfg=sandbox.cfg)
-    clip = sandbox.volume / "plate.mp4"
+    clip = sandbox.inputs / "plate.mp4"
     clip.write_bytes(MP4)
     with pytest.raises(WorkerError) as excinfo:
         media_in.materialize(
@@ -424,7 +433,7 @@ def test_url_fetch_streams_redirects_and_caps(sandbox, monkeypatch):
 # --------------------------------------------------------------------------
 
 def test_cleanup_removes_the_job_dir_only(sandbox):
-    clip = sandbox.volume / "plate.mp4"
+    clip = sandbox.inputs / "plate.mp4"
     clip.write_bytes(MP4)
     media_in.materialize({"image_start": {"b64": b64(PNG)},
                           "video_guide": {"volume": "plate.mp4"}},
@@ -696,7 +705,10 @@ def test_direct_s3_upload_sets_the_content_type(sandbox, video, monkeypatch):
                                model_type="minimax_h3_fl2va_pruned", cfg=C.WorkerConfig())
     assert result["transport"] == "rp_bucket" and result["uploader"] == "boto3"
     assert result["url"].startswith("https://")
-    assert client.uploads[0]["extra"] == {"ContentType": "video/mp4"}
+    assert client.uploads[0]["extra"]["ContentType"] == "video/mp4"
+    # The sha256 rides along as user metadata so an idempotent cache hit can
+    # report the same digest the live response does.
+    assert client.uploads[0]["extra"]["Metadata"]["sha256"] == result["sha256"]
     assert client.uploads[0]["key"] == result["key"]
     assert result["expires_in_s"] == 3600
 
@@ -722,12 +734,15 @@ def test_boto3_uploader_is_used_when_runpod_is_absent(sandbox, video, monkeypatc
     assert client.uploads and result["url"].startswith("https://")
 
 
-def test_find_existing_probes_the_volume_without_a_bucket(sandbox, video):
+def test_find_existing_probes_the_volume_without_a_bucket(sandbox, video, monkeypatch):
     """Failure mode 23 on the documented phase-1 shape: volume, no BUCKET_*.
 
     Probing only the bucket there would re-run every retried generation at full
-    GPU cost, which is the entire thing the probe exists to prevent.
+    GPU cost, which is the entire thing the probe exists to prevent. The volume
+    probe is only meaningful when ``volume`` is in the chain, because nothing
+    else ever writes ``outputs/<key>`` -- so the chain has to say so.
     """
+    monkeypatch.setenv("WANGP_OUTPUT_CHAIN", "presigned,rp_bucket,volume,base64")
     cfg = C.WorkerConfig()
     delivered = media_out.deliver(video, job_id="vol-idem-1",
                                   request_opts={"mode": "volume"}, cfg=cfg)
@@ -819,3 +834,109 @@ def test_extension_whitelists_match_wgp_source():
     assert found["video"] == set(media_in.VIDEO_EXTS)
     assert found["image"] == set(media_in.IMAGE_EXTS)
     assert found["audio"] == set(media_in.AUDIO_EXTS)
+
+
+# --------------------------------------------------------------------------
+# Review fixes: volume confinement, aggregate volume budget, symlink races
+# --------------------------------------------------------------------------
+
+def test_volume_inputs_cannot_reach_outputs_ckpts_or_loras(sandbox):
+    """The volume is SHARED. Outputs are written to ``outputs/<key>`` at a key
+    derived from a caller-choosable idempotency key, so resolving inputs against
+    the volume root let one request read another tenant's delivered video (and,
+    with ``image_prompt_type`` containing "V", continue it)."""
+    victim = sandbox.volume / "outputs" / "wangp" / "mt" / "victims-key.mp4"
+    victim.parent.mkdir(parents=True, exist_ok=True)
+    victim.write_bytes(MP4)
+    (sandbox.volume / "ckpts").mkdir()
+    (sandbox.volume / "ckpts" / "weights.safetensors").write_bytes(MP4)
+
+    for attempt in ("outputs/wangp/mt/victims-key.mp4", "ckpts/weights.safetensors"):
+        with pytest.raises(WorkerError) as excinfo:
+            media_in.resolve_volume_path(attempt)
+        assert excinfo.value.code == "media_fetch_failed"
+    # ...while the same file under inputs/ resolves normally.
+    (sandbox.inputs / "ok.mp4").write_bytes(MP4)
+    assert media_in.resolve_volume_path("ok.mp4").is_file()
+
+
+def test_volume_input_subdir_is_overridable(sandbox, monkeypatch):
+    """An operator who really wants whole-volume access can have it."""
+    monkeypatch.setenv("WANGP_VOLUME_INPUT_SUBDIR", "")
+    loose = sandbox.volume / "loose.mp4"
+    loose.write_bytes(MP4)
+    assert media_in.resolve_volume_path("loose.mp4") == loose
+
+
+def test_volume_inputs_have_an_aggregate_byte_budget(sandbox, monkeypatch):
+    """``WANGP_VOLUME_IN_MAX`` is per item; a list of refs multiplies it."""
+    monkeypatch.setenv("WANGP_VOLUME_TOTAL_MAX", str(len(PNG) + 1))
+    for index in range(3):
+        (sandbox.inputs / f"ref{index}.png").write_bytes(PNG)
+    with pytest.raises(WorkerError) as excinfo:
+        media_in.materialize(
+            {"image_refs": [{"volume": f"ref{i}.png"} for i in range(3)]},
+            job_id="vol-budget", cfg=sandbox.cfg,
+        )
+    assert excinfo.value.code == "media_too_large"
+    assert any("WANGP_VOLUME_TOTAL_MAX" in item for item in excinfo.value.details)
+
+
+def test_a_symlinked_volume_input_is_not_followed(sandbox):
+    """resolve_volume_path checks the realpath; the open() after it must not
+    re-follow the final component (a TOCTOU window for anyone who can write to
+    the volume)."""
+    outside = sandbox.tmp / "secret.bin"
+    outside.write_bytes(b"root:x:0:0" + b"\x00" * 64)
+    link = sandbox.inputs / "ref.png"
+    link.symlink_to(outside)
+    with pytest.raises(WorkerError) as excinfo:
+        media_in._read_head_nofollow("image_start", link)
+    assert excinfo.value.code == "media_fetch_failed"
+
+
+def test_the_unidentified_file_error_carries_no_file_bytes(sandbox):
+    """The message went to the client; the raw head bytes are an 8-byte read
+    oracle over anything the input directory can reach."""
+    mystery = sandbox.inputs / "mystery.png"
+    mystery.write_bytes(b"SECRET42" + b"\x00" * 64)
+    with pytest.raises(WorkerError) as excinfo:
+        media_in.materialize({"image_start": {"volume": "mystery.png"}},
+                             job_id="oracle", cfg=sandbox.cfg)
+    assert excinfo.value.code == "media_unsupported"
+    blob = excinfo.value.message + " ".join(excinfo.value.details)
+    assert "534543524554" not in blob.lower(), "raw file bytes leaked to the client"
+    assert b"SECRET42".hex() not in blob.lower()
+
+
+def test_find_existing_skips_transports_the_request_cannot_consume(sandbox, video,
+                                                                   monkeypatch):
+    """A volume path is not an answer for a caller who asked for base64 or
+    supplied a presigned PUT URL -- it is exactly the "hands a remote caller a
+    path they have no way to read" failure the default chain avoids."""
+    monkeypatch.setenv("WANGP_OUTPUT_CHAIN", "presigned,rp_bucket,volume,base64")
+    cfg = C.WorkerConfig()
+    delivered = media_out.deliver(video, job_id="opts-1",
+                                  request_opts={"mode": "volume"}, cfg=cfg)
+    key = delivered["key"]
+
+    assert media_out.find_existing(key, cfg=cfg, request_opts={"mode": "volume"})
+    assert media_out.find_existing(key, cfg=cfg, request_opts={"mode": "base64"}) is None
+    assert media_out.find_existing(
+        key, cfg=cfg, request_opts={"mode": "presigned",
+                                    "presigned_url": "https://x.example/put"}
+    ) is None
+
+
+def test_the_volume_probe_is_skipped_when_the_chain_excludes_it(sandbox, video,
+                                                                monkeypatch):
+    """Nothing but ``_copy_to_volume`` writes ``outputs/<key>``, so probing it on
+    an endpoint whose chain has no ``volume`` can only ever be dead weight."""
+    monkeypatch.setenv("WANGP_OUTPUT_CHAIN", "presigned,rp_bucket,volume,base64")
+    cfg = C.WorkerConfig()
+    key = media_out.deliver(video, job_id="chain-1",
+                            request_opts={"mode": "volume"}, cfg=cfg)["key"]
+    assert media_out.find_existing(key, cfg=cfg, request_opts={"mode": "auto"})
+
+    monkeypatch.setenv("WANGP_OUTPUT_CHAIN", "presigned,rp_bucket,base64")
+    assert media_out.find_existing(key, cfg=cfg, request_opts={"mode": "auto"}) is None
