@@ -264,9 +264,13 @@ BUCKET_NAME=...
 REQUIRE_BUCKET=1                 # if outputs will exceed the 6 MB base64 cap
 ```
 
-Leaving `WANGP_ALLOWED_LORAS` empty means **no LoRA allow-list**, and a request may then
-name an arbitrary `https://` LoRA that WanGP will download. Set it on anything that is not
-fully trusted.
+Leaving `WANGP_ALLOWED_LORAS` empty means **no caller-supplied LoRAs at all** — a request
+that names one is rejected. Remote (`http://`/`https://`) entries are refused outright
+whatever the allow-list says: WanGP would fetch them with `urlretrieve` from inside the
+RunPod network and write the bytes to the shared volume, where the next job loads them as
+weights. The one exception is a URL a shipped accelerator profile contributes verbatim
+(`input.profile`), which resolves to a staged file by basename. To let callers name their
+own staged LoRAs, list the basenames here.
 
 VRAM is not the binding constraint (5–6 GB for 5 s at 832×480 with mmgp block-swapping);
 **system RAM is**, because mmgp streams ~48–60 GB of weights through it. RunPod does not
@@ -310,7 +314,7 @@ marked **(baked)**. Nothing below is required for the worker to start.
 | `WANGP_CONSOLE` | `1` **(baked)** | `console_output=True`. Set to `0` and WanGP's stdout is swallowed into the event queue instead of the container log. |
 | `WANGP_WARM` | `0` | Load the model weights at boot instead of on the first request. Trades first-request latency for the risk of tripping RunPod's ~7-minute worker-start (unhealthy) threshold. |
 | `WANGP_WARM_STRICT` | `0` | `1` makes a failed warm fatal instead of a logged warning. |
-| `WANGP_WARM_MODEL` | `0` | Handler-side switch that calls `engine.warm()` during `bootstrap()`. `WANGP_WARM` is the engine-side equivalent. |
+| `WANGP_WARM_MODEL` | `0` | **Deprecated alias for `WANGP_WARM`.** Still honoured (with a warning) so an existing endpoint config keeps working; use `WANGP_WARM`. |
 | `WANGP_REQUIRE_FULL_WEIGHTS` | `0` | `1` makes a non-`EXPECTED` download status fatal at boot, not just a warning. Core files are always fatal. |
 | `WORKER_SKIP_WEIGHT_CHECK` | `0` | `1` skips the boot weight gate. Debug only — a missing file then downloads on the clock. |
 | `WANGP_STRICT_ATTACHMENT_KEYS` | `1` | Fail boot if upstream `wgp.ATTACHMENT_KEYS` grew keys our forbidden-key list does not cover (that gap is an arbitrary local-file read). Set `0` only to unblock an upgrade you are actively fixing. |
@@ -326,7 +330,8 @@ marked **(baked)**. Nothing below is required for the worker to start.
 | `WANGP_MAX_BUDGET_S` | `2600` | Ceiling on `runtime.timeout_s`. A larger request value is clamped and a warning is returned. The floor is 60 s. |
 | `WANGP_CANCEL_GRACE_S` | `150` | After a budget overrun the worker calls `job.cancel()` and waits this long. Cancel lands at the model's next interrupt check — one denoising step. If it does not land, the process is permanently poisoned (`backend_fatal` + recycle). |
 | `WANGP_PROGRESS_INTERVAL_S` | `5` | Minimum seconds between `progress_update` frames. |
-| `WANGP_MAX_FRAMES` | `362` | Hard cap on `video_length` (362 frames ≈ 15.1 s at 24 fps). **This is worker-imposed and load-bearing:** `frames_maximum` exists only for Ref2VA (737); FL2VA has no cap anywhere in the headless path, so `video_length: 100000` would otherwise burn a GPU for the full execution timeout. |
+| `WANGP_MAX_FRAMES` | `362` | Hard cap on `video_length` (362 frames ≈ 15.1 s at 24 fps). **This is worker-imposed and load-bearing:** `frames_maximum` exists only for Ref2VA (737); FL2VA has no cap anywhere in the headless path, so `video_length: 100000` would otherwise burn a GPU for the full execution timeout. There is **no "unlimited"**: `0`, a negative number or anything unparseable logs a warning and falls back to `362`. |
+| `WANGP_MAX_MEDIA_ITEMS` | `16` | Hard cap on the number of attachments in one request, over every `media` key. The byte budget counts bytes, not entries, so thousands of tiny valid images fit inside it and would still cost thousands of files on the container disk. MiniMax H3 takes one reference image (FL2VA) or nine (Ref2VA). |
 | `WANGP_MAX_STEPS` | `100` | Hard cap on `num_inference_steps`, same class of hole. |
 | `WORKER_FAILURE_BUDGET` | `3` | Consecutive failures before the worker asks to be recycled. |
 
@@ -337,6 +342,8 @@ marked **(baked)**. Nothing below is required for the worker to start.
 | `WANGP_B64_IN_MAX` | `6291456` (6 MB) | Per-item cap on inline (`b64`/`url`) input bytes. |
 | `WANGP_MEDIA_TOTAL_MAX` | `7340032` (7 MB) | Total inline input bytes per request. RunPod's `/run` envelope is 10 MB and base64 inflates by 4/3. |
 | `WANGP_VOLUME_IN_MAX` | `2147483648` (2 GiB) | Per-item cap for `{"volume": …}` inputs. These are already on the volume, so they are **not** charged against the inline budget. |
+| `WANGP_VOLUME_TOTAL_MAX` | `8589934592` (8 GiB) | Cap on the **sum** of `volume` input bytes for one request. `image_refs` is list-valued, so the per-item cap alone let N entries copy N × 2 GiB into the container-local job dir. |
+| `WANGP_VOLUME_INPUT_SUBDIR` | `inputs` **(baked)** | Sub-directory of the volume that `{"volume": …}` paths resolve against, so `outputs/`, `ckpts/` and `loras/` are out of a request's reach. `""` restores whole-volume access — single-tenant endpoints only. |
 | `WANGP_HASH_MAX` | `67108864` (64 MB) | Largest input file that gets sha256'd for the log line. |
 | `ALLOW_URL_INPUTS` | `0` **(baked)** | `1` lets requests pass `{"url": "https://…"}`. Turning this on means owning an SSRF guard forever; the worker implements one (scheme/port allow-list, DNS resolved once and the socket pinned to that IP, per-hop redirect revalidation, streaming byte cap, magic-byte typing), but for a multi-tenant endpoint the right answer is to leave it off. |
 | `WANGP_URL_SCHEMES` | `https` | Allowed URL input schemes. |
@@ -369,7 +376,7 @@ marked **(baked)**. Nothing below is required for the worker to start.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `WANGP_ALLOWED_LORAS` | *(empty)* | Comma-separated **basenames** a request may put in `activated_loras`. Absolute paths, `..`, and non-http schemes are always rejected; LoRAs contributed by a baked accelerator profile are always allowed. **An empty value means no allow-list**, and an `https://` entry that is not staged locally gets downloaded at request time — set this on any endpoint that is not fully trusted. |
+| `WANGP_ALLOWED_LORAS` | *(empty, baked)* | Comma-separated **basenames** a request may put in `activated_loras`. **Empty means no caller-supplied LoRAs at all** (not "no allow-list"). Absolute paths, `..` and every `scheme://` entry are rejected regardless — the only exception is a URL a shipped accelerator profile contributes verbatim. |
 
 ### Handler and observability
 
@@ -377,11 +384,13 @@ marked **(baked)**. Nothing below is required for the worker to start.
 |---|---|---|
 | `WANGP_EAGER_BOOT` | `auto` | `auto` = boot (`import wgp`, weight gate) at import when running as `__main__` or when `RUNPOD_WEBHOOK_GET_JOB` is set, so a pytest import stays free. `1` forces it, `0` defers to the first job. |
 | `WORKER_FITNESS` | `1` | Register the SDK fitness checks (boot, CUDA, weights, transport). A failing check exits the worker so the platform marks it unhealthy and replaces it. |
-| `WORKER_SKIP_GPU_FITNESS` | `0` | `1` drops the `torch.cuda.is_available()` check — for a CPU smoke test of the container. |
-| `WORKER_IDEMPOTENCY` | `1` | Probe the derived object key before generating. A retry (yours or RunPod's `/retry`) then returns the existing object at zero GPU seconds. Both durable transports are probed: a HEAD against the bucket when the `BUCKET_*` trio **and** `BUCKET_NAME` are set, then `outputs/<key>` on the network volume. With neither configured the probe is a no-op. A hit is marked `video.cached: true` and carries no ffprobe block — nothing was generated to probe. |
+| `WORKER_SKIP_GPU_FITNESS` | `0` | `1` drops the `torch.cuda.is_available()` check — for a CPU smoke test of the container. It also defaults `RUNPOD_SKIP_GPU_CHECK=true`, because the SDK auto-registers its own GPU check (`rp_fitness.py:242` → `rp_gpu_fitness.auto_register_gpu_check`) that ours does not control. |
+| `WORKER_DEBUG_DETAILS` | `0` | `1` puts the boot / unhandled-exception traceback tail in the client-facing `details`. Off by default: those lines name container paths and internal frames. They go to the structured log either way. |
+| `WORKER_REQUIRE_DELIVERABLE` | `0` | `1` rejects a request in the first second when the only transport left is base64 (no `output.presigned_url`, no bucket, no `volume` in the chain). Default is a warning on the response instead, because a small output really does fit inline. |
+| `WORKER_IDEMPOTENCY` | `1` | Probe the derived object key before generating. A retry (yours or RunPod's `/retry`) then returns the existing object at zero GPU seconds. The key is **scoped by a digest of the request**, not by `idempotency_key` alone, so a guessed or reused key can never return someone else's video. Only transports the current request can consume are probed: a HEAD against the bucket when the `BUCKET_*` trio **and** `BUCKET_NAME` are set and `rp_bucket` is in the chain, then `outputs/<key>` when `volume` is in the chain. `output.mode` of `presigned` or `base64` never hits. A hit is marked `video.cached: true` and carries no ffprobe block — nothing was generated to probe. |
 | `WORKER_KEEP_OUTPUTS` | `0` | `1` keeps generated files in `WANGP_OUTPUT_DIR` after delivery. Debug only; the disk is not swept. |
 | `WORKER_LOG_TAIL` | `30` | Lines of WanGP output attached to a failure response as `logs_tail`. |
-| `WORKER_ERROR_OBJECT` | `0` | `1` replaces the string `error` field with `{code, message, retryable, details}`. Off by default because the documented response shape uses the string. |
+| `WORKER_ERROR_OBJECT` | `0` | `1` replaces the plain `error` message with a **JSON-encoded string** `{"code","message","retryable","details"}`. Encoded, not a dict: `rp_job.run_job` assigns `run_result["error"] = error_msg` with no `str()` (`rp_job.py:266-273`), so a dict would reach the result endpoint as an object in a field that is a string everywhere else. Off by default. |
 | `WORKER_LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error`. |
 | `WORKER_LOG_MAX_FIELD` | `8192` | Per-field truncation in the JSON log lines. |
 | `RUNPOD_POD_ID`, `RUNPOD_ENDPOINT_ID` | set by the platform | Echoed into every log line as `worker_id` / `endpoint_id`. |
@@ -450,7 +459,7 @@ Duration rules (each reference video ≥2 s and truncated to 15 s, each audio 2�
 ```jsonc
 "media": {
   "image_start": {"b64": "iVBORw0KGgo…"},              // raw base64 or a data: URI
-  "video_guide": {"volume": "clips/plate.mp4",         // relative to $WANGP_VOLUME_ROOT
+  "video_guide": {"volume": "clips/plate.mp4",         // relative to $WANGP_VOLUME_ROOT/inputs
                   "range": {"start_frame": 0, "end_frame": 240, "audio_track_no": 1}},
   "audio_guide": {"url": "https://…"},                 // only when ALLOW_URL_INPUTS=1
   "image_refs":  [{"b64": "…"}, {"b64": "…"}]          // the only list-valued key
@@ -488,7 +497,8 @@ point of failure instead of being silently downgraded.
 | Field | Meaning |
 |---|---|
 | `timeout_s` | Wall-clock budget, clamped to `[60, WANGP_MAX_BUDGET_S]`. Out-of-range values are clamped with a warning, not rejected. |
-| `idempotency_key` | 1–128 chars of `[A-Za-z0-9._:-]` starting alphanumeric. Becomes the object key, so a retry with the same key returns the existing object at zero GPU seconds. |
+| `idempotency_key` | 1–128 chars of `[A-Za-z0-9._:-]` starting alphanumeric. Combined with a digest of the request it becomes the object key, so a retry of the **same** request returns the existing object at zero GPU seconds while the same key on a *different* request generates normally. |
+| `priority` | `0`–`9`, accepted and **inert**: one generation per worker means there is no queue to order. A warning says so on the response. Scale with `max_workers`. |
 | `priority` | 0–9. Accepted and echoed; the worker itself is FIFO at concurrency 1. |
 
 ### Worked example
