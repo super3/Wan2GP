@@ -450,6 +450,12 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     _apply_env(args)
 
+    from runpod_worker import config as _C
+    _hf = _C.ensure_hf_transfer_sane()
+    if _hf == "disabled":
+        print("  hf_transfer        : HF_HUB_ENABLE_HF_TRANSFER=1 but hf_transfer "
+              "is not installed -- forced to 0 (downloads would have failed)")
+
     from runpod_worker import config as C  # noqa: PLC0415 - must follow _apply_env
     from runpod_worker import engine
     from runpod_worker.errors import WorkerError
