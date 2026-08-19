@@ -55,7 +55,12 @@ ARG SAGEATTENTION_REF="main"
 # (--build-arg MAX_JOBS=4) if the build dies with an OOM-killed cicc.
 ARG MAX_JOBS="8"
 
-FROM nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04 AS builder
+# Builder base MUST match the CUDA major torch was compiled with: requirements
+# resolve torch 2.13.0 cu13 wheels, and torch.utils.cpp_extension hard-refuses
+# an nvcc whose major differs (detected 12.8 vs torch 13.0). Runtime stage can
+# stay on 12.8 -- the wheels bundle their own CUDA runtime; only build-time
+# nvcc must match.
+FROM nvidia/cuda:13.0.1-cudnn-devel-ubuntu22.04 AS builder
 ARG WITH_SAGE
 ARG CUDA_ARCHITECTURES
 ARG SAGEATTENTION_REF
