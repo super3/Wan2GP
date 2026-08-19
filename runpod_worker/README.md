@@ -332,8 +332,9 @@ inferred.
   `models/minimax_h3/usp.py` adds Ulysses sequence parallelism (an all-to-all
   around each block's attention so every rank holds the full sequence for
   `heads / world_size` heads) via plain `torch.distributed` -- no xfuser, no
-  ray. Measured on ONE 2x A40 pod, same clip, profile 4, warm second job:
-  **70.86 s on 1 GPU -> 53.89 s on 2 GPUs (1.31x)**; cold 121.7 s -> 92.3 s.
+  ray. Measured on ONE 2x A40 pod, same clip, warm second job:
+  **profile 4: 70.86 s on 1 GPU -> 53.89 s on 2 GPUs (1.31x)**; profile 1:
+  71.14 s -> 55.03 s (1.29x). Cold: 121.7 -> 92.3 s and 93.2 -> 101.5 s.
   That is Amdahl's law, not an implementation defect: of the 70.86 s, only
   ~33 s is denoise (the parallel part) and ~38 s is serial text encode + VAE
   decode + mux, so perfect scaling predicts 54.5 s and we measured 53.89 s --
