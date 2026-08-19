@@ -274,9 +274,31 @@ RUN if ls /wheels/*.whl >/dev/null 2>&1; then \
 # import it without a requirements line of its own.
 COPY runpod_worker/requirements-worker.txt runpod_worker/constraints.txt /opt/wangp/runpod_worker/
 # hadolint ignore=DL3059
-RUN pip install --no-cache-dir -c runpod_worker/constraints.txt \
-      -r runpod_worker/requirements-worker.txt && \
-    pip check
+# The gate. `pip check` cannot be used raw: requirements.txt itself ships
+# `decord 0.6.0`, whose wheel carries a platform tag this image does not match,
+# so `pip check` reports it BEFORE this layer runs (verified by probe,
+# 2026-08-19). Failing on it would make the gate unpassable; ignoring pip check
+# entirely would have missed the real tomlkit/gradio break it caught on the same
+# build. So: allow exactly that one known line, fail on anything else.
+# `set -e` FIRST and the steps separated by `;`, not `&&`: an earlier version
+# of this layer chained `pip install ... && {...} ; if [ -s ... ]`, so when the
+# install failed the `&&` short-circuited, the `;` ran the `if` against a file
+# that did not exist, and the RUN exited 0 -- producing an image with NO runpod
+# SDK that looked like a clean build. A silently broken image is worse than a
+# failed one. Never let this layer's first command be optional.
+RUN set -e; \
+    pip install --no-cache-dir -c runpod_worker/constraints.txt \
+      -r runpod_worker/requirements-worker.txt; \
+    pip check > /tmp/pc.raw 2>&1 || true; \
+    grep -vE '^WARNING:' /tmp/pc.raw \
+      | grep -vxF 'decord 0.6.0 is not supported on this platform' \
+      > /tmp/pc.out || true; \
+    if [ -s /tmp/pc.out ]; then \
+      echo '[build] pip check found NEW dependency conflicts:'; \
+      cat /tmp/pc.out; exit 1; \
+    fi; \
+    rm -f /tmp/pc.raw /tmp/pc.out; \
+    python3 -c "import runpod, gradio, tomlkit; print('[build] runpod/gradio/tomlkit import OK')" 
 
 # --- the application ---------------------------------------------------------
 # The repo's own Dockerfile deliberately ships NO app code -- it bind-mounts
