@@ -944,9 +944,16 @@ def run(
                 if kind == "stream":
                     # Every stdout/stderr LINE is an event, and _OutputCapture
                     # splits on "\r" as well as "\n" (shared/api.py:316-330), so a
-                    # tqdm bar is one event per refresh. Ring-buffer it.
+                    # tqdm bar is one event per refresh. Ring-buffer it, and tee
+                    # it into the structured log at debug level: with
+                    # WORKER_LOG_LEVEL=debug and LOG_SHIP_URL set this is the
+                    # only way WanGP/mmgp prints (e.g. "Pinning data of
+                    # 'text_encoder' to reserved RAM") escape a worker that the
+                    # host kills mid-load -- the in-memory tail dies with it.
                     stream_events += 1
-                    tail.append(f"{getattr(data, 'stream', '?')}: {getattr(data, 'text', data)}"[:512])
+                    line = f"{getattr(data, 'stream', '?')}: {getattr(data, 'text', data)}"[:512]
+                    tail.append(line)
+                    LOG.debug("wangp_stream", line=line)
 
                 elif kind == "progress":
                     progress_events += 1
