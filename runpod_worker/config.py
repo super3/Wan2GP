@@ -333,6 +333,44 @@ def ensure_wgp_config(cli_args=()) -> Path:
     return path
 
 
+def _env_int(name: str, default: int, *, minimum: int | None = None) -> int:
+    """An int env var that cannot make this module unimportable.
+
+    Every numeric knob below is read at import (``CONFIG = WorkerConfig()``), so
+    a typo in one env var would otherwise turn a misconfigured endpoint into an
+    ``ImportError`` in ``handler.py`` -- no structured log, no fitness check, no
+    way to tell what happened. Fall back and say so instead.
+
+    ``minimum`` also rejects the "0 means unlimited" reading where 0 is not a
+    legal value: ``WANGP_MAX_FRAMES=0`` used to collapse the frame cap onto
+    ``frames_minimum`` (107) rather than lift it.
+    """
+    raw = os.environ.get(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        LOG.warn("env_int_invalid", var=name, value=str(raw)[:64], using=default)
+        return default
+    if minimum is not None and value < minimum:
+        LOG.warn("env_int_too_small", var=name, value=value, minimum=minimum,
+                 using=default)
+        return default
+    return value
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    try:
+        return float(str(raw).strip())
+    except (TypeError, ValueError):
+        LOG.warn("env_float_invalid", var=name, value=str(raw)[:64], using=default)
+        return default
+
+
 @dataclass(frozen=True)
 class WorkerConfig:
     """Runtime knobs. Every field re-reads its env var on construction, so tests
@@ -355,26 +393,41 @@ class WorkerConfig:
         default_factory=lambda: os.environ.get("WANGP_MODEL_CONFIG", "").rstrip(",")
     )
     default_budget_s: int = field(
-        default_factory=lambda: int(os.environ.get("WANGP_DEFAULT_BUDGET_S", "1400"))
+        default_factory=lambda: _env_int("WANGP_DEFAULT_BUDGET_S", 1400, minimum=1)
     )
     max_budget_s: int = field(
-        default_factory=lambda: int(os.environ.get("WANGP_MAX_BUDGET_S", "2600"))
+        default_factory=lambda: _env_int("WANGP_MAX_BUDGET_S", 2600, minimum=1)
     )
+    # minimum=0: "no grace at all" is a legitimate setting (and what the tests
+    # use); only a negative value is nonsense.
     cancel_grace_s: int = field(
-        default_factory=lambda: int(os.environ.get("WANGP_CANCEL_GRACE_S", "150"))
+        default_factory=lambda: _env_int("WANGP_CANCEL_GRACE_S", 150, minimum=0)
     )
     progress_interval_s: float = field(
-        default_factory=lambda: float(os.environ.get("WANGP_PROGRESS_INTERVAL_S", "5"))
+        default_factory=lambda: _env_float("WANGP_PROGRESS_INTERVAL_S", 5.0)
     )
-    max_frames: int = field(default_factory=lambda: int(os.environ.get("WANGP_MAX_FRAMES", "362")))
+    # 0 is NOT "unlimited": FL2VA declares no frames_maximum, so an uncapped
+    # endpoint lets one request schedule hundreds of sliding windows on a billed
+    # GPU. minimum=1 sends 0/negative back to the documented default.
+    max_frames: int = field(
+        default_factory=lambda: _env_int("WANGP_MAX_FRAMES", 362, minimum=1)
+    )
+    #: Hard ceiling on the number of attachments one request may carry. The byte
+    #: budget counts bytes, not entries; thousands of tiny valid images fit inside
+    #: it and still cost thousands of inodes plus a list that long handed to
+    #: WanGP's validator.
+    max_media_items: int = field(
+        default_factory=lambda: _env_int("WANGP_MAX_MEDIA_ITEMS", 16, minimum=1)
+    )
+    # minimum=0 on the byte caps: 0 is a legitimate "never inline anything".
     b64_out_max: int = field(
-        default_factory=lambda: int(os.environ.get("WANGP_B64_OUT_MAX", str(6 * 1024 * 1024)))
+        default_factory=lambda: _env_int("WANGP_B64_OUT_MAX", 6 * 1024 * 1024, minimum=0)
     )
     b64_in_max: int = field(
-        default_factory=lambda: int(os.environ.get("WANGP_B64_IN_MAX", str(6 * 1024 * 1024)))
+        default_factory=lambda: _env_int("WANGP_B64_IN_MAX", 6 * 1024 * 1024, minimum=0)
     )
     media_total_max: int = field(
-        default_factory=lambda: int(os.environ.get("WANGP_MEDIA_TOTAL_MAX", str(7 * 1024 * 1024)))
+        default_factory=lambda: _env_int("WANGP_MEDIA_TOTAL_MAX", 7 * 1024 * 1024, minimum=0)
     )
     allow_url_inputs: bool = field(
         default_factory=lambda: os.environ.get("ALLOW_URL_INPUTS", "0") == "1"
@@ -383,7 +436,7 @@ class WorkerConfig:
         default_factory=lambda: os.environ.get("ALLOW_MODEL_SWITCH", "0") == "1"
     )
     failure_budget: int = field(
-        default_factory=lambda: int(os.environ.get("WORKER_FAILURE_BUDGET", "3"))
+        default_factory=lambda: _env_int("WORKER_FAILURE_BUDGET", 3, minimum=1)
     )
     allowed_loras: tuple[str, ...] = field(
         default_factory=lambda: tuple(_split_env_list(os.environ.get("WANGP_ALLOWED_LORAS", "")))
