@@ -36,6 +36,9 @@ this endpoint must clearly disclose that it uses WanGP.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import hashlib
+import json
 import os
 import sys
 import threading
@@ -88,6 +91,7 @@ from runpod_worker.errors import (  # noqa: E402
     GENERATION_TIMEOUT,
     INTERNAL_ERROR,
     NO_OUTPUT,
+    OUTPUT_TOO_LARGE,
     WANGP_VALIDATION,
     WorkerError,
     default_retryable,
@@ -241,10 +245,14 @@ def _warm(session: Any) -> int:
       doing that at boot keeps it off a billed request and off a slow volume.
     * stale job scratch dirs from a hard restart are swept.
 
-    Weight preloading is opt-in via ``WANGP_WARM_MODEL=1`` and only runs if the
-    engine exposes a warm entry point. It is minutes long: enabling it trades
+    Weight preloading is opt-in via ``WANGP_WARM=1`` and only runs if the engine
+    exposes a warm entry point. It is minutes long: enabling it trades
     first-request latency for the risk of tripping RunPod's 7-minute
     worker-start (unhealthy) threshold.
+
+    ``WANGP_WARM_MODEL`` is a deprecated alias for ``WANGP_WARM``: two env vars
+    for one behaviour meant the README had to explain that each was "the other
+    one's equivalent". It is still honoured, with a warning.
     """
     started = time.monotonic()
     model_type = C.CONFIG.model_type
@@ -261,7 +269,12 @@ def _warm(session: Any) -> int:
     except Exception as exc:  # noqa: BLE001 - a sweep failure must not fail boot
         LOG.warn("warm_sweep_failed", exc=f"{type(exc).__name__}: {exc}")
 
-    if _flag("WANGP_WARM_MODEL", "0"):
+    if _flag("WANGP_WARM_MODEL", "0") and not _flag("WANGP_WARM", "0"):
+        LOG.warn(
+            "warm_env_deprecated",
+            note="WANGP_WARM_MODEL is a deprecated alias for WANGP_WARM; set WANGP_WARM=1",
+        )
+    if _flag("WANGP_WARM", "0") or _flag("WANGP_WARM_MODEL", "0"):
         warm_fn = getattr(engine, "warm", None) or getattr(engine, "preload", None)
         if callable(warm_fn):
             with LOG.span("warm_model", model_type=model_type):
@@ -269,7 +282,7 @@ def _warm(session: Any) -> int:
         else:
             LOG.warn(
                 "warm_model_unsupported",
-                note="WANGP_WARM_MODEL=1 but engine exposes neither warm() nor preload()",
+                note="WANGP_WARM=1 but engine exposes neither warm() nor preload()",
             )
     return int((time.monotonic() - started) * 1000)
 
@@ -420,6 +433,17 @@ def register_fitness_checks() -> list[str]:
     checks: list[Callable[[], None]] = [_fitness_boot, _fitness_gpu, _fitness_weights, _fitness_transport]
     if _flag("WORKER_SKIP_GPU_FITNESS", "0"):
         checks.remove(_fitness_gpu)
+        # Dropping OUR check is only half the gate: rp_fitness.run_fitness_checks
+        # auto-registers the SDK's own GPU check
+        # (rp_fitness.py:242 -> rp_gpu_fitness.auto_register_gpu_check), which
+        # self-detects via nvidia-smi, plus CUDA-version / CUDA-init / benchmark
+        # checks. Without this the env var reads as an escape hatch that does not
+        # open. setdefault so an explicit operator value always wins.
+        os.environ.setdefault("RUNPOD_SKIP_GPU_CHECK", "true")
+        LOG.warn(
+            "gpu_fitness_skipped",
+            note="WORKER_SKIP_GPU_FITNESS=1; RUNPOD_SKIP_GPU_CHECK defaulted to 'true'",
+        )
     for check in checks:
         register(check)
         _FITNESS_REGISTERED.append(check.__name__)
@@ -530,14 +554,21 @@ def error_response(
     }
     if _flag("WORKER_ERROR_OBJECT", "0"):
         # Opt-in shape for clients that would rather branch on a structured
-        # top-level `error`. The default is the string form the response schema
-        # in docs/RUNPOD_SERVERLESS.md documents.
-        body["error"] = {
-            "code": code,
-            "message": message,
-            "retryable": bool(retryable),
-            "details": detail_list,
-        }
+        # top-level `error`. JSON-ENCODED, not a dict: rp_job.run_job assigns
+        # `run_result["error"] = error_msg` with no str() coercion
+        # (rp_job.py:266-273), unlike the streaming path (rp_job.py:205) which
+        # does coerce -- so a dict would reach the result endpoint as a JSON
+        # object in a field that is a string everywhere else in the API. The
+        # default is still the plain string the response schema documents.
+        body["error"] = json.dumps(
+            {
+                "code": code,
+                "message": message,
+                "retryable": bool(retryable),
+                "details": detail_list,
+            },
+            ensure_ascii=False,
+        )
     if req is not None:
         body["model_type"] = getattr(req, "model_type", None)
         seed = getattr(req, "settings", {}).get("seed") if getattr(req, "settings", None) else None
@@ -684,8 +715,123 @@ def _unlink_outputs(paths: list[str]) -> None:
 # ---------------------------------------------------------------------------
 
 
-def run_job(job: Mapping[str, Any]) -> dict[str, Any]:
-    """Synchronous job body. Runs on a worker thread, off the SDK event loop."""
+def _preflight_transport(req: Any) -> None:
+    """Say, in the first second, when this endpoint cannot deliver a big file.
+
+    The default chain is ``presigned,rp_bucket,base64``. On the documented
+    phase-1 shape (network volume, no ``BUCKET_*`` credentials) and a request
+    with no ``output.presigned_url``, that degrades to base64 under
+    ``WANGP_B64_OUT_MAX`` (6 MiB) -- and a 5 s 832x480 clip with audio is
+    plausibly 2-8 MB. ``media_out.deliver`` finds that out AFTER a multi-minute
+    generation and raises ``output_too_large``, which is the most expensive
+    possible moment to learn it.
+
+    This cannot be a hard refusal by default: a small output really does fit
+    inline, and rejecting every job on a volume-only endpoint would be worse
+    than the disease. So it warns by default and refuses under
+    ``WORKER_REQUIRE_DELIVERABLE=1`` -- and ``REQUIRE_BUCKET=1`` still fails the
+    whole worker at fitness time, which is the right gate for an operator who
+    knows the outputs are always large.
+    """
+    opts = getattr(req, "output", None) or {}
+    mode = str(opts.get("mode") or "auto").strip().lower()
+    if mode not in ("auto", "b64", "base64", "inline"):
+        return
+    if opts.get("presigned_url") or opts.get("url"):
+        return
+    chain = media_out.default_chain() if mode == "auto" else ["base64"]
+    if "rp_bucket" in chain and C.CONFIG.bucket_configured:
+        return
+    if "volume" in chain:
+        return
+    cap = int(getattr(C.CONFIG, "b64_out_max", 0) or 0)
+    message = (
+        f"this endpoint can only return outputs under {cap} B: the only transport "
+        f"left in the chain ({','.join(chain)}) is base64"
+    )
+    fixes = [
+        "pass input.output.presigned_url (a presigned PUT URL)",
+        "or set BUCKET_ENDPOINT_URL + BUCKET_ACCESS_KEY_ID + "
+        "BUCKET_SECRET_ACCESS_KEY + BUCKET_NAME on the endpoint",
+        "or add 'volume' to WANGP_OUTPUT_CHAIN (the response then carries "
+        "volume_path, readable only by something with the same volume mounted)",
+    ]
+    LOG.warn("transport_preflight", chain=chain, b64_out_max=cap)
+    if _flag("WORKER_REQUIRE_DELIVERABLE", "0"):
+        raise WorkerError(OUTPUT_TOO_LARGE, message, details=fixes, retryable=False)
+    req.warnings.append(message + "; " + fixes[0])
+
+
+#: Request fields that do NOT change what gets generated, so they must not
+#: change the idempotency digest: ``output`` is transport (a re-signed PUT URL
+#: differs on every retry of the same request) and ``runtime`` is budget /
+#: priority / the idempotency key itself.
+_DIGEST_IGNORED_INPUT_KEYS: frozenset[str] = frozenset({"output", "runtime"})
+
+
+def request_digest(job_input: Any, model_type: str) -> str:
+    """A stable hash of everything about a request that decides its output.
+
+    Computed from the RAW input, before schema resolution, so a replayed payload
+    digests identically even though ``seed`` is resolved randomly per parse.
+    """
+    try:
+        body = {
+            key: value
+            for key, value in dict(job_input or {}).items()
+            if key not in _DIGEST_IGNORED_INPUT_KEYS
+        }
+    except (TypeError, ValueError):  # pragma: no cover - job_input is a Mapping
+        body = {"_unhashable": repr(job_input)}
+    body["_model_type"] = model_type
+    blob = json.dumps(body, sort_keys=True, ensure_ascii=False, default=repr)
+    return hashlib.sha256(blob.encode("utf-8", "replace")).hexdigest()
+
+
+def _idempotency_scope(req: Any, job_input: Any, job_id: str) -> str:
+    """The job-id-shaped string :func:`media_out.object_key` namespaces by."""
+    idem = getattr(req, "idempotency_key", None)
+    if not idem:
+        return job_id
+    digest = request_digest(job_input, getattr(req, "model_type", ""))
+    return f"{idem}-{digest[:16]}"
+
+
+def _annotate_cached(req: Any, job_input: Any) -> None:
+    """Keep a cache-hit envelope honest about the one field it cannot know.
+
+    The digest guarantees the settings match, but a request that did not pin a
+    seed had one resolved randomly for THIS parse, and the cached file was made
+    with a different one. Drop it rather than report a seed the video was not
+    generated with.
+    """
+    raw = job_input.get("settings") if isinstance(job_input, Mapping) else None
+    pinned = False
+    if isinstance(raw, Mapping) and raw.get("seed") not in (None, ""):
+        try:
+            pinned = int(raw["seed"]) >= 0
+        except (TypeError, ValueError):
+            pinned = False
+    if pinned:
+        return
+    getattr(req, "settings", {}).pop("seed", None)
+    getattr(req, "resolved", {}).pop("seed", None)
+    req.warnings.append(
+        "seed omitted: this is a cached delivery of an earlier identical request, "
+        "which resolved its own random seed"
+    )
+
+
+def run_job(
+    job: Mapping[str, Any], cancelled: threading.Event | None = None
+) -> dict[str, Any]:
+    """Synchronous job body. Runs on a worker thread, off the SDK event loop.
+
+    ``cancelled`` is set by :func:`handler` when the platform cancels the job.
+    It is polled by ``engine.run`` every 0.5 s; without it a ``/cancel`` frees
+    the SDK's concurrency slot immediately while this thread keeps burning GPU
+    for the rest of the budget.
+    """
     job = dict(job or {})
     job_id = str(job.get("id") or "local_test")
     started = time.monotonic()
@@ -701,10 +847,18 @@ def run_job(job: Mapping[str, Any]) -> dict[str, Any]:
 
             state = bootstrap()
             if state.error is not None:
+                # The traceback names container paths, env-derived directories
+                # and internal frames; it goes to the structured log every time
+                # and to the client only under WORKER_DEBUG_DETAILS=1.
+                LOG.error("boot_failure_reported", traceback=state.traceback[-2000:])
                 raise WorkerError(
                     BACKEND_FATAL,
                     f"worker failed to boot: {type(state.error).__name__}: {state.error}",
-                    details=[line for line in state.traceback.splitlines()[-8:]],
+                    details=(
+                        [line for line in state.traceback.splitlines()[-8:]]
+                        if _flag("WORKER_DEBUG_DETAILS", "0")
+                        else ["set WORKER_DEBUG_DETAILS=1 on the endpoint for the traceback"]
+                    ),
                     retryable=True,
                     recycle=True,
                 )
@@ -725,6 +879,7 @@ def run_job(job: Mapping[str, Any]) -> dict[str, Any]:
                 session=session,
             )
             metrics["validate_ms"] = int((time.monotonic() - started) * 1000)
+            _preflight_transport(req)
             LOG.info(
                 "request_validated",
                 model_type=req.model_type,
@@ -739,16 +894,35 @@ def run_job(job: Mapping[str, Any]) -> dict[str, Any]:
             )
 
             # ---- idempotency: a retry must not cost GPU seconds ------------
+            # The object key is namespaced by a digest of the request itself, not
+            # by the caller-chosen idempotency key alone. Three things depend on
+            # that: (1) an idempotency key is caller-chosen and the key namespace
+            # is the whole endpoint, so a guessed or reused key would otherwise
+            # return ANOTHER caller's video, sha256 and URL for free; (2) the
+            # success envelope is built from the CURRENT request, so a hit on a
+            # different request would describe yesterday's video with today's
+            # parameters; (3) RunPod's own /retry replays the identical payload,
+            # which is exactly the case this is for and which still hits.
             key = media_out.object_key(
-                req.idempotency_key or job_id, "output.mp4", model_type=req.model_type
+                _idempotency_scope(req, job_input, job_id), "output.mp4",
+                model_type=req.model_type,
             )
+            # Probed with or without a caller key: without one the scope is the
+            # platform's job id, which is not caller-chosen, so a hit can only
+            # ever be this same job replayed (RunPod's /retry keeps the id).
             if _flag("WORKER_IDEMPOTENCY", "1"):
-                cached = media_out.find_existing(key, cfg=C.CONFIG)
+                cached = media_out.find_existing(
+                    key, cfg=C.CONFIG, request_opts=req.output
+                )
                 if cached:
                     metrics["idempotent_hit"] = True
                     metrics["total_s"] = round(time.monotonic() - started, 2)
                     metrics.update(_engine_stats())
-                    LOG.info("idempotent_hit", key=key, url=cached.get("url"))
+                    # Never log the URL: a presigned GET carries its signature in
+                    # the query string, and obs.py serializes fields verbatim.
+                    LOG.info("idempotent_hit", key=key,
+                             transport=cached.get("transport"))
+                    _annotate_cached(req, job_input)
                     return _success_response(req, cached, metrics, model_name)
 
             # ---- materialize inputs ---------------------------------------
@@ -767,7 +941,12 @@ def run_job(job: Mapping[str, Any]) -> dict[str, Any]:
 
             generate_started = time.monotonic()
             result, timed_out, logs, phase_marks, generate_s = _unpack_run_result(
-                engine.run(req.settings, budget_s=req.budget_s, emit_progress=emit)
+                engine.run(
+                    req.settings,
+                    budget_s=req.budget_s,
+                    emit_progress=emit,
+                    cancel_check=(cancelled.is_set if cancelled is not None else None),
+                )
             )
             metrics["generate_s"] = generate_s or round(time.monotonic() - generate_started, 2)
             metrics["phase_marks_s"] = phase_marks
@@ -808,7 +987,15 @@ def run_job(job: Mapping[str, Any]) -> dict[str, Any]:
                 ] or ["WanGP reported failure without an error message"]
                 stages = {str(getattr(err, "stage", "") or "").lower() for err in errors}
                 code, poisoned = _classify_generation_failure(messages, stages)
-                _note_failure()
+                # Same policy as the WorkerError path below: a request WanGP
+                # rejected is the caller's fault and says nothing about this
+                # worker's health. wangp_validation is precisely the class
+                # schema.parse cannot pre-empt (reference-video / audio duration,
+                # control-video soundtrack presence -- all need ffprobe or librosa
+                # on the real file), so counting it let three bad client uploads
+                # in a row kill a healthy worker.
+                if code != WANGP_VALIDATION:
+                    _note_failure()
                 return error_response(
                     job_id,
                     code,
@@ -893,7 +1080,11 @@ def run_job(job: Mapping[str, Any]) -> dict[str, Any]:
                 INTERNAL_ERROR,
                 f"{type(exc).__name__}: {exc}",
                 retryable=True,
-                details=traceback.format_exc().splitlines()[-8:],
+                details=(
+                    traceback.format_exc().splitlines()[-8:]
+                    if _flag("WORKER_DEBUG_DETAILS", "0")
+                    else ["set WORKER_DEBUG_DETAILS=1 on the endpoint for the traceback"]
+                ),
                 logs=logs,
                 recycle=should_recycle(),
                 req=req,
@@ -968,11 +1159,36 @@ async def handler(job: Mapping[str, Any]) -> dict[str, Any]:
     (``runpod/serverless/modules/rp_job.py:257-262``). A synchronous handler
     starves ``JobScaler.monitor_stop_signals`` for the whole job, so a client
     ``/cancel`` is never observed and SIGTERM on scale-down never drains.
-    ``asyncio.to_thread`` fixes both, and carries the contextvars our logger
+    ``asyncio.to_thread`` fixes that, and carries the contextvars our logger
     binds into the worker thread. (The heartbeat is safe either way -- it runs
     in its own process.)
+
+    Being awaitable is only half of it. ``JobScaler.stop_job``
+    (``rp_scale.py:321-338``) reacts to the platform's stop channel with
+    ``task.cancel()``, and ``handle_job``'s ``finally``
+    (``rp_scale.py:341-368``) frees the concurrency slot on ``CancelledError``
+    -- but ``asyncio.to_thread`` cannot cancel a thread that has already
+    started. Without the ``threading.Event`` below the cancelled generation runs
+    to the full budget on a billed GPU, its result is never sent (so no
+    ``refresh_worker`` ever reaches the platform), and the next jobs pulled into
+    the freed slot fail with ``worker_busy`` against ``_JOB_LOCK``.
+
+    So: shield the thread's task from the cancellation, signal the engine
+    cooperatively, and give it the same grace window the engine uses before it
+    declares the process poisoned. The ``CancelledError`` is re-raised either
+    way -- the platform asked for it.
     """
-    return await asyncio.to_thread(run_job, job)
+    cancelled = threading.Event()
+    task = asyncio.ensure_future(asyncio.to_thread(run_job, job, cancelled))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        cancelled.set()
+        LOG.warn("job_cancel_requested", note="signalled the engine; draining the thread")
+        grace = float(getattr(C.CONFIG, "cancel_grace_s", 150)) + 30.0
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(asyncio.shield(task), grace)
+        raise
 
 
 # ---------------------------------------------------------------------------
