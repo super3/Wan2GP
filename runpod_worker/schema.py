@@ -561,6 +561,14 @@ def normalize_frames(frame_count: int, minimum: int, step: int, offset: int = 1)
     return math.ceil(max(0, frame_count - offset) / step) * step + offset
 
 
+# NOTE on the step used to floor `video_length`. wgp.py:6929 floors with
+# `latent_size`, not `frames_steps`:
+#     frames_minimum, frames_steps, latent_size = get_model_min_frames_and_step(...)
+#     latent_size = model_def.get("latent_size", frames_steps)     # wgp.py:2853
+# MiniMax H3 declares no `latent_size`, so latent_size == frames_steps == 17 for
+# all four types and `frame_lattice`'s use of frames_steps is exact. A future
+# model that declares a different `latent_size` would make the two diverge --
+# read it out of model_def here rather than assuming they stay equal.
 def floor_frames(frame_count: int, minimum: int, step: int, offset: int = 1) -> int:
     """Mirror ``floor_frame_count`` (``frame_scheduler.py:22-29``): round DOWN,
     but never below ``minimum`` -- in which case it rounds the minimum UP onto
@@ -602,10 +610,20 @@ def round_overlap(frame_count: int, step: int, offset: int = 1) -> int:
 
 
 def frame_lattice(model_def: Mapping[str, Any] | None) -> tuple[int, int, int]:
-    """``(minimum, step, offset)`` for a model. Defaults match a step-1 model."""
+    """``(minimum, step, offset)`` for a model. Defaults match a step-1 model.
+
+    The step is ``latent_size`` when the model declares one, exactly as
+    ``get_model_min_frames_and_step`` does (``wgp.py:2853``:
+    ``latent_size = model_def.get("latent_size", frames_steps)``), because that
+    -- not ``frames_steps`` -- is what ``wgp.py:6929`` floors ``video_length``
+    with. The two are equal for all four MiniMax H3 types (neither declares
+    ``latent_size``, both declare ``frames_steps: 17``), so this changes nothing
+    today; it is here so a future model that separates them cannot make this
+    module quietly predict the wrong lattice.
+    """
     md = model_def or {}
     minimum = max(1, int(md.get("frames_minimum", 1) or 1))
-    step = max(1, int(md.get("frames_steps", 1) or 1))
+    step = max(1, int(md.get("latent_size") or md.get("frames_steps", 1) or 1))
     offset = max(0, int(md.get("frames_offset", 0) or 0))
     return minimum, step, offset
 
