@@ -440,15 +440,19 @@ def test_ensure_wgp_config_survives_a_corrupt_file(config_dir):
 
 
 def test_attention_mode_whitelist_matches_wgp():
-    """``config.ATTENTION_MODES`` must equal the literal wgp.py:3303 enforces.
+    """``config.CLI_ATTENTION_MODES`` must equal the literal wgp.py:3303 enforces.
 
     An unlisted value raises ``Exception(f"Unknown attention mode ...")`` during
     import (wgp.py:3306), i.e. another way to build an image that cannot boot.
+
+    ``ATTENTION_MODES`` is deliberately WIDER: the config-file path
+    (wgp.py:3301) also accepts "sol", which the CLI never does.
     """
     source = _wgp_source()
     match = re.search(r"if args\.attention in (\[[^\]]*\])", source)
     assert match, "wgp.py no longer validates args.attention against a list literal"
-    assert sorted(ast.literal_eval(match.group(1))) == sorted(C.ATTENTION_MODES)
+    assert sorted(ast.literal_eval(match.group(1))) == sorted(C.CLI_ATTENTION_MODES)
+    assert set(C.CLI_ATTENTION_MODES) < set(C.ATTENTION_MODES)
 
 
 def test_unknown_attention_mode_is_rejected_before_the_image_is_built(monkeypatch):
@@ -696,3 +700,27 @@ def test_pip_check_layer_cannot_swallow_install_failure():
         "the layer should prove at build time that runpod and gradio actually "
         "coexist, not just that pip check was quiet"
     )
+
+
+def test_sol_is_config_only_attention_mode():
+    """Regression: a 1x PRO 6000 bench run lost every sol config because
+    WANGP_ATTENTION='sol' was rejected outright. Sol IS valid in
+    wgp_config.json (wgp.py:3301) but never on the CLI (wgp.py:3303), and
+    MiniMax H3 supports it (minimax_h3_handler.py:199 sol_attention=True)."""
+    from runpod_worker import config as C
+
+    assert "sol" in C.ATTENTION_MODES, "sol must be accepted as a config attention mode"
+    assert "sol" not in C.CLI_ATTENTION_MODES, "sol must never be passed as --attention"
+
+    import os
+    from unittest import mock
+
+    with mock.patch.dict(os.environ, {"WANGP_ATTENTION": "sol"}, clear=False):
+        assert C.attention_mode(()) == "sol"
+        # ...but the same value on the CLI must fail loudly rather than reach wgp.
+        try:
+            C.attention_mode(("--attention", "sol"))
+        except RuntimeError as exc:
+            assert "3303" in str(exc)
+        else:  # pragma: no cover
+            raise AssertionError("--attention sol must be refused before wgp sees it")
