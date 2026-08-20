@@ -145,14 +145,33 @@ def main() -> int:
     # unsupported (a bench run reported sdpa/sol/sage2 within 0.1 s of each
     # other -- all three were SDPA). Ask the runtime what it actually holds
     # instead of trusting the request.
-    def probe_attention():
-        """shared_state['_attention'] is only populated once a generation has
-        configured the model -- probing at bootstrap returns None."""
+    # GROUND TRUTH: shared_state["_attention"] is set by a CONTEXT MANAGER
+    # (shared/attention.py attention_config_shared_state) that RESTORES the old
+    # value when the generation ends -- so reading it after a job reports the
+    # restored default, not what ran. A leg once looked like an sdpa fallback
+    # purely because of that. Wrap the DiT's own pay_attention reference (bound
+    # at import in models/minimax_h3/transformer.py, so patching the module it
+    # came from would not take) and record the mode on the first real call.
+    _kernel = {}
+
+    def install_kernel_probe():
         try:
+            from models.minimax_h3 import transformer as T  # noqa: PLC0415
             from mmgp import offload  # noqa: PLC0415
-            return offload.shared_state.get("_attention")
-        except Exception as exc:  # noqa: BLE001
-            return f"probe_failed: {exc!r}"
+
+            original = T.pay_attention
+
+            def probing_pay_attention(qkv_list, *a, **kw):
+                if "mode" not in _kernel:
+                    _kernel["mode"] = offload.shared_state.get("_attention")
+                return original(qkv_list, *a, **kw)
+
+            T.pay_attention = probing_pay_attention
+        except Exception as exc:  # noqa: BLE001 - never fail a bench over a probe
+            _kernel["mode"] = f"probe_failed: {exc!r}"
+
+    def probe_attention():
+        return _kernel.get("mode")
 
     effective = installed = supported = None
     try:
@@ -165,6 +184,7 @@ def main() -> int:
         supported = list(get_supported_attention_modes())
     except Exception as exc:  # noqa: BLE001 - probe must never fail the bench
         effective = f"probe_failed: {exc!r}"
+    install_kernel_probe()
     if rank == 0:
         print(f"BENCH_ATTENTION requested={args.attention} installed={installed}", flush=True)
 
@@ -209,6 +229,12 @@ def main() -> int:
         # in the shipped stream log (profile 1 pins transformer + text encoder
         # + VAEs, ~51 GB; profile 4 pins only the transformer, ~20 GB).
         run["effective_attention"] = probe_attention()
+        # The tail (VAE decode + mux) is the metric for codec changes: denoise
+        # variance on a shared host swamped a 29.6s-vs-32.9s control pair, but
+        # decoding -> video_saved isolates exactly what an encoder swap moves.
+        marks = run.get("phase_marks_s") or {}
+        if marks.get("decoding") and marks.get("video_saved"):
+            run["tail_s"] = round(marks["video_saved"] - marks["decoding"], 2)
         runs.append(run)
         if rank == 0:
             print("BENCH_RUN " + json.dumps(run), flush=True)
