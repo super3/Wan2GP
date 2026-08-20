@@ -305,6 +305,13 @@ def authoritative_keys(cli_args=()) -> dict:
         # dedicated NVENC block, which is idle during generation (note: A100 and
         # H100 have no NVENC).
         "video_output_codec": os.environ.get("WANGP_VIDEO_CODEC", "libx264_8"),
+        # wgp.py:3323 reads server_config["vae_config"] at module scope and hands
+        # it to the model's get_VAE_tile_size. MiniMax H3's implementation
+        # (models/minimax_h3/video_vae.py:52-55) IGNORES device_mem_capacity: on
+        # the default 0 ("auto") it hard-returns a 256 px tile, so the VAE tiles
+        # even on a 96 GB card that peaks at 5.6 GB. 1 means "no tiling" and is
+        # the only value that lets a big card decode the frame in one pass.
+        "vae_config": _env_int("WANGP_VAE_CONFIG", 0, minimum=0),
         "audio_output_codec": "aac_128",   # wgp.py:3339 default
         # shared/api.py:816-831 rewrites these three from `output_dir` on every
         # run anyway; writing them keeps the file honest if output_dir is None.
