@@ -16,7 +16,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[2]
 
 #: sha256 of MiniMaxH3Model.forward's source at the revision usp.py mirrors.
-MIRRORED_FORWARD_SHA256 = "a45ba9cf731416aa827b77d68f5d05223a653f97da1165dc13a3db25b3f40aeb"
+MIRRORED_FORWARD_SHA256 = "93f9a95b5e6297b2b337a38d592944a9c28a5da58370456119f7de2ab6763f69"
 
 
 def _forward_source() -> str:
