@@ -213,10 +213,14 @@ def test_frame_lattice_matches_the_handler_source():
     assert (found["frames_minimum"], found["frames_steps"], found["frames_offset"]) == (107, 17, 5)
     assert S.frame_lattice(model_def) == (107, 17, 5)
     assert model_def["block_size"] == found["block_size"] == 32
-    # frames_maximum is Ref2VA-only (minimax_h3_handler.py:251).
-    assert "frames_maximum" not in S.fallback_model_def(FL2VA)
-    assert S.fallback_model_def(REF2VA)["frames_maximum"] == int(
-        re.search(r'"frames_maximum"\s*:\s*(\d+)', source).group(1)
+    # Upstream 238e25f renamed this to frames_selection_maximum and demoted it
+    # to a gradio slider bound (wgp.py:11897); the headless path never reads it.
+    assert "frames_selection_maximum" not in S.fallback_model_def(FL2VA)
+    assert S.fallback_model_def(REF2VA)["frames_selection_maximum"] == int(
+        re.search(r'"frames_selection_maximum"\s*:\s*(\d+)', source).group(1)
+    )
+    assert '"frames_maximum"' not in source, (
+        "upstream reintroduced frames_maximum -- re-check which key bounds frames"
     )
 
 
