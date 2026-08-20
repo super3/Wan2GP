@@ -323,6 +323,9 @@ def _boot_locked() -> Any:
         # server_config["attention_mode"], so the file must agree with the flag
         # or the config is a lie.
         hf_mode = C.ensure_hf_transfer_sane()
+        # imageio's bundled ffmpeg has no NVENC; repoint it before wgp writes
+        # any video, or every job dies at save time (see the function's note).
+        C.ensure_ffmpeg_supports_codec()
         if hf_mode == "disabled":
             LOG.warn("hf_transfer_disabled",
                      reason="HF_HUB_ENABLE_HF_TRANSFER=1 but hf_transfer not importable")
