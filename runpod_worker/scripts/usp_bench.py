@@ -155,18 +155,35 @@ def main() -> int:
     _kernel = {}
 
     def install_kernel_probe():
-        try:
-            from models.minimax_h3 import transformer as T  # noqa: PLC0415
-            from mmgp import offload  # noqa: PLC0415
+        """Wrap EVERY module-level pay_attention reference the DiT might use.
 
-            original = T.pay_attention
+        transformer.py binds one at import, but MiniMax H3's DiT blocks never
+        call it: ``self.sol_attention`` is always constructed (transformer.py
+        :473), so ``Attention.forward`` takes the
+        ``self.sol_attention(qkv_list, use_sol)`` branch, and that lands on the
+        SEPARATE reference bound in sol_attention.py. Wrapping only the first
+        one probed the TokenRefiner instead of the 50 DiT blocks -- which is
+        how a sage2 leg came back reporting "sdpa"."""
+        from mmgp import offload  # noqa: PLC0415
 
-            def probing_pay_attention(qkv_list, *a, **kw):
-                if "mode" not in _kernel:
-                    _kernel["mode"] = offload.shared_state.get("_attention")
+        def wrap(module, label):
+            original = getattr(module, "pay_attention", None)
+            if original is None:
+                return
+
+            def probing(qkv_list, *a, **kw):
+                _kernel.setdefault("mode", offload.shared_state.get("_attention"))
+                _kernel.setdefault("via", label)
                 return original(qkv_list, *a, **kw)
 
-            T.pay_attention = probing_pay_attention
+            module.pay_attention = probing
+
+        try:
+            from models.minimax_h3 import sol_attention as S  # noqa: PLC0415
+            from models.minimax_h3 import transformer as T  # noqa: PLC0415
+
+            wrap(S, "sol_attention")   # the real DiT path for this model
+            wrap(T, "transformer")     # TokenRefiner / any non-sol block
         except Exception as exc:  # noqa: BLE001 - never fail a bench over a probe
             _kernel["mode"] = f"probe_failed: {exc!r}"
 
@@ -229,6 +246,7 @@ def main() -> int:
         # in the shipped stream log (profile 1 pins transformer + text encoder
         # + VAEs, ~51 GB; profile 4 pins only the transformer, ~20 GB).
         run["effective_attention"] = probe_attention()
+        run["attention_via"] = _kernel.get("via")
         # The tail (VAE decode + mux) is the metric for codec changes: denoise
         # variance on a shared host swamped a 29.6s-vs-32.9s control pair, but
         # decoding -> video_saved isolates exactly what an encoder swap moves.
