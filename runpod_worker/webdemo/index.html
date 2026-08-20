@@ -242,6 +242,15 @@ function diagnose(e) {
            "or serve the folder over http — run <code>python3 -m http.server 8000</code> " +
            "in this file's directory and open <code>http://localhost:8000</code>.";
   }
+  // An embedded preview (a chat file viewer, a docs sandbox) serves the page
+  // under a Content-Security-Policy that permits no external host. Nothing the
+  // page does can lift that, and the endpoint and key are not the problem --
+  // saying "check your key" here sends people to debug something that is fine.
+  if (window.top !== window.self) {
+    return "This page is running inside an embedded preview, which blocks requests to " +
+           "any external site. The endpoint and key are almost certainly fine. " +
+           "Download this file and open it directly in Chrome, or serve it over http.";
+  }
   return "Network request failed — check the endpoint id, the key, and your connection. " +
          "(" + String(e) + ")";
 }
