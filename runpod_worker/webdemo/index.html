@@ -72,20 +72,23 @@
     <fieldset>
       <legend>Endpoint</legend>
       <label for="ep">Endpoint ID</label>
-      <input id="ep" placeholder="s3415s3i4c0q2w" autocomplete="off" spellcheck="false">
+      <input id="ep" value="59kne66vo58331" placeholder="s3415s3i4c0q2w" autocomplete="off" spellcheck="false">
       <label for="key">RunPod API key</label>
       <input id="key" type="password" placeholder="rpa_…" autocomplete="off" spellcheck="false">
       <p class="hint">
-        Kept in this browser's <code>localStorage</code> only — it is never sent anywhere
-        except <code>api.runpod.ai</code>. Anyone with the page open can read it, so use a
-        key scoped to this endpoint and revoke it when you're done.
+        Stored in this browser only, and sent nowhere except <code>api.runpod.ai</code>.
+        Where the browser blocks storage — a sandboxed frame, Safari private mode — it is
+        held in memory for this tab instead, so you re-enter it next time. Anyone with the
+        page open can read it: use a key scoped to this endpoint and revoke it after.
       </p>
       <button type="button" class="ghost" id="check">Check endpoint health</button>
     </fieldset>
 
     <fieldset>
       <legend>Prompt</legend>
-      <textarea id="prompt" spellcheck="false"></textarea>
+      <textarea id="prompt" spellcheck="false">integrated_multimodal_description: [Shot 1] A five-second cinematic close-up of a brass desk lamp switching on in a dark study, dust drifting through the beam. The camera pushes in slowly.
+overall_soundscape: A single click, a low electrical hum, faint room tone.
+non_diegetic_music: One soft sustained cello note.</textarea>
       <p class="hint">
         H3 wants the three-part form: <code>integrated_multimodal_description:</code>,
         <code>overall_soundscape:</code>, <code>non_diegetic_music:</code>. Spoken lines go in
@@ -136,8 +139,8 @@ const $ = (id) => document.getElementById(id);
 // Prefilled so the page is usable the moment it opens. The endpoint id is not a
 // secret. DEFAULT_KEY is deliberately empty in the repo copy -- putting a live
 // RunPod key in a tracked file would publish it to anyone who clones. Paste your
-// key into the field (it persists in localStorage), or fill this in on a local
-// copy you never commit.
+// key into the field (it persists where the browser allows storage), or fill
+// this in on a local copy you never commit.
 const DEFAULT_ENDPOINT = "59kne66vo58331";   // wangp-h3-sage2-fp8vae, PRO 6000 Blackwell
 const DEFAULT_KEY = "";
 
@@ -157,20 +160,42 @@ non_diegetic_music: One rising string swell.`,
 ];
 
 // ---- persistence -----------------------------------------------------------
-const DEFAULTS = { ep: DEFAULT_ENDPOINT, key: DEFAULT_KEY, prompt: EXAMPLES[0], seed: "-1" };
+// localStorage is not always reachable: a sandboxed iframe throws SecurityError
+// on the property GETTER itself, and so does Safari in private mode. This ran at
+// top level and took the whole script down with it -- the fields stayed empty and
+// no handler below was ever wired, which looked like "the buttons do nothing".
+// Nothing outside this shim may reach the storage global directly.
+const store = (() => {
+  const memory = new Map();
+  let backing = null;
+  try {
+    const probe = window.localStorage;
+    probe.setItem("wangp.probe", "1");
+    probe.removeItem("wangp.probe");
+    backing = probe;
+  } catch { /* sandboxed or blocked: fall back to memory for this session */ }
+  return {
+    get(k) { try { return backing ? backing.getItem(k) : memory.get(k) ?? null; } catch { return null; } },
+    set(k, v) { try { backing ? backing.setItem(k, v) : memory.set(k, v); } catch { /* full or blocked */ } },
+    persistent: backing !== null,
+  };
+})();
+
+// The markup already carries the defaults, so a saved value only ever OVERLAYS
+// them -- and a saved blank never wins.
+if (DEFAULT_KEY && !$("key").value) $("key").value = DEFAULT_KEY;
 for (const id of ["ep", "key", "prompt", "seed"]) {
-  const saved = localStorage.getItem("wangp." + id);
-  // A previously saved blank must not beat the default, hence the || rather
-  // than a plain null check.
-  $(id).value = (saved || DEFAULTS[id] || "");
-  $(id).addEventListener("change", () => localStorage.setItem("wangp." + id, $(id).value));
+  const saved = store.get("wangp." + id);
+  if (saved) $(id).value = saved;
+  $(id).addEventListener("change", () => store.set("wangp." + id, $(id).value));
 }
-$("shuffle").onclick = () => {
-  const cur = $("prompt").value;
-  const pool = EXAMPLES.filter((e) => e !== cur);
-  $("prompt").value = pool[Math.floor(Math.random() * pool.length)];
-  localStorage.setItem("wangp.prompt", $("prompt").value);
-};
+$("shuffle").addEventListener("click", () => {
+  const cur = $("prompt").value.trim();
+  const pool = EXAMPLES.filter((e) => e.trim() !== cur);
+  const next = pool[Math.floor(Math.random() * pool.length)] || EXAMPLES[0];
+  $("prompt").value = next;
+  store.set("wangp.prompt", next);
+});
 
 // ---- ui helpers ------------------------------------------------------------
 let t0 = 0, timer = null, currentJob = null, cancelled = false;
@@ -229,7 +254,7 @@ async function readBody(res) {
 }
 
 // ---- health ----------------------------------------------------------------
-$("check").onclick = async () => {
+$("check").addEventListener("click", async () => {
   const c = creds(); if (!c) return;
   say("Checking…", "run", "contacting api.runpod.ai");
   try {
@@ -247,10 +272,10 @@ $("check").onclick = async () => {
   } catch (e) {
     say("Could not reach RunPod", "bad", diagnose(e));
   }
-};
+});
 
 // ---- generate --------------------------------------------------------------
-$("go").onclick = async () => {
+$("go").addEventListener("click", async () => {
   const c = creds(); if (!c) return;
   const prompt = $("prompt").value.trim();
   if (!prompt) return say("Write a prompt first.", "bad");
@@ -299,14 +324,14 @@ $("go").onclick = async () => {
   } catch (e) {
     finish("Request failed", "bad", diagnose(e));
   }
-};
+});
 
-$("cancel").onclick = async () => {
+$("cancel").addEventListener("click", async () => {
   const c = creds(); if (!c || !currentJob) return;
   cancelled = true;
   try { await call(`${API}/${c.ep}/cancel/${currentJob}`, { method: "POST", headers: c.h }); } catch {}
   finish("Cancelled", "bad", "");
-};
+});
 
 let lastMsg = "Working…", lastPhase = "";
 
