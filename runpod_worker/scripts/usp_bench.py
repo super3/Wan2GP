@@ -94,6 +94,9 @@ def main() -> int:
     parser.add_argument("--config", default="")
     #: server_config["video_output_codec"]: libx264_8 (default) | h264_nvenc | ...
     parser.add_argument("--codec", default="")
+    #: server_config["vae_config"]: 0 = "auto", which for MiniMax H3 is a hard
+    #: 256 px tile regardless of VRAM (video_vae.py:52-55). 1 = no tiling.
+    parser.add_argument("--vae-config", dest="vae_config", default="")
     args = parser.parse_args()
 
     world = int(os.environ.get("WORLD_SIZE", "1"))
@@ -124,6 +127,8 @@ def main() -> int:
         os.environ["WANGP_MODEL_CONFIG"] = args.config
     if args.codec:
         os.environ["WANGP_VIDEO_CODEC"] = args.codec
+    if args.vae_config:
+        os.environ["WANGP_VAE_CONFIG"] = args.vae_config
 
     cli = f"--profile {args.profile} --verbose 1"
     if args.compile:
@@ -298,6 +303,7 @@ def main() -> int:
     attention_ok = effective == args.attention
     summary = {"event": "usp_bench_summary", "tag": tag, "frames": args.frames,
                "compile": bool(args.compile), "config": args.config, "codec": args.codec,
+               "vae_config": args.vae_config,
                "attention": args.attention,
                "effective_attention": effective, "attention_ok": attention_ok,
                "installed_attention": installed, "supported_attention": supported,
