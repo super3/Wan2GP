@@ -80,7 +80,7 @@
         except <code>api.runpod.ai</code>. Anyone with the page open can read it, so use a
         key scoped to this endpoint and revoke it when you're done.
       </p>
-      <button class="ghost" id="check">Check endpoint health</button>
+      <button type="button" class="ghost" id="check">Check endpoint health</button>
     </fieldset>
 
     <fieldset>
@@ -91,7 +91,7 @@
         <code>overall_soundscape:</code>, <code>non_diegetic_music:</code>. Spoken lines go in
         <code>&lt;d&gt;[English] …&lt;/d&gt;</code>.
       </p>
-      <button class="ghost" id="shuffle">Load another example</button>
+      <button type="button" class="ghost" id="shuffle">Load another example</button>
     </fieldset>
 
     <fieldset>
@@ -112,8 +112,8 @@
         </div>
       </div>
       <p class="hint">Frames are on a lattice: ≥107 and ≡5 (mod 17). −1 seeds randomly.</p>
-      <button id="go">Generate</button>
-      <button class="ghost" id="cancel" style="display:none">Cancel job</button>
+      <button type="button" id="go">Generate</button>
+      <button type="button" class="ghost" id="cancel" style="display:none">Cancel job</button>
     </fieldset>
   </div>
 
@@ -186,7 +186,39 @@ function fill(pct) { $("fill").style.width = Math.max(0, Math.min(100, pct)) + "
 function creds() {
   const ep = $("ep").value.trim(), key = $("key").value.trim();
   if (!ep || !key) { say("Enter an endpoint ID and API key first.", "bad"); return null; }
-  return { ep, key, h: { "Content-Type": "application/json", Authorization: "Bearer " + key } };
+  // Content-Type belongs only on the request that has a body. It is sent on the
+  // POST below; a GET that declares it is just a larger preflight to get wrong.
+  return { ep, key, h: { Authorization: "Bearer " + key },
+           hp: { "Content-Type": "application/json", Authorization: "Bearer " + key } };
+}
+
+// Every network call goes through this. Without a timeout a stalled request
+// leaves the UI on "Checking…" forever with nothing to click -- which is
+// indistinguishable, to the person looking at it, from the button being dead.
+async function call(url, opts = {}, timeoutMs = 15000) {
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...opts, signal: ctl.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// fetch rejects with a bare "TypeError: Failed to fetch" for every network-layer
+// refusal, so name the causes that actually happen instead of echoing that.
+function diagnose(e) {
+  if (e && e.name === "AbortError") {
+    return "Timed out after 15s with no reply. RunPod may be slow, or the network is blocking it.";
+  }
+  if (location.protocol === "file:") {
+    return "The browser refused the request. Safari and Firefox block cross-origin " +
+           "requests from file:// pages; Chrome allows them. Either open this in Chrome, " +
+           "or serve the folder over http — run <code>python3 -m http.server 8000</code> " +
+           "in this file's directory and open <code>http://localhost:8000</code>.";
+  }
+  return "Network request failed — check the endpoint id, the key, and your connection. " +
+         "(" + String(e) + ")";
 }
 
 // RunPod returns plain text for some errors (403/404 from the gateway), so never
@@ -199,9 +231,9 @@ async function readBody(res) {
 // ---- health ----------------------------------------------------------------
 $("check").onclick = async () => {
   const c = creds(); if (!c) return;
-  say("Checking…", "run");
+  say("Checking…", "run", "contacting api.runpod.ai");
   try {
-    const res = await fetch(`${API}/${c.ep}/health`, { headers: c.h });
+    const res = await call(`${API}/${c.ep}/health`, { headers: c.h });
     const body = await readBody(res);
     if (!res.ok) return say(`Health check failed — HTTP ${res.status}`, "bad",
       typeof body._raw === "string" ? body._raw.slice(0, 200) : JSON.stringify(body));
@@ -213,7 +245,7 @@ $("check").onclick = async () => {
       `completed ${j.completed ?? 0}, failed ${j.failed ?? 0}`);
     $("raw").textContent = JSON.stringify(body, null, 2);
   } catch (e) {
-    say("Could not reach RunPod", "bad", String(e));
+    say("Could not reach RunPod", "bad", diagnose(e));
   }
 };
 
@@ -254,9 +286,9 @@ $("go").onclick = async () => {
   timer = setInterval(() => { if (currentJob) say(lastMsg, "run", lastPhase); }, 250);
 
   try {
-    const res = await fetch(`${API}/${c.ep}/run`, {
-      method: "POST", headers: c.h, body: JSON.stringify(payload),
-    });
+    const res = await call(`${API}/${c.ep}/run`, {
+      method: "POST", headers: c.hp, body: JSON.stringify(payload),
+    }, 30000);
     const body = await readBody(res);
     if (!res.ok || !body.id) {
       return finish(`Submit failed — HTTP ${res.status}`, "bad",
@@ -265,14 +297,14 @@ $("go").onclick = async () => {
     currentJob = body.id;
     await poll(c, body.id);
   } catch (e) {
-    finish("Request failed", "bad", String(e));
+    finish("Request failed", "bad", diagnose(e));
   }
 };
 
 $("cancel").onclick = async () => {
   const c = creds(); if (!c || !currentJob) return;
   cancelled = true;
-  try { await fetch(`${API}/${c.ep}/cancel/${currentJob}`, { method: "POST", headers: c.h }); } catch {}
+  try { await call(`${API}/${c.ep}/cancel/${currentJob}`, { method: "POST", headers: c.h }); } catch {}
   finish("Cancelled", "bad", "");
 };
 
@@ -287,7 +319,7 @@ async function poll(c, id) {
     delay = Math.min(delay * 1.2, 3000);
     let body;
     try {
-      const res = await fetch(`${API}/${c.ep}/status/${id}`, { headers: c.h });
+      const res = await call(`${API}/${c.ep}/status/${id}`, { headers: c.h });
       body = await readBody(res);
       if (!res.ok) return finish(`Status check failed — HTTP ${res.status}`, "bad", JSON.stringify(body).slice(0, 300));
     } catch (e) { lastMsg = "Network blip, retrying…"; continue; }
