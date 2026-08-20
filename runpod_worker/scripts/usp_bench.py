@@ -51,6 +51,10 @@ PROMPT = (
 #: Attention modes WanGP honours ONLY as a per-generation override, never as a
 #: global mode (shared/attention.py:28-33 keeps them out of get_attention_modes).
 OVERRIDE_ONLY_MODES = ("sol",)
+#: Local copy of runpod_worker.config.CLI_ATTENTION_MODES -- needed BEFORE
+#: that module may be imported (see the freeze note in main()). A drift
+#: assert below keeps the two in sync.
+BENCH_CLI_ATTENTION_MODES = ("auto", "sdpa", "sage", "sage2", "flash", "xformers")
 
 ACCEL_PROFILE = "Turbo Lightx2v FL2V 4 Steps v1.0 768p"
 RESOLUTION = "832x480"
@@ -96,16 +100,17 @@ def main() -> int:
     rank = int(os.environ.get("RANK", "0"))
     tag = args.tag or (f"usp{world}" if world > 1 else f"single-{args.attention}")
 
-    # Config must be pinned before runpod_worker.config / wgp import.
+    # EVERY knob must be pinned into os.environ before runpod_worker.config is
+    # imported: `CONFIG = WorkerConfig()` runs at import time and freezes
+    # cli_args / model_config for the process lifetime. Importing it even once
+    # -- e.g. just to read CLI_ATTENTION_MODES -- locks in whatever the image
+    # baked (ENV WANGP_CLI_ARGS="--attention sdpa --profile 4 --verbose 1"),
+    # and every later os.environ write is silently ignored. That bug voided a
+    # whole matrix: --attention sage2, --compile and --config fp8mix legs all
+    # ran plain sdpa/no-compile/fp16 while reporting their own tag. Hence the
+    # local copy of the whitelist below and the reload_config() assertions.
     os.environ["WANGP_ATTENTION"] = args.attention
     os.environ["WANGP_PROFILE"] = str(args.profile)
-    # "sol" is config-only: wgp.py:3303 rejects it as a CLI value, so pass it
-    # through WANGP_ATTENTION (-> wgp_config.json) with no --attention flag.
-    # NOTE: runpod_worker.config must NOT be imported before this point --
-    # it builds its CONFIG singleton at import time, so an early import
-    # silently freezes the DEFAULT profile/attention (a bench run reported
-    # "profile 1" while actually running profile 4: vram_peak 5.6 GB, not 25).
-    from runpod_worker.config import CLI_ATTENTION_MODES  # noqa: PLC0415
 
     # Measured: a "sol" leg ran at SDPA speed and never printed
     # "[MiniMax H3] Sol-Attn enabled" -- WanGP ignores sol as a global mode and
@@ -123,10 +128,30 @@ def main() -> int:
     cli = f"--profile {args.profile} --verbose 1"
     if args.compile:
         cli += " --compile"
-    if os.environ["WANGP_ATTENTION"] in CLI_ATTENTION_MODES:
+    # "sol" is config-only: wgp.py:3303 rejects it as a CLI value, so it must
+    # reach wgp through WANGP_ATTENTION -> wgp_config.json with no --attention.
+    if os.environ["WANGP_ATTENTION"] in BENCH_CLI_ATTENTION_MODES:
         cli = f"--attention {os.environ['WANGP_ATTENTION']} " + cli
     os.environ["WANGP_CLI_ARGS"] = cli
     os.environ.setdefault("WANGP_EAGER_BOOT", "0")
+
+    # Only NOW may config be imported. reload_config() makes the singleton
+    # match the env even if some earlier import already built it.
+    from runpod_worker import config as _cfg  # noqa: PLC0415
+
+    assert _cfg.CLI_ATTENTION_MODES == BENCH_CLI_ATTENTION_MODES, (
+        "runpod_worker.config.CLI_ATTENTION_MODES drifted from the bench copy: "
+        f"{_cfg.CLI_ATTENTION_MODES} != {BENCH_CLI_ATTENTION_MODES}"
+    )
+    live = _cfg.reload_config()
+    # Hard-fail rather than silently benchmark the wrong thing.
+    assert list(live.cli_args) == cli.split(), (
+        f"CONFIG.cli_args={list(live.cli_args)} does not match the requested "
+        f"{cli.split()} -- config was frozen before the env was pinned"
+    )
+    assert live.model_config == args.config.rstrip(","), (
+        f"CONFIG.model_config={live.model_config!r} != requested {args.config!r}"
+    )
 
     if world > 1:
         from models.minimax_h3 import usp
@@ -172,8 +197,13 @@ def main() -> int:
                 return
 
             def probing(qkv_list, *a, **kw):
-                _kernel.setdefault("mode", offload.shared_state.get("_attention"))
-                _kernel.setdefault("via", label)
+                # Record PER MODULE, not first-call-wins: the TokenRefiner
+                # (transformer.py) fires before the first DiT block, so a
+                # setdefault here reports the refiner's kernel and hides the
+                # 50 blocks that actually dominate the step time.
+                _kernel.setdefault("by_module", {}).setdefault(
+                    label, offload.shared_state.get("_attention")
+                )
                 return original(qkv_list, *a, **kw)
 
             module.pay_attention = probing
@@ -188,7 +218,12 @@ def main() -> int:
             _kernel["mode"] = f"probe_failed: {exc!r}"
 
     def probe_attention():
-        return _kernel.get("mode")
+        """The DiT's kernel, not the TokenRefiner's: sol_attention.py is the
+        module MiniMax H3's 50 blocks route through."""
+        if "mode" in _kernel:          # probe_failed sentinel
+            return _kernel["mode"]
+        by_module = _kernel.get("by_module") or {}
+        return by_module.get("sol_attention") or by_module.get("transformer")
 
     effective = installed = supported = None
     try:
@@ -246,7 +281,7 @@ def main() -> int:
         # in the shipped stream log (profile 1 pins transformer + text encoder
         # + VAEs, ~51 GB; profile 4 pins only the transformer, ~20 GB).
         run["effective_attention"] = probe_attention()
-        run["attention_via"] = _kernel.get("via")
+        run["attention_via"] = dict(_kernel.get("by_module") or {})
         # The tail (VAE decode + mux) is the metric for codec changes: denoise
         # variance on a shared host swamped a 29.6s-vs-32.9s control pair, but
         # decoding -> video_saved isolates exactly what an encoder swap moves.
@@ -266,11 +301,20 @@ def main() -> int:
                "attention": args.attention,
                "effective_attention": effective, "attention_ok": attention_ok,
                "installed_attention": installed, "supported_attention": supported,
+               # The knobs as wgp ACTUALLY received them. Without this the
+               # config-freeze bug (see main()) silently mislabels a whole
+               # matrix -- the tag says sage2/compile/fp8mix, the run is sdpa.
+               "cli_args": list(live.cli_args), "model_config": live.model_config,
                "profile": str(args.profile), "world": world, "boot_s": boot_s, "runs": runs}
     if rank == 0:
         print("BENCH_SUMMARY " + json.dumps(summary), flush=True)
         _ship(summary)
     failed = any(r["status"] != "completed" for r in runs)
+    if not attention_ok:
+        # A leg whose kernel silently fell back is not a result, it is noise.
+        print(f"BENCH_ATTENTION_MISMATCH requested={args.attention} "
+              f"effective={effective}", file=sys.stderr, flush=True)
+        failed = True
     return 1 if failed else 0
 
 
