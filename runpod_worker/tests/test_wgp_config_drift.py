@@ -724,3 +724,35 @@ def test_sol_is_config_only_attention_mode():
             assert "3303" in str(exc)
         else:  # pragma: no cover
             raise AssertionError("--attention sol must be refused before wgp sees it")
+
+
+def test_video_output_codec_is_worker_owned_and_nvenc_exists():
+    """The mux is the largest CPU cost in a job and WanGP defaults it to
+    libx264 at CRF 10 (near-lossless). The worker pins
+    server_config['video_output_codec'] (consumed at wgp.py:8123) so an
+    endpoint can move encoding onto the GPU's NVENC block."""
+    import os
+    from unittest import mock
+
+    from runpod_worker import config as C
+
+    keys = C.authoritative_keys(())
+    assert keys["video_output_codec"] == "libx264_8", "default must stay WanGP's"
+    with mock.patch.dict(os.environ, {"WANGP_VIDEO_CODEC": "h264_nvenc"}, clear=False):
+        assert C.authoritative_keys(())["video_output_codec"] == "h264_nvenc"
+
+    # ...and the key must resolve to a real ffmpeg encoder, not silently fall
+    # back to libx264 (which would make an NVENC benchmark meaningless).
+    # Loaded BY PATH: importing shared.utils drags in numpy via fm_solvers, and
+    # this suite is deliberately numpy-free.
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "wangp_video_codecs", REPO_ROOT / "shared" / "utils" / "video_codecs.py")
+    codecs = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(codecs)
+
+    codec, _pixfmt, params = codecs._get_video_codec_spec("h264_nvenc", "mp4")
+    assert codec == "h264_nvenc" and "-cq" in params
+    # the default must be untouched
+    assert codecs._get_video_codec_spec("libx264_8", "mp4")[0] == "libx264"
