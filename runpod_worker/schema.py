@@ -308,6 +308,7 @@ _PRIMARY_SETTINGS_KEYS: tuple[str, ...] = (
     "alt_prompt",
     "alt_scale",
     "apg_switch",
+    "attention_sparsity",
     "audio_guidance_scale",
     "audio_guide",
     "audio_guide2",
@@ -471,7 +472,10 @@ _MINIMAX_H3_COMMON: dict[str, Any] = {
     "spectrum_cache": True,
     "first_block_cache": True,
     "first_block_cache_thresholds": FIRST_BLOCK_CACHE_THRESHOLDS,
-    "sample_solvers": [("Euler", "euler"), ("RES Multistep", "res_multistep")],
+    # upstream 238e25f added Ralston 2S: two full transformer predictions per
+    # step, so ~2x slower than Euler at the same step count.
+    "sample_solvers": [("Euler", "euler"), ("RES Multistep", "res_multistep"),
+                      ("Ralston 2S (~2x slower)", "ralston_2s")],
     "no_negative_prompt": True,
     "returns_audio": True,
     "multimedia_generation": True,
@@ -520,8 +524,13 @@ _FL2VA_MODEL_DEF: dict[str, Any] = {
 
 _REF2VA_MODEL_DEF: dict[str, Any] = {
     **_MINIMAX_H3_COMMON,
-    # minimax_h3_handler.py:251 -- the only variant with an upper frame bound.
-    "frames_maximum": 737,
+    # minimax_h3_handler.py:258 -- upstream 238e25f renamed this from
+    # "frames_maximum" and demoted it to a UI-only slider bound (wgp.py:11897).
+    # The headless path no longer reads it at all: shared/api.py:109-118 derives
+    # its maximum from the sliding-window default instead. Keep declaring it so
+    # the cap message can still cite the model's own number, but WANGP_MAX_FRAMES
+    # is now the ONLY real bound for Ref2VA as well as FL2VA.
+    "frames_selection_maximum": 737,
     # minimax_h3_handler.py:265-279 -- "PDEV+-" for the guide, "KI" for refs.
     "guide_custom_choices": {"letters_filter": "PDEV+-", "default": ""},
     "image_ref_choices": {"letters_filter": "KI", "default": ""},
@@ -1736,7 +1745,7 @@ DEFAULT_MAX_FRAMES = 362
 def _worker_frame_cap(cfg: Any) -> int:
     """The endpoint's ``video_length`` ceiling, never 0.
 
-    ``0`` is NOT "unlimited": FL2VA declares no ``frames_maximum`` anywhere in
+    ``0`` is NOT "unlimited": FL2VA declares no frame maximum anywhere in
     the headless path, so an uncapped endpoint lets one request schedule
     hundreds of sliding windows on a billed GPU. A non-positive or unparseable
     value therefore falls back to :data:`DEFAULT_MAX_FRAMES` rather than
@@ -1770,15 +1779,16 @@ def _validate_frames(
     ``wgp.py:6929``; we do it here so the ``resolved`` block we return is the
     truth rather than the request.
 
-    ``frames_maximum`` exists ONLY for Ref2VA (=737,
-    ``minimax_h3_handler.py:251``). FL2VA has no upper bound anywhere in the
+    ``frames_selection_maximum`` exists ONLY for Ref2VA (=737,
+    ``minimax_h3_handler.py:258``) and, since upstream 238e25f, bounds only the
+    gradio slider (``wgp.py:11897``). No variant has an upper bound in the
     headless path -- ``validate_settings`` never caps it -- so the worker MUST,
     or one request can schedule hundreds of sliding windows on a billed GPU.
     """
     minimum, step, offset = frame_lattice(mdef)
     fps = float(mdef.get("fps", 24) or 24)
     worker_max = _worker_frame_cap(cfg)
-    model_max = int(mdef.get("frames_maximum") or 0)
+    model_max = int(mdef.get("frames_selection_maximum") or 0)
     hard_max = min(model_max, worker_max) if model_max > 0 else worker_max
     cap = floor_frames(max(minimum, hard_max), minimum, step, offset)
 
@@ -1795,7 +1805,8 @@ def _validate_frames(
             details=[
                 f"legal values are {minimum} then every +{step} frames ({offset} mod {step})",
                 "raise WANGP_MAX_FRAMES to allow longer clips"
-                + (f"; the model's own maximum is {hard_max}" if mdef.get("frames_maximum") else ""),
+                + (f"; the model's own maximum is {hard_max}"
+                   if mdef.get("frames_selection_maximum") else ""),
             ],
         )
     if value != requested:
