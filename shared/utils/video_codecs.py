@@ -1,6 +1,7 @@
 SDR_VIDEO_CODEC_CHOICES = [
     ("H.264 NVENC (GPU, fast)", "h264_nvenc"),
     ("HEVC NVENC (GPU, fast)", "hevc_nvenc"),
+    ("x264 CRF 23 (Web / small files)", "libx264_23"),
     ("x265 CRF 28 (Balanced)", "libx265_28"),
     ("x264 Level 8 (Balanced)", "libx264_8"),
     ("x265 CRF 8 (High Quality)", "libx265_8"),
@@ -50,6 +51,16 @@ def _get_video_codec_spec(codec_key: str | None, container: str | None) -> tuple
         return "h264_nvenc", "yuv420p", ["-preset", "p4", "-cq", "23"]
     if codec_key == "hevc_nvenc":
         return "hevc_nvenc", "yuv420p", ["-preset", "p4", "-cq", "26"]
+    if codec_key == "libx264_23":
+        # For API delivery, not for archival. WanGP's own x264 settings are
+        # crf 10 (near-lossless): a 5 s 832x480 clip lands anywhere from 2.6 MB
+        # to 9.2 MB depending on motion, and base64 inflates by 4/3 against
+        # RunPod's 10 MB payload cap -- so a high-motion prompt fails delivery
+        # while a static one succeeds. crf 23 is the usual web default and keeps
+        # H.264/yuv420p, which every browser can play (x265 in MP4 cannot be
+        # relied on outside Safari). faststart moves the moov atom to the front
+        # so a browser can begin playback without the whole file.
+        return "libx264", "yuv420p", ["-crf", "23", "-movflags", "+faststart"]
     if codec_key == "libx264_8":
         return "libx264", "yuv420p", ["-crf", "10"]
     if codec_key == "libx264_10":
