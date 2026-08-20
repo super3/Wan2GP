@@ -756,6 +756,12 @@ def test_video_output_codec_is_worker_owned_and_nvenc_exists():
     assert codec == "h264_nvenc" and "-cq" in params
     # the default must be untouched
     assert codecs._get_video_codec_spec("libx264_8", "mp4")[0] == "libx264"
+    # libx264_23 exists so API delivery has a codec whose output fits the 10 MB
+    # base64 envelope, and stays H.264/yuv420p so any browser can play it.
+    codec, pixfmt, params = codecs._get_video_codec_spec("libx264_23", "mp4")
+    assert (codec, pixfmt) == ("libx264", "yuv420p")
+    assert params[:2] == ["-crf", "23"] and "+faststart" in params
+    assert ("x264 CRF 23 (Web / small files)", "libx264_23") in codecs.SDR_VIDEO_CODEC_CHOICES
 
 
 def test_nvenc_repoints_imageio_ffmpeg(tmp_path, monkeypatch):
