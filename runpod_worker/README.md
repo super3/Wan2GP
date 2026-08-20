@@ -394,6 +394,88 @@ inferred.
   (hf_transfer), so a cold worker is serving in ~4-5 min with no network volume
   and no datacenter pin.
 
+## Inference tuning (measured 2026-08-20, RTX PRO 6000 Blackwell, 832x480/124f/4 steps)
+
+Five candidate speedups, ranked before testing and then actually measured. Two
+paid, three did not. Every leg was interleaved with its own baseline inside a
+single pod and repeated over two rounds x three seeds; the reason for that
+discipline is finding (g) below.
+
+| # | Change | Verdict | Effect |
+|---|---|---|---|
+| 1 | `torch.compile` (`--compile`) | **loss** | denoise 38.7 -> 22.8 -> 15.5 s over three runs, never reaching the 14.7 s uncompiled baseline; tail worsened 9.2 -> 10.5 s |
+| 2 | Fewer denoise steps | not tested | deliberately out of scope |
+| 3 | fp8 video VAE (`config=",fp8mix"`) | **win** | tail 10.20 -> 8.75 s (-1.45 s, -14%), n=6 each, two rounds |
+| 3b | VAE tile size (`vae_config`) | **null** | 256 px 10.63 / none 10.38 / 512 px 10.17 -- 0.46 s spread, inside noise |
+| 4 | NVENC video encode | **dead** | -0.29 s, i.e. slightly *slower* than x264 |
+| 5 | SageAttention 2 (`--attention sage2`) | **win** | warm job 24.84 -> 23.45 s (-1.39 s); denoise 14.7-14.8 -> 13.3-13.4 s (-9.5%) |
+
+Stacked (sage2 + fp8 VAE), warm job went 31.16 -> 29.05 s on one host: -2.11 s,
+against -2.84 s if the two effects were purely additive.
+
+The findings behind that table, in the order they cost time to learn:
+
+- **(a) `CONFIG` freezes at import, and it silently voided an entire matrix.**
+  `config.py` runs `CONFIG = WorkerConfig()` at module scope, and `cli_args` /
+  `model_config` are captured *there*. The benchmark harness imported the module
+  early -- only to read `CLI_ATTENTION_MODES` -- which locked in the image's
+  baked `ENV WANGP_CLI_ARGS="--attention sdpa --profile 4 --verbose 1"` and made
+  every later `os.environ` write a no-op. The `sage2`, `--compile` and
+  `--config` legs all ran plain sdpa / no-compile / fp16 **while reporting their
+  own tag**. Only the codec knob survived, because `video_output_codec` is read
+  from `os.environ` inside `authoritative_keys()` rather than frozen on the
+  dataclass. The worker had been logging the conflict all along
+  (`attention_mode_conflict env=sage2 cli=sdpa effective=sdpa`); nobody read it.
+  Anything that sets these env vars must do so *before* importing `config`, then
+  call `reload_config()` and assert the result -- `usp_bench.py` now does, and
+  `test_wgp_config_drift.py` pins the import order.
+- **(b) A config selection is positional; the leading comma is load-bearing.**
+  `_CONFIG_GROUP_KEYS` zips the comma-split string against
+  `system_configs` / `system_configs2` / `system_configs3` / `configs`. The fp8
+  video VAE lives in `system_configs2`, i.e. **slot 2**, so the value is
+  `",fp8mix"`. Passing `"fp8mix"` names the *text encoder* slot, where it does
+  not exist, and the model correctly answers `config selection 'fp8mix' is not
+  defined in system_configs`. That error means "wrong slot" far more often than
+  "no such config".
+- **(c) MiniMax H3 tiles its VAE decode on every card, and it does not matter.**
+  `models/minimax_h3/video_vae.py:52-55` accepts `device_mem_capacity` and never
+  reads it: on the default `vae_config=0` it hard-returns a 256 px tile, so a
+  96 GB card peaking at 5.6 GB still decodes tile-by-tile. `WANGP_VAE_CONFIG`
+  exists to override it (1 = no tiling, 2 = 512 px) -- but measured across two
+  pods and twelve runs the knob is worth nothing at this resolution. Keep it for
+  larger frames; do not expect it to pay here.
+- **(d) The tail is essentially all VAE decode.** Swapping the *entire* video
+  encoder for NVENC moved the post-denoise tail by less than 0.3 s (and in the
+  wrong direction). Whatever the ~8-10 s tail is, it is not muxing or H.264, and
+  the only thing that has ever moved it is (3) the fp8 VAE.
+- **(e) There is no fp8/fp16 choice for the VAE beyond that config.**
+  `vae_precision` (`wgp.py:4024`) is 16 or 32, and 16 -- already the default --
+  is the fast one. `system_configs` (`bf16`, `int8`, `nvfp4_awq`, `gguf_*`) are
+  *transformer* quantizations, not VAE precision.
+- **(f) `torch.compile` cannot amortize on a 4-step turbo model.** Three
+  consecutive runs never reached the uncompiled baseline, and on serverless
+  every cold worker repays the cost from scratch. The tail also degraded
+  monotonically, which remains unexplained.
+- **(g) Host-to-host variance on the *same GPU model* exceeds most of these
+  effects.** Two PRO 6000 pods differed by ~25% on the tail (8.1 s vs 10.6 s)
+  with identical images and payloads. Any leg compared against a baseline from a
+  *different* pod is noise dressed as a result. Interleave every leg with its own
+  control inside one pod, run at least two rounds, and pool. A single round is
+  not enough: `vae_config=2` looked like a 0.8 s win in round 1 and gave it all
+  back in round 2.
+- **`sage2` must be set in two places.** `wgp.py:3304-3305` lets the CLI
+  `--attention` overwrite `server_config`, and the image bakes
+  `--attention sdpa`. Setting only `WANGP_ATTENTION=sage2` silently runs sdpa
+  (see (a)); set `WANGP_CLI_ARGS` to match. SageAttention also needs a wheel
+  built for the target architecture -- the one in `artifacts/` is sm_120
+  (Blackwell) only.
+- **`libx264_23` exists for API delivery.** WanGP's `libx264_8` is CRF 10,
+  near-lossless: measured clips ran 2.6 MB (static) to 9.2 MB (high motion),
+  base64 inflates by 4/3, and RunPod caps payloads at 10 MB -- so base64
+  delivery succeeded or failed depending on how much the prompt moved.
+  `WANGP_VIDEO_CODEC=libx264_23` keeps H.264/yuv420p (x265 in MP4 is not
+  playable outside Safari) and adds `+faststart`. A 5.2 s clip lands ~0.4 MB.
+
 ## Environment variables
 
 Everything is env-overridable and everything has a default; the image bakes the values
