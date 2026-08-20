@@ -266,7 +266,9 @@ def _usp_forward(self, video_x, audio_x, sigma_video, sigma_audio, context, payl
     target_audio_rows = audio_t * 2
     video_start = layout.sequence_length - target_video_rows
     audio_start = video_start - target_audio_rows
-    self.sol_attention.begin_forward(layout, device, dtype)
+    # upstream 238e25f ("added sol attn 0.6.2") made tau a required positional:
+    # sol_attention.py:23 begin_forward(self, layout, device, dtype, tau).
+    self.sol_attention.begin_forward(layout, device, dtype, payload["attention_sparsity"])
 
     # ---- USP delta: shard the sequence across ranks --------------------
     _assert_ranks_agree(hidden)
