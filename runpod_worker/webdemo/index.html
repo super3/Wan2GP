@@ -44,6 +44,17 @@
   button.ghost { background: transparent; color: var(--dim); border-color: var(--line); font-weight: 500; margin-top: 8px; padding: 7px; }
   .hint { color: var(--dim); font-size: 11.5px; margin-top: 5px; }
   .hint code { background: #0d0f16; padding: 1px 4px; border-radius: 4px; }
+  .queue {
+    display: flex; align-items: center; gap: 9px; margin: 0 0 10px;
+    padding: 8px 12px; border: 1px solid var(--line); border-radius: 9px;
+    background: var(--panel); font-size: 12.5px; color: var(--dim);
+    font-variant-numeric: tabular-nums;
+  }
+  .queue .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--dim); flex: none; }
+  .queue.busy .dot { background: var(--warn); }
+  .queue.free .dot { background: var(--ok); }
+  .queue.err  .dot { background: var(--bad); }
+  .queue .ago { margin-left: auto; opacity: .65; font-size: 11.5px; }
   #status { margin: 0 0 14px; padding: 11px 13px; border-radius: 9px; border: 1px solid var(--line); background: var(--panel); min-height: 44px; }
   #status.run { border-color: var(--accent); }
   #status.ok { border-color: var(--ok); }
@@ -121,6 +132,11 @@ non_diegetic_music: One soft sustained cello note.</textarea>
   </div>
 
   <div class="col">
+    <div id="queue" class="queue" hidden>
+      <span class="dot" id="qdot"></span>
+      <span id="qtext">checking…</span>
+      <span class="ago" id="qago"></span>
+    </div>
     <div id="status">Idle. Enter an endpoint ID and API key to begin.</div>
     <div class="bar"><i id="fill"></i></div>
     <video id="vid" controls playsinline></video>
@@ -283,6 +299,59 @@ $("check").addEventListener("click", async () => {
   }
 });
 
+// ---- live queue ------------------------------------------------------------
+// The health endpoint is the only view of the queue, and it is exactly what you
+// want while waiting for a job that is not yours to finish. Polled quietly: a
+// failure here must never take over the status box the job flow is using.
+let healthTimer = null, lastHealth = 0;
+
+function renderQueue(body, error) {
+  const box = $("queue");
+  box.hidden = false;
+  if (error) {
+    box.className = "queue err";
+    $("qtext").textContent = "queue unavailable";
+    return;
+  }
+  const j = body.jobs || {}, w = body.workers || {};
+  const pending = (j.inQueue || 0) + (j.inProgress || 0);
+  box.className = "queue " + (pending ? "busy" : "free");
+  const workers = [
+    w.running ? `${w.running} running` : "",
+    w.idle ? `${w.idle} idle` : "",
+    w.initializing ? `${w.initializing} starting` : "",
+    w.throttled ? `${w.throttled} throttled` : "",
+  ].filter(Boolean).join(", ") || "no workers";
+  $("qtext").textContent = pending
+    ? `${pending} job${pending === 1 ? "" : "s"} pending (${j.inQueue || 0} queued, ` +
+      `${j.inProgress || 0} running) — ${workers}`
+    : `queue empty — ${workers}`;
+  lastHealth = Date.now();
+}
+
+async function pollHealth() {
+  const ep = $("ep").value.trim(), key = $("key").value.trim();
+  if (!ep || !key) { $("queue").hidden = true; return; }
+  try {
+    const res = await call(`${API}/${ep}/health`, { headers: { Authorization: "Bearer " + key } }, 10000);
+    renderQueue(await readBody(res), !res.ok);
+  } catch { renderQueue(null, true); }
+}
+
+function startHealthPolling() {
+  if (healthTimer) return;
+  pollHealth();
+  healthTimer = setInterval(pollHealth, 10000);
+}
+setInterval(() => {
+  if (!lastHealth || $("queue").hidden) return;
+  const secs = Math.round((Date.now() - lastHealth) / 1000);
+  $("qago").textContent = secs < 2 ? "just now" : `${secs}s ago`;
+}, 1000);
+startHealthPolling();
+$("ep").addEventListener("change", pollHealth);
+$("key").addEventListener("change", pollHealth);
+
 // ---- generate --------------------------------------------------------------
 $("go").addEventListener("click", async () => {
   const c = creds(); if (!c) return;
@@ -329,6 +398,7 @@ $("go").addEventListener("click", async () => {
         typeof body._raw === "string" ? body._raw.slice(0, 300) : JSON.stringify(body));
     }
     currentJob = body.id;
+    pollHealth();
     await poll(c, body.id);
   } catch (e) {
     finish("Request failed", "bad", diagnose(e));
@@ -437,6 +507,7 @@ function finish(msg, cls, phase) {
   currentJob = null;
   say(msg, cls, phase);
   if (cls !== "ok") fill(0);
+  pollHealth();
 }
 </script>
 </body>
