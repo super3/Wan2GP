@@ -1,4 +1,6 @@
 SDR_VIDEO_CODEC_CHOICES = [
+    ("H.264 NVENC (GPU, fast)", "h264_nvenc"),
+    ("HEVC NVENC (GPU, fast)", "hevc_nvenc"),
     ("x265 CRF 28 (Balanced)", "libx265_28"),
     ("x264 Level 8 (Balanced)", "libx264_8"),
     ("x265 CRF 8 (High Quality)", "libx265_8"),
@@ -40,6 +42,14 @@ def get_video_container_extension(container: str | None) -> str:
 def _get_video_codec_spec(codec_key: str | None, container: str | None) -> tuple[str, str, list[str]]:
     codec_key = normalize_video_codec(codec_key)
     container = normalize_video_container(container)
+    if codec_key == "h264_nvenc":
+        # Hardware encoder: uses the GPU's dedicated NVENC block, which is idle
+        # during generation and does not compete with the tensor cores. p4 is a
+        # mid-speed preset; cq 23 is visually equivalent to x264 crf ~20 here.
+        # NOTE: A100 and H100 have NO NVENC silicon -- they fall back below.
+        return "h264_nvenc", "yuv420p", ["-preset", "p4", "-cq", "23"]
+    if codec_key == "hevc_nvenc":
+        return "hevc_nvenc", "yuv420p", ["-preset", "p4", "-cq", "26"]
     if codec_key == "libx264_8":
         return "libx264", "yuv420p", ["-crf", "10"]
     if codec_key == "libx264_10":

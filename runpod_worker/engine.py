@@ -954,6 +954,13 @@ def run(
                     line = f"{getattr(data, 'stream', '?')}: {getattr(data, 'text', data)}"[:512]
                     tail.append(line)
                     LOG.debug("wangp_stream", line=line)
+                    # The tail of a job is VAE decode THEN encode/mux, and the
+                    # phase marks lump them together. wgp prints this line the
+                    # moment save_video() returns, so marking it splits the two:
+                    # video_saved - decoding = VAE decode + encode; total -
+                    # video_saved = delivery. Cheap: one substring test per line.
+                    if "video_saved" not in phase_marks and "New video saved" in line:
+                        phase_marks["video_saved"] = round(now - t0, 1)
 
                 elif kind == "progress":
                     progress_events += 1
