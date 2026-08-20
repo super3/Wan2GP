@@ -1226,6 +1226,26 @@ changes that would otherwise break boot or open a file-read hole.
 
 ---
 
+### After cloning: install the secret guard
+
+```bash
+python3 runpod_worker/scripts/install_hooks.py     # --check to verify
+```
+
+Installs a `pre-commit` hook that blocks credential-shaped content in the lines
+you are adding. It reports the rule and a redacted fragment, never the value --
+findings land in terminal scrollback and CI logs, which are stored.
+
+This matters more than a normal lint: a pushed key is compromised at the moment
+of the push, and reverting the commit does not un-publish it. Rotation is the
+only remedy, so the guard has to fire *before* the commit, not after.
+
+`.git/hooks` is not version controlled, which is why the same scanner runs as
+the `secret-guard` job in `worker-ci.yml` over each PR's diff -- the hook is the
+fast local check, CI is the one that holds for everyone. False positives take a
+`# pragma: allowlist secret` comment on the line; a deliberate bypass is
+`git commit --no-verify`.
+
 ## Cost notes (estimates)
 
 > **Everything in this section is an estimate, not a measurement.** Nothing in this repo
@@ -1297,6 +1317,8 @@ in this repo**; a Ref2VA endpoint runs at 20 steps.
 | `scripts/verify_weights.py` | Pre-deploy gate; the same enumeration the boot fitness check runs. |
 | `scripts/calibrate.py` | Timing matrix → measured timeout and cost numbers. |
 | `scripts/patch_sage_setup.py` | Build-time: pins SageAttention's target architectures without a GPU present. |
+| `scripts/secret_guard.py` | Refuses to commit credentials. Scans only ADDED lines, redacts what it reports, honours a `pragma: allowlist secret` marker. Also run by CI over the PR diff. |
+| `scripts/install_hooks.py` | Installs `secret_guard.py` as this clone's `pre-commit` hook. `.git/hooks` is not version controlled, so every clone opts in separately. |
 | `scripts/usp_bench.py` | Benchmark harness: drives `handler.run_job` directly for single-GPU attention/codec/VAE legs and multi-GPU USP. Pins every env var **before** importing `config` and asserts the result — see finding (a) in Inference tuning. |
 | `scripts/test_usp_gloo.py` | 2-process gloo proof that Ulysses SP is numerically exact vs full SDPA. Needs torch, so it is not in the CPU suite. |
 | `webdemo/index.html` | Single-file browser tester for a live endpoint: paste endpoint id + API key, submit, poll, play. No build step and no server — `api.runpod.ai` sends `access-control-allow-origin: *`. The tracked copy keeps `DEFAULT_KEY` empty on purpose. |
