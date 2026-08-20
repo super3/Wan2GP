@@ -64,6 +64,38 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Runs on its own and first: a leaked credential is the one CI finding that
+  # cannot be fixed by a follow-up commit -- pushing it is the disclosure, and
+  # rotation is the only remedy. The pre-commit hook
+  # (runpod_worker/scripts/install_hooks.py) catches it earlier, but .git/hooks
+  # is not version controlled, so this job is what actually holds for everyone.
+  secret-guard:
+    name: no credentials in the diff
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The scanner diffs against the base, so it needs history, not a
+          # depth-1 checkout.
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Scan the added lines
+        run: |
+          BASE="${{ github.event.pull_request.base.sha || github.event.before }}"
+          if [ -z "$BASE" ] || [ "$BASE" = "0000000000000000000000000000000000000000" ]; then
+            echo "no base commit to diff against; scanning the whole worker tree"
+            python3 runpod_worker/scripts/secret_guard.py \
+              $(git ls-files 'runpod_worker/*' '.github/*' 'docs/*')
+          else
+            echo "scanning $BASE..${{ github.sha }}"
+            python3 runpod_worker/scripts/secret_guard.py --range "$BASE..${{ github.sha }}"
+          fi
+
   tests:
     name: cpu tests (py${{ matrix.python-version }})
     runs-on: ubuntu-latest
