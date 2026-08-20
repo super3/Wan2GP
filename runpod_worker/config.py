@@ -298,7 +298,12 @@ def authoritative_keys(cli_args=()) -> dict:
         "notification_sound_enabled": 0,   # also forced by shared/api.py:817
         "save_queue_if_crash": 0,
         "video_container": "mp4",          # wgp.py:3333 default
-        "video_output_codec": "libx264_8", # wgp.py:3331 default
+        # wgp.py:8123 hands server_config["video_output_codec"] to save_video.
+        # WanGP's default is CPU x264 at CRF 10 -- near-lossless, and the single
+        # largest CPU cost in a job. "h264_nvenc" moves encoding onto the GPU's
+        # dedicated NVENC block, which is idle during generation (note: A100 and
+        # H100 have no NVENC).
+        "video_output_codec": os.environ.get("WANGP_VIDEO_CODEC", "libx264_8"),
         "audio_output_codec": "aac_128",   # wgp.py:3339 default
         # shared/api.py:816-831 rewrites these three from `output_dir` on every
         # run anyway; writing them keeps the file honest if output_dir is None.
