@@ -190,3 +190,14 @@ def test_webdemo_requests_are_bounded():
     assert "AbortController" in html, "a fetch with no timeout hangs the UI silently"
     assert html.count("await call(") >= 4, "every request must go through call()"
     assert 'type="button"' in html, "a bare <button> defaults to submit"
+
+
+def test_webdemo_polls_the_queue_without_hijacking_the_status_box():
+    """The health endpoint is the only view of the queue, and it is what you want
+    while waiting on a job. It polls on a timer, so a failure must render into
+    its own strip rather than overwriting whatever the job flow is showing."""
+    html = DEMO.read_text()
+    assert 'id="queue"' in html and "setInterval(pollHealth" in html
+    body = html[html.index("async function pollHealth"):html.index("function startHealthPolling")]
+    assert "say(" not in body, "pollHealth must not write to the shared status box"
+    assert "renderQueue(null, true)" in body, "a failed poll must degrade, not throw"
