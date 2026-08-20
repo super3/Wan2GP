@@ -145,3 +145,48 @@ def test_installer_and_guard_are_executable():
         path = REPO / "runpod_worker" / "scripts" / name
         assert path.is_file(), f"{name} missing"
         assert path.read_text().startswith("#!"), f"{name} needs a shebang"
+
+
+# ---------------------------------------------------------------------------
+# webdemo: the page must survive a sandbox with no storage
+# ---------------------------------------------------------------------------
+
+DEMO = REPO / "runpod_worker" / "webdemo" / "index.html"
+
+
+def test_webdemo_defaults_live_in_the_markup():
+    """A sandboxed iframe throws SecurityError on the localStorage *getter*, and
+    that once took the whole script down: the prompt came up empty and every
+    button was dead. Defaults therefore belong in the HTML, where no JS failure
+    can reach them."""
+    html = DEMO.read_text()
+    assert 'id="ep" value="' in html, "endpoint id must be a value= attribute, not JS-assigned"
+    start = html.index('<textarea id="prompt"')
+    body = html[start:html.index("</textarea>", start)]
+    assert "integrated_multimodal_description:" in body, "sample prompt must be in the markup"
+    assert "overall_soundscape:" in body
+
+
+def test_webdemo_never_touches_localstorage_outside_the_shim():
+    """Any bare localStorage reference outside store() reintroduces the crash."""
+    html = DEMO.read_text()
+    shim_start = html.index("const store = (() => {")
+    shim_end = html.index("})();", shim_start)
+    outside = html[:shim_start] + html[shim_end:]
+    # Prose and comments may name it; only real property access is the hazard.
+    for call in ("localStorage.getItem", "localStorage.setItem",
+                 "localStorage.removeItem", "localStorage["):
+        assert call not in outside, (
+            f"{call} outside the store() shim -- a bare reference throws in a "
+            "sandboxed frame and kills every handler defined after it"
+        )
+    assert html.count("window.localStorage") == 1, (
+        "the shim's guarded probe must be the only window.localStorage access"
+    )
+
+
+def test_webdemo_requests_are_bounded():
+    html = DEMO.read_text()
+    assert "AbortController" in html, "a fetch with no timeout hangs the UI silently"
+    assert html.count("await call(") >= 4, "every request must go through call()"
+    assert 'type="button"' in html, "a bare <button> defaults to submit"
