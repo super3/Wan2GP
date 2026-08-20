@@ -80,6 +80,9 @@ def main() -> int:
     parser.add_argument("--profile", default=os.environ.get("WANGP_PROFILE", "1"))
     parser.add_argument("--seeds", default="12345,5555")
     parser.add_argument("--tag", default="")
+    #: The frame lattice is video_length >= 107 and == 5 (mod 17), so only
+    #: 107 + 17k is legal (124 = 5.2 s, 243 = 10.1 s at 24 fps).
+    parser.add_argument("--frames", type=int, default=VIDEO_LENGTH)
     args = parser.parse_args()
 
     world = int(os.environ.get("WORLD_SIZE", "1"))
@@ -162,7 +165,7 @@ def main() -> int:
                     {
                         "prompt": PROMPT,
                         "resolution": RESOLUTION,
-                        "video_length": VIDEO_LENGTH,
+                        "video_length": args.frames,
                         "seed": seed,
                     },
                     **({"override_attention": override_attention} if override_attention else {}),
@@ -200,7 +203,8 @@ def main() -> int:
 
     effective = runs[-1].get("effective_attention") if runs else None
     attention_ok = effective == args.attention
-    summary = {"event": "usp_bench_summary", "tag": tag, "attention": args.attention,
+    summary = {"event": "usp_bench_summary", "tag": tag, "frames": args.frames,
+               "attention": args.attention,
                "effective_attention": effective, "attention_ok": attention_ok,
                "installed_attention": installed, "supported_attention": supported,
                "profile": str(args.profile), "world": world, "boot_s": boot_s, "runs": runs}
