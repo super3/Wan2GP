@@ -37,6 +37,7 @@ __all__ = [
     "render_wgp_config",
     "authoritative_keys",
     "ensure_wgp_config",
+    "ensure_ffmpeg_supports_codec",
     "ensure_hf_transfer_sane",
     "WorkerConfig",
     "CONFIG",
@@ -312,6 +313,54 @@ def authoritative_keys(cli_args=()) -> dict:
         "audio_save_path": str(OUTPUT_DIR),
     }
 
+
+
+def ensure_ffmpeg_supports_codec() -> str:
+    """Point imageio at an ffmpeg that can actually run the requested encoder.
+
+    Measured on a PRO 6000 pod (2026-08-20): with
+    ``WANGP_VIDEO_CODEC=h264_nvenc`` every job died with
+
+        FFmpeg error: ... _tmp.mp4: No such file or directory
+
+    The system ffmpeg lists ``h264_nvenc`` -- but that is NOT the binary that
+    writes the video. ``save_video`` goes through ``imageio_ffmpeg``, which
+    ships its OWN static build (``imageio_ffmpeg/binaries/ffmpeg-linux-x86_64``)
+    compiled WITHOUT NVENC. It failed to produce the file, and the confusing
+    error came from the *later* audio-mux step looking for a file that was
+    never written.
+
+    ``imageio_ffmpeg`` honours ``IMAGEIO_FFMPEG_EXE``, so when an nvenc codec is
+    requested this points it at a system ffmpeg that advertises the encoder.
+    Returns "unset" (no nvenc requested), "preset" (operator already chose a
+    binary), "system" (repointed), or "unavailable" (no ffmpeg has it -- the
+    caller should fall back rather than fail every job).
+    """
+    codec = os.environ.get("WANGP_VIDEO_CODEC", "")
+    if "nvenc" not in codec.lower():
+        return "unset"
+    if os.environ.get("IMAGEIO_FFMPEG_EXE"):
+        return "preset"
+    import shutil
+    import subprocess
+
+    for candidate in ("ffmpeg", "/usr/bin/ffmpeg", "/usr/local/bin/ffmpeg"):
+        path = shutil.which(candidate) if "/" not in candidate else (
+            candidate if os.path.exists(candidate) else None)
+        if not path:
+            continue
+        try:
+            out = subprocess.run([path, "-hide_banner", "-encoders"],
+                                 capture_output=True, text=True, timeout=15).stdout
+        except Exception:  # noqa: BLE001 - a missing/odd ffmpeg must not fail boot
+            continue
+        if codec.lower() in out.lower():
+            os.environ["IMAGEIO_FFMPEG_EXE"] = path
+            LOG.info("imageio_ffmpeg_repointed", path=path, codec=codec)
+            return "system"
+    LOG.warn("ffmpeg_codec_unavailable", codec=codec,
+             note="no ffmpeg on PATH advertises it; imageio's bundled build has no NVENC")
+    return "unavailable"
 
 
 def ensure_hf_transfer_sane() -> str:
