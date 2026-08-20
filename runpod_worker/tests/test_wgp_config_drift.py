@@ -791,3 +791,42 @@ def test_nvenc_repoints_imageio_ffmpeg(tmp_path, monkeypatch):
     monkeypatch.setenv("IMAGEIO_FFMPEG_EXE", "/opt/custom/ffmpeg")
     assert C.ensure_ffmpeg_supports_codec() == "preset"
     assert os.environ["IMAGEIO_FFMPEG_EXE"] == "/opt/custom/ffmpeg"
+
+
+# ---------------------------------------------------------------------------
+# usp_bench.py env-pinning order
+# ---------------------------------------------------------------------------
+
+
+def _bench_source() -> str:
+    return (REPO_ROOT / "runpod_worker" / "scripts" / "usp_bench.py").read_text()
+
+
+def test_bench_pins_env_before_importing_config():
+    """``config.CONFIG = WorkerConfig()`` runs at import and freezes cli_args /
+    model_config. usp_bench.py must therefore write every env var BEFORE it
+    imports the module -- an earlier import silently benchmarks the image's
+    baked ``--attention sdpa --profile 4``. That bug voided a full matrix:
+    sage2, --compile and --config fp8mix legs all ran plain sdpa/fp16 while
+    reporting their own tag."""
+    src = _bench_source()
+    pin = src.index('os.environ["WANGP_CLI_ARGS"] = cli')
+    imports = [src.index(m) for m in ("from runpod_worker import config as _cfg",)]
+    assert all(pin < i for i in imports), (
+        "usp_bench.py imports runpod_worker.config before WANGP_CLI_ARGS is set; "
+        "CONFIG freezes at import, so the bench would measure the baked defaults"
+    )
+    assert "reload_config()" in src, "the bench must rebuild CONFIG from the pinned env"
+    assert "assert list(live.cli_args) == cli.split()" in src, (
+        "the bench must hard-fail when CONFIG does not match the requested knobs"
+    )
+
+
+def test_bench_attention_whitelist_matches_config():
+    """The bench keeps a local copy of CLI_ATTENTION_MODES (it cannot import
+    config that early). Pin the values so the copy cannot drift silently."""
+    from runpod_worker.config import CLI_ATTENTION_MODES
+
+    src = _bench_source()
+    literal = src.split("BENCH_CLI_ATTENTION_MODES = ")[1].split("\n")[0]
+    assert ast.literal_eval(literal) == CLI_ATTENTION_MODES
