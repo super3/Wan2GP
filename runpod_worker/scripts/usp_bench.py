@@ -83,6 +83,13 @@ def main() -> int:
     #: The frame lattice is video_length >= 107 and == 5 (mod 17), so only
     #: 107 + 17k is legal (124 = 5.2 s, 243 = 10.1 s at 24 fps).
     parser.add_argument("--frames", type=int, default=VIDEO_LENGTH)
+    #: torch.compile the transformer (wgp.py:3316 --compile -> compile="transformer").
+    parser.add_argument("--compile", action="store_true")
+    #: WanGP "config selection" string, e.g. "fp8mix" for the FP8 video VAE
+    #: (minimax_h3_handler.py:237). Comma-separated for several.
+    parser.add_argument("--config", default="")
+    #: server_config["video_output_codec"]: libx264_8 (default) | h264_nvenc | ...
+    parser.add_argument("--codec", default="")
     args = parser.parse_args()
 
     world = int(os.environ.get("WORLD_SIZE", "1"))
@@ -108,7 +115,14 @@ def main() -> int:
         override_attention = args.attention
         os.environ["WANGP_ATTENTION"] = "sdpa"
 
+    if args.config:
+        os.environ["WANGP_MODEL_CONFIG"] = args.config
+    if args.codec:
+        os.environ["WANGP_VIDEO_CODEC"] = args.codec
+
     cli = f"--profile {args.profile} --verbose 1"
+    if args.compile:
+        cli += " --compile"
     if os.environ["WANGP_ATTENTION"] in CLI_ATTENTION_MODES:
         cli = f"--attention {os.environ['WANGP_ATTENTION']} " + cli
     os.environ["WANGP_CLI_ARGS"] = cli
@@ -204,6 +218,7 @@ def main() -> int:
     effective = runs[-1].get("effective_attention") if runs else None
     attention_ok = effective == args.attention
     summary = {"event": "usp_bench_summary", "tag": tag, "frames": args.frames,
+               "compile": bool(args.compile), "config": args.config, "codec": args.codec,
                "attention": args.attention,
                "effective_attention": effective, "attention_ok": attention_ok,
                "installed_attention": installed, "supported_attention": supported,
