@@ -1297,5 +1297,10 @@ in this repo**; a Ref2VA endpoint runs at 20 steps.
 | `scripts/verify_weights.py` | Pre-deploy gate; the same enumeration the boot fitness check runs. |
 | `scripts/calibrate.py` | Timing matrix → measured timeout and cost numbers. |
 | `scripts/patch_sage_setup.py` | Build-time: pins SageAttention's target architectures without a GPU present. |
-| `tests/` | CPU-only test suite: `test_schema.py`, `test_media.py`, `test_wgp_config_drift.py`, `test_handler.py` (end-to-end `run_job` with a stubbed engine), `test_engine.py` (the drain loop with a fake job). No GPU, no torch, no weights, no network. |
+| `scripts/usp_bench.py` | Benchmark harness: drives `handler.run_job` directly for single-GPU attention/codec/VAE legs and multi-GPU USP. Pins every env var **before** importing `config` and asserts the result — see finding (a) in Inference tuning. |
+| `scripts/test_usp_gloo.py` | 2-process gloo proof that Ulysses SP is numerically exact vs full SDPA. Needs torch, so it is not in the CPU suite. |
+| `webdemo/index.html` | Single-file browser tester for a live endpoint: paste endpoint id + API key, submit, poll, play. No build step and no server — `api.runpod.ai` sends `access-control-allow-origin: *`. The tracked copy keeps `DEFAULT_KEY` empty on purpose. |
+| `webdemo/serve.py` | Serves `webdemo/` over http. Safari and Firefox refuse cross-origin requests from `file://` pages while Chrome allows them, so the same file works or silently does nothing depending on the browser; http has no such special case. |
+| `artifacts/*.whl` | **Temporary.** An sm_120-only SageAttention build, installed at boot until the image carries it. Delete before merge — see `artifacts/README.md`. |
+| `tests/` | CPU-only test suite: `test_schema.py`, `test_media.py`, `test_wgp_config_drift.py`, `test_handler.py` (end-to-end `run_job` with a stubbed engine), `test_engine.py` (the drain loop with a fake job), `test_obs.py`, `test_usp_drift.py` (hash-pins the `MiniMaxH3Model.forward` that `usp.py` mirrors). No GPU, no torch, no weights, no network. |
 | `../.github/workflows/worker-ci.yml` | The Tier-1 suite plus hadolint, on every PR touching this directory. |
