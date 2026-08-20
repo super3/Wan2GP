@@ -65,6 +65,13 @@ def _ship(payload: dict) -> None:
     url = os.environ.get("LOG_SHIP_URL", "").strip()
     if not url:
         return
+    # Several pods may share one sink, and the bench posts its summary directly
+    # rather than through obs.py, so nothing else stamps an identity on it. Two
+    # concurrent pods produced one interleaved stream of same-shaped summaries
+    # that could not be attributed after the fact.
+    payload = dict(payload)
+    payload.setdefault("run_id", os.environ.get("BENCH_RUN_ID", ""))
+    payload.setdefault("host_gpu", os.environ.get("BENCH_HOST_GPU", ""))
     try:
         req = urllib.request.Request(
             url,
