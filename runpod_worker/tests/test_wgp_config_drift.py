@@ -756,3 +756,38 @@ def test_video_output_codec_is_worker_owned_and_nvenc_exists():
     assert codec == "h264_nvenc" and "-cq" in params
     # the default must be untouched
     assert codecs._get_video_codec_spec("libx264_8", "mp4")[0] == "libx264"
+
+
+def test_nvenc_repoints_imageio_ffmpeg(tmp_path, monkeypatch):
+    """imageio_ffmpeg ships its own NVENC-less static ffmpeg, so requesting an
+    nvenc codec without repointing it kills every job at save time with a
+    misleading '_tmp.mp4: No such file or directory' from the audio-mux step.
+    """
+    from runpod_worker import config as C
+
+    monkeypatch.delenv("IMAGEIO_FFMPEG_EXE", raising=False)
+
+    # no nvenc requested -> no probing, no env change
+    monkeypatch.setenv("WANGP_VIDEO_CODEC", "libx264_8")
+    assert C.ensure_ffmpeg_supports_codec() == "unset"
+    assert "IMAGEIO_FFMPEG_EXE" not in os.environ
+
+    # an ffmpeg that advertises the encoder is adopted (found via PATH)
+    fake = tmp_path / "ffmpeg"
+    fake.write_text("#!/bin/sh\necho ' V....D h264_nvenc  NVIDIA NVENC H.264 encoder'\n")
+    fake.chmod(0o755)
+    monkeypatch.setenv("PATH", str(tmp_path))
+    monkeypatch.setenv("WANGP_VIDEO_CODEC", "h264_nvenc")
+    assert C.ensure_ffmpeg_supports_codec() == "system"
+    assert os.environ["IMAGEIO_FFMPEG_EXE"] == str(fake)
+
+    # an ffmpeg WITHOUT the encoder is refused rather than adopted blindly
+    monkeypatch.delenv("IMAGEIO_FFMPEG_EXE", raising=False)
+    fake.write_text("#!/bin/sh\necho ' V....D libx264  H.264 encoder'\n")
+    assert C.ensure_ffmpeg_supports_codec() == "unavailable"
+    assert "IMAGEIO_FFMPEG_EXE" not in os.environ
+
+    # an operator's explicit choice is never overridden
+    monkeypatch.setenv("IMAGEIO_FFMPEG_EXE", "/opt/custom/ffmpeg")
+    assert C.ensure_ffmpeg_supports_codec() == "preset"
+    assert os.environ["IMAGEIO_FFMPEG_EXE"] == "/opt/custom/ffmpeg"
