@@ -104,6 +104,9 @@ def main() -> int:
     #: server_config["vae_config"]: 0 = "auto", which for MiniMax H3 is a hard
     #: 256 px tile regardless of VRAM (video_vae.py:52-55). 1 = no tiling.
     parser.add_argument("--vae-config", dest="vae_config", default="")
+    #: Decode only the final chunk (models/minimax_h3/last_frame.py): the last
+    #: frame is bit-identical, at 1/num_chunks of the decode work.
+    parser.add_argument("--last-frame", action="store_true")
     args = parser.parse_args()
 
     world = int(os.environ.get("WORLD_SIZE", "1"))
@@ -164,6 +167,11 @@ def main() -> int:
     assert live.model_config == args.config.rstrip(","), (
         f"CONFIG.model_config={live.model_config!r} != requested {args.config!r}"
     )
+
+    if args.last_frame:
+        from models.minimax_h3 import last_frame  # noqa: PLC0415
+        last_frame.activate()
+        print("bench: last-frame decode active", flush=True)
 
     if world > 1:
         from models.minimax_h3 import usp
@@ -310,7 +318,7 @@ def main() -> int:
     attention_ok = effective == args.attention
     summary = {"event": "usp_bench_summary", "tag": tag, "frames": args.frames,
                "compile": bool(args.compile), "config": args.config, "codec": args.codec,
-               "vae_config": args.vae_config,
+               "vae_config": args.vae_config, "last_frame": bool(args.last_frame),
                "attention": args.attention,
                "effective_attention": effective, "attention_ok": attention_ok,
                "installed_attention": installed, "supported_attention": supported,

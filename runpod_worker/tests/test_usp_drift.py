@@ -46,3 +46,28 @@ def test_usp_module_stays_torch_lazy_for_this_suite():
         assert needle not in text, (
             f"{py} references the torch-requiring usp module; keep the worker package torch-free"
         )
+
+
+#: sha256 of AutoencoderKLMiniMaxH3._decode at the revision last_frame.py reasons about.
+MIRRORED_DECODE_SHA256 = "b68e95d66cbbf48af74fa29a2d021c51322fe66cb6e7840e406871bd2c003afd"
+
+
+def _decode_source() -> str:
+    src = (REPO / "models" / "minimax_h3" / "components" / "video_autoencoder.py").read_text()
+    match = re.search(r"    def _decode\(self, z.*?(?=\n    def )", src, re.S)
+    assert match, "AutoencoderKLMiniMaxH3._decode not found — the anchor regex needs updating"
+    return match.group(0)
+
+
+def test_decode_chunking_unchanged_since_last_frame_patch():
+    """models/minimax_h3/last_frame.py is only correct because _decode loops over
+    INDEPENDENT chunks and the final frames come from the last chunk's unblended
+    j==1 segment. If that loop changes, the tail slice may silently return frames
+    from the wrong place — which looks like a plausible image, not an error."""
+    digest = hashlib.sha256(_decode_source().encode()).hexdigest()
+    assert digest == MIRRORED_DECODE_SHA256, (
+        "AutoencoderKLMiniMaxH3._decode changed. Re-verify that the last chunk still "
+        "reads exactly the trailing tokens_chunk_size + token_overlap latent frames and "
+        "that nothing earlier contributes to the final frames, then update "
+        f"MIRRORED_DECODE_SHA256 to {digest}."
+    )
