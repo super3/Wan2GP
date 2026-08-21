@@ -9,7 +9,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # db.py and static/ ship with the app; the old boot-script deploys curl'd
 # app.py alone, which is why the missing static/ copy never surfaced.
-COPY app.py db.py ./
+COPY app.py db.py story.py ./
 COPY static ./static
 
 # RUNPOD_API_KEY and RUNPOD_ENDPOINT_ID stay server-side and are never returned
