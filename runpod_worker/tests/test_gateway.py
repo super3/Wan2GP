@@ -22,6 +22,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 fastapi = pytest.importorskip("fastapi")
+pytest.importorskip("sqlalchemy", reason="gateway requirements not installed")
 from fastapi.testclient import TestClient  # noqa: E402
 
 KEY_A, KEY_B = "sk_test_aaa", "sk_test_bbb"
