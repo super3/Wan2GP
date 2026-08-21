@@ -592,7 +592,30 @@ def status(job_id: str, ident: Ident = Depends(auth)) -> dict:
 
     state = st.get("status")
     if state in ("IN_QUEUE", "IN_PROGRESS"):
-        return {"id": job_id, "status": "queued" if state == "IN_QUEUE" else "processing"}
+        body: dict[str, Any] = {
+            "id": job_id, "status": "queued" if state == "IN_QUEUE" else "processing"}
+        # The worker pushes progress frames (phase, step, eta) through
+        # RunPod's progress API; forward a sanitized copy so the page can say
+        # what the generation is actually doing instead of a bare "processing".
+        prog = st.get("output")
+        if state == "IN_PROGRESS" and isinstance(prog, dict) and prog.get("phase"):
+            def _num(v: Any) -> float | int | None:
+                return v if isinstance(v, (int, float)) else None
+            body["progress"] = {
+                "phase": str(prog.get("phase", ""))[:60],
+                "status": str(prog.get("status", ""))[:300],
+                "pct": _num(prog.get("pct")),
+                "step": _num(prog.get("step")),
+                "total_steps": _num(prog.get("total_steps")),
+                "eta_s": _num(prog.get("eta_s")),
+            }
+            # A small denoising preview JPEG the worker encodes from the
+            # latents -- a partial image beats a blank stage. Size-capped so
+            # a misbehaving worker cannot balloon the poll responses.
+            preview = prog.get("preview_jpeg")
+            if isinstance(preview, str) and 0 < len(preview) <= 300_000:
+                body["progress"]["preview_jpeg"] = preview
+        return body
     if state != "COMPLETED":
         db.mark_job(job_id, "failed")
         return {"id": job_id, "status": "failed",
