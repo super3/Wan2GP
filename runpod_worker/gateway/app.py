@@ -64,7 +64,11 @@ DEFAULT_DURATION = 5
 #: rejects it with "nearest valid: 1280x704". 704 is the real 16:9-ish 720p.
 #: 2.26x the pixels of 480p, so it generates far slower; the turbo LoRA is
 #: 768p-trained so this is near its native size.
-RESOLUTIONS = {"480p": "832x480", "720p": "1280x704"}
+RESOLUTIONS = {
+    "480p": "832x480",     # 16:9, every measurement in the README
+    "720p": "1280x704",    # 16:9
+    "square": "960x960",   # 1:1, 1.02x the pixels of 720p so it costs the same
+}
 DEFAULT_RESOLUTION = "480p"
 ACCEL_PROFILE = "Turbo Lightx2v FL2V 4 Steps v1.0 768p"
 MODEL_TYPE = "minimax_h3_fl2va_pruned"
@@ -159,7 +163,11 @@ class VideoRequest(BaseModel):
     #: which is why it is background-only below -- no synchronous route can
     #: outlast the proxy for it.
     resolution: str = Field(default=DEFAULT_RESOLUTION,
-                            description="480p (default) or 720p")
+                            description="480p (default), 720p, or square (960x960)")
+    #: A start frame, base64 (raw or a data: URI). The model is first-last-to-
+    #: video, so this conditions the opening frame and the motion follows from
+    #: it. Its aspect should match `resolution` or the model letterboxes.
+    image: str | None = Field(default=None, description="base64 start frame")
     background: bool = Field(default=False,
                              description="return a job id immediately instead of the file")
     #: -1 (or omitted) picks a random seed; the resolved value is returned so a
@@ -197,7 +205,9 @@ def create(body: VideoRequest, key: str = Depends(auth)) -> dict:
     # the proxy kills it loses the job id -- which is the one thing the caller
     # needs. Force background rather than let them pick a combination that
     # cannot work.
-    background = body.background or body.resolution == "720p"
+    # Anything above 480p takes minutes; a held connection cannot outlast the
+    # proxy, and losing the job id is worse than waiting.
+    background = body.background or body.resolution != "480p"
     settings: dict[str, Any] = {
         "prompt": body.prompt,
         "resolution": RESOLUTIONS[body.resolution],
@@ -205,13 +215,21 @@ def create(body: VideoRequest, key: str = Depends(auth)) -> dict:
         "sample_solver": "euler",
         "image_prompt_type": "", "video_prompt_type": "", "audio_prompt_type": "",
     }
+    media: dict[str, Any] = {}
+    if body.image:
+        # wgp.py:1409 reads image_start only when "S" is in image_prompt_type,
+        # so the letter and the attachment must be set together or the image is
+        # silently ignored.
+        settings["image_prompt_type"] = "S"
+        media["image_start"] = {"b64": body.image.split(",", 1)[-1]}
     if body.seed is not None and body.seed >= 0:
         settings["seed"] = body.seed
 
     try:
         created = _rp("run", {"input": {
             "model_type": MODEL_TYPE, "profile": ACCEL_PROFILE,
-            "settings": settings, "output": {"mode": "auto"},
+            "settings": settings, "media": media,
+            "output": {"mode": "auto"},
             "runtime": {"timeout_s": 1200},
         }})
     except Exception:
