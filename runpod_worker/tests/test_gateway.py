@@ -265,7 +265,8 @@ def test_every_file_the_app_serves_is_tracked_by_git():
 
 
 def test_health_needs_no_key_so_the_page_can_poll_it(client):
-    """The capacity strip polls from page load, before a key is entered."""
+    """/v1/health is keyless: the legacy page polls it from page load, and
+    API callers use it to see whether the next request hits a warm worker."""
     c, m = client
     with mock.patch.object(m, "_rp", return_value={"jobs": {}, "workers": {"ready": 1}}):
         r = c.get("/v1/health")          # no Authorization header
@@ -273,14 +274,17 @@ def test_health_needs_no_key_so_the_page_can_poll_it(client):
     assert r.json()["capacity"]["ready"] == 1
 
 
-def test_docs_page_polls_capacity(client):
+def test_studio_v2_signup_markers(client):
+    """Studio v2 swaps the header status strip for account buttons and adds
+    the preview/Pro messaging. The page must no longer poll /v1/health."""
     c, _ = client
     body = c.get("/").text
-    assert 'fetch("/v1/health")' in body
-    assert "setInterval(poll" in body
-    # the strip must not hijack the message box the generate flow writes to
-    strip = body[body.index("function renderStatus"):body.index("async function poll")]
-    assert "say(" not in strip
+    assert "Sign up free" in body
+    assert "Pro feature — free during the preview" in body
+    assert "no account needed for 5 s at 480p" in body
+    assert "keeps your clips past the 1-hour limit" in body
+    assert 'fetch("/v1/health")' not in body
+    assert "setInterval(poll" not in body
 
 
 def test_background_returns_immediately(client):

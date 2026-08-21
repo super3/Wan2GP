@@ -15,17 +15,20 @@
   a:hover { color:#8f3f14; text-decoration:underline; }
   button { font:inherit; cursor:pointer; }
   header { border-bottom:1px solid #e3e0da; background:#fff; }
-  .hwrap { max-width:1200px; margin:0 auto; padding:16px 28px;
+  .hwrap { max-width:1200px; margin:0 auto; padding:14px 28px;
            display:flex; align-items:center; justify-content:space-between; gap:16px; }
   .brand { display:flex; align-items:baseline; gap:10px; }
   .brand b { font-weight:650; font-size:16px; }
   .brand span { font-size:11px; letter-spacing:.12em; text-transform:uppercase; color:#6b665e; }
-  .status { display:inline-flex; align-items:center; gap:8px; font-size:12.5px;
-            color:#6b665e; font-variant-numeric:tabular-nums; }
-  .status .dot { width:7px; height:7px; border-radius:50%; flex:none; background:#6b665e; }
+  .hbtns { display:flex; align-items:center; gap:18px; }
+  .signin { font-size:13px; font-weight:500; color:#1c1a17; background:none; border:none; padding:0; }
+  .signin:hover { color:#b4531f; }
+  .signup { font-size:13px; font-weight:650; color:#fff; background:#b4531f;
+            border:1px solid #b4531f; border-radius:7px; padding:7px 14px; }
+  .signup:hover { background:#9c4517; }
   main { max-width:1200px; margin:0 auto; padding:28px 28px 70px; }
   .cols { display:flex; flex-wrap:wrap; gap:26px; align-items:flex-start; }
-  .panel { flex:0 1 400px; min-width:340px; }
+  .panel { flex:0 1 360px; min-width:320px; }
   .card { background:#fff; border:1px solid #e3e0da; border-radius:14px; padding:20px; }
   .tabs { display:flex; background:#f4f2ee; border-radius:9px; padding:3px; gap:3px; }
   .tabs button { flex:1; font-size:13px; font-weight:500; padding:7px 10px; border-radius:7px;
@@ -52,8 +55,8 @@
                   border-radius:20px; padding:3px 10px; }
   .chips button:hover { border-color:#b4531f; color:#b4531f; }
   .segs { display:flex; gap:6px; }
-  .segs button { flex:1; display:inline-flex; align-items:center; justify-content:center; gap:6px;
-                 font-size:13px; font-weight:500; border-radius:7px; padding:8px 0;
+  .segs button { flex:1; display:inline-flex; align-items:center; justify-content:center; gap:5px;
+                 font-size:13px; font-weight:500; border-radius:7px; height:36px; padding:0;
                  background:#fff; border:1px solid #e3e0da; color:#6b665e; }
   .segs button.on { border-color:#b4531f; color:#b4531f; }
   .adv-toggle { display:inline-flex; align-items:center; gap:5px; font-size:12.5px; font-weight:500;
@@ -75,7 +78,7 @@
             border:1px solid #b4531f; border-radius:9px; padding:13px 20px; }
   .create:hover { background:#9c4517; border-color:#9c4517; }
   .create:disabled { opacity:.5; cursor:not-allowed; }
-  .stagecol { flex:1.4 1 480px; min-width:340px; }
+  .stagecol { flex:1.4 1 420px; min-width:320px; }
   .stage { position:relative; aspect-ratio:16/9; border-radius:12px; overflow:hidden;
            background:#151412; border:1px solid #33302b; }
   .stage .center { position:absolute; inset:0; display:flex; flex-direction:column;
@@ -98,8 +101,15 @@
   h2 { font-size:13px; font-weight:650; text-transform:uppercase; letter-spacing:.09em;
        color:#6b665e; margin:32px 0 6px; }
   .retention { font-size:13px; color:#9a6b12; margin:0 0 14px; }
+  .prohint { font-size:12px; color:#9a6b12; margin:0 0 16px; line-height:1.5; }
+  .freeline { font-size:12px; color:#6b665e; margin:10px 0 0; text-align:center; }
+  .banner { display:flex; align-items:center; gap:14px; margin-top:14px; padding:13px 16px;
+            background:#fff; border:1px solid #e3e0da; border-radius:10px; }
+  .banner .txt { flex:1; font-size:13.5px; color:#1c1a17; line-height:1.5; }
+  .banner .x { font-size:15px; color:#6b665e; background:none; border:none; padding:0; flex:none; }
+  .banner .x:hover { color:#1c1a17; }
   .empty { font-size:13px; color:#6b665e; margin:0; }
-  .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(180px,1fr)); gap:14px; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(200px,1fr)); gap:14px; }
   .tile { background:#fff; border:1px solid #e3e0da; border-radius:10px; padding:0 0 10px;
           cursor:pointer; overflow:hidden; }
   .tile:hover { border-color:#b4531f; }
@@ -132,25 +142,16 @@
 <body>
 <header><div class="hwrap">
   <div class="brand"><b>Minimax H3</b><span>Video generation</span></div>
-  <div class="status"><span class="dot" id="sdot"></span><span id="stext">checking…</span></div>
+  <div class="hbtns">
+    <button type="button" class="signin" id="signin">Sign in</button>
+    <button type="button" class="signup" id="signup">Sign up free</button>
+  </div>
 </div></header>
 
 <main><div class="cols">
   <div class="panel">
     <div class="card">
-      <div class="tabs">
-        <button type="button" id="tab-t2v" class="on">Text to video</button>
-        <button type="button" id="tab-i2v">Image to video</button>
-      </div>
-
-      <div class="field" id="framefield" hidden>
-        <label>Start frame</label>
-        <div class="drop" id="drop">Drag or click to upload a JPG or PNG</div>
-        <input id="img" type="file" accept="image/*" style="display:none">
-        <p class="hint">The video opens on this frame. Match its aspect to the resolution, or the model letterboxes it.</p>
-      </div>
-
-      <div class="field">
+      <div>
         <div class="prompt-head">
           <label style="margin:0">Prompt</label>
           <span class="count"><span id="chars">0</span> / 2000</span>
@@ -158,7 +159,7 @@
         <textarea id="prompt" spellcheck="false" maxlength="2000">integrated_multimodal_description: [Shot 1] A cinematic close-up of a brass desk lamp switching on in a dark study, dust drifting through the beam. The camera pushes in slowly.
 overall_soundscape: A single click, a low electrical hum, faint room tone.
 non_diegetic_music: None.</textarea>
-        <div class="chips"><span>Examples:</span>
+        <div class="chips">
           <button type="button" data-p="integrated_multimodal_description: [Shot 1] A cinematic close-up of a brass desk lamp switching on in a dark study, dust drifting through the beam. The camera pushes in slowly.&#10;overall_soundscape: A single click, a low electrical hum, faint room tone.&#10;non_diegetic_music: None.">Desk lamp</button>
           <button type="button" data-p="integrated_multimodal_description: [Shot 1] Rain streaking down a café window at dusk, neon signs blurring into bokeh beyond the glass. The camera holds still.&#10;overall_soundscape: Steady rain, muffled street noise, a distant tram bell.&#10;non_diegetic_music: None.">Rain on glass</button>
           <button type="button" data-p="integrated_multimodal_description: [Shot 1] A slow-motion espresso shot pouring into a white cup, crema folding over itself, warm morning light.&#10;overall_soundscape: The hiss of the machine, a liquid trickle, quiet café murmur.&#10;non_diegetic_music: None.">Espresso pour</button>
@@ -173,22 +174,26 @@ non_diegetic_music: None.</textarea>
         </div>
       </div>
 
-      <div class="field"><label>Aspect ratio</label>
-        <div class="segs" id="aspects">
-          <button type="button" data-v="portrait"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="7" y="3" width="10" height="18" rx="2"/></svg>Portrait</button>
-          <button type="button" data-v="horizontal" class="on"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="7" width="18" height="10" rx="2"/></svg>Horizontal</button>
-          <button type="button" data-v="square"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="5" y="5" width="14" height="14" rx="2"/></svg>Square</button>
+      <div style="display:flex;gap:14px;margin-top:16px;margin-bottom:16px">
+        <div style="flex:1.1"><label>Resolution</label>
+          <div class="segs" id="tiers">
+            <button type="button" data-v="480p" class="on">480p</button>
+            <button type="button" data-v="720p">720p</button>
+          </div>
+        </div>
+        <div style="flex:1"><label>Aspect</label>
+          <div class="segs" id="aspects">
+            <button type="button" data-v="portrait" title="Portrait"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="8" y="3.5" width="8" height="17" rx="1.5"/></svg></button>
+            <button type="button" data-v="horizontal" title="Horizontal" class="on"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3.5" y="8" width="17" height="8" rx="1.5"/></svg></button>
+            <button type="button" data-v="square" title="Square"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="5.5" y="5.5" width="13" height="13" rx="1.5"/></svg></button>
+          </div>
         </div>
       </div>
 
-      <div class="field"><label>Resolution</label>
-        <div class="segs" id="tiers">
-          <button type="button" data-v="480p" class="on">480p</button>
-          <button type="button" data-v="720p">720p</button>
-        </div>
-      </div>
+      <p class="prohint" id="prohint" hidden>Pro feature — free during the preview.
+        <a href="#" id="prolink">Sign up</a> to keep access when limits land.</p>
 
-      <div class="field">
+      <div>
         <button type="button" class="adv-toggle" id="advtoggle"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18l6-6-6-6"/></svg>Advanced</button>
         <div id="advbody" hidden style="margin-top:12px">
           <label>Seed</label>
@@ -204,6 +209,7 @@ non_diegetic_music: None.</textarea>
 
       <div class="est"><span>Estimated generation time</span><b id="est">~22 s</b></div>
       <button type="button" class="create" id="go"><svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2l2.4 7.6L22 12l-7.6 2.4L12 22l-2.4-7.6L2 12l7.6-2.4z"/></svg>Create</button>
+      <p class="freeline">Free while in preview · no account needed for 5 s at 480p</p>
     </div>
   </div>
 
@@ -223,6 +229,11 @@ non_diegetic_music: None.</textarea>
       <div class="big">Generated in <b id="finalt"></b></div>
       <div class="meta" id="meta"></div>
     </div>
+    <div class="banner" id="banner" hidden>
+      <div class="txt">Like the speed? A free account keeps your clips past the 1-hour limit and saves your history.</div>
+      <button type="button" class="signup" id="bannerup">Sign up free</button>
+      <button type="button" class="x" id="bannerx" title="Dismiss">✕</button>
+    </div>
     <p class="belowmsg" id="msg" hidden></p>
 
     <h2>Recent generations</h2>
@@ -236,8 +247,8 @@ non_diegetic_music: None.</textarea>
 <script>
 "use strict";
 const $ = (id) => document.getElementById(id);
-const state = { mode:"t2v", dur:"5", tier:"480p", aspect:"horizontal",
-                busy:false, gallery:[], dropFile:null };
+const state = { dur:"5", tier:"480p", aspect:"horizontal",
+                busy:false, gallery:[] };
 
 // ---- key handling: ?key= prefods the field then leaves the address bar -----
 // A key left in the URL leaks into history, Referer headers and proxy logs.
@@ -254,36 +265,36 @@ $("key").addEventListener("change", () => {
   try { sessionStorage.setItem("gw.key", $("key").value); } catch {}
 });
 
-// ---- live capacity ---------------------------------------------------------
-// /v1/health needs no key, so this runs from page load: it tells a caller
-// whether the next request hits a warm worker or starts a cold one -- the
-// single biggest surprise in this API. Writes only into the header status,
-// never the message area the generate flow uses.
-function renderStatus(body, failed) {
-  const dot = $("sdot"), txt = $("stext");
-  if (failed) { dot.style.background = "#b4531f"; txt.textContent = "service unreachable"; return; }
-  const q = body.queue || {}, c = body.capacity || {};
-  const p = (q.waiting || 0) + (q.running || 0), r = c.ready || 0, st = c.starting || 0;
-  if (p)      { dot.style.background = "#9a6b12"; txt.textContent = `${p} job${p === 1 ? "" : "s"} in flight`; }
-  else if (r) { dot.style.background = "#2f7d52"; txt.textContent = `warm — ${r} worker ready`; }
-  else if (st){ dot.style.background = "#6b665e"; txt.textContent = "worker starting"; }
-  else        { dot.style.background = "#6b665e"; txt.textContent = "idle — first request starts a worker"; }
+// ---- accounts (not wired up yet) ------------------------------------------
+// The header buttons and banner exist ahead of the auth launch; until then
+// they explain the preview instead of navigating anywhere.
+function accountsSoon(e) {
+  if (e) e.preventDefault();
+  say("Accounts are coming soon — everything here is free during the preview.", "ok");
 }
-async function poll() {
-  try {
-    const r = await fetch("/v1/health");
-    renderStatus(r.ok ? await r.json() : null, !r.ok);
-  } catch { renderStatus(null, true); }
+$("signin").addEventListener("click", accountsSoon);
+$("signup").addEventListener("click", accountsSoon);
+$("prolink").addEventListener("click", accountsSoon);
+$("bannerup").addEventListener("click", accountsSoon);
+$("bannerx").addEventListener("click", () => {
+  $("banner").hidden = true;
+  try { sessionStorage.setItem("gw.bannerDismissed", "1"); } catch {}
+});
+function bannerDismissed() {
+  try { return sessionStorage.getItem("gw.bannerDismissed") === "1"; } catch { return false; }
 }
-poll();
-setInterval(poll, 10000);
 
 // ---- pickers ---------------------------------------------------------------
+// Anything past the free tier (5 s at 480p) shows the Pro hint.
+function updateProHint() {
+  $("prohint").hidden = !(state.dur !== "5" || state.tier === "720p");
+}
 function pick(groupId, value, stateKey) {
   for (const b of $(groupId).querySelectorAll("button"))
     b.classList.toggle("on", b.dataset.v === value);
   state[stateKey] = value;
   updateEstimate();
+  updateProHint();
 }
 $("durs").addEventListener("click", e => { const b = e.target.closest("button"); if (b) pick("durs", b.dataset.v, "dur"); });
 $("tiers").addEventListener("click", e => { const b = e.target.closest("button"); if (b) pick("tiers", b.dataset.v, "tier"); });
@@ -294,32 +305,6 @@ $("aspects").addEventListener("click", e => { const b = e.target.closest("button
 const EST = { "480p": { "5": "~22 s", "10": "~56 s", "15": "~1 min 40*" },
               "720p": { "5": "~50 s", "10": "~1 min 45", "15": "~3 min*" } };
 function updateEstimate() { $("est").textContent = EST[state.tier][state.dur]; }
-
-// ---- tabs + start frame ----------------------------------------------------
-function setMode(mode) {
-  state.mode = mode;
-  $("tab-t2v").classList.toggle("on", mode === "t2v");
-  $("tab-i2v").classList.toggle("on", mode === "i2v");
-  $("framefield").hidden = mode !== "i2v";
-}
-$("tab-t2v").addEventListener("click", () => setMode("t2v"));
-$("tab-i2v").addEventListener("click", () => setMode("i2v"));
-
-const drop = $("drop");
-drop.addEventListener("click", () => $("img").click());
-drop.addEventListener("dragover", e => { e.preventDefault(); drop.classList.add("over"); });
-drop.addEventListener("dragleave", () => drop.classList.remove("over"));
-drop.addEventListener("drop", e => {
-  e.preventDefault(); drop.classList.remove("over");
-  const f = e.dataTransfer.files && e.dataTransfer.files[0];
-  if (f) { state.dropFile = f; drop.textContent = f.name; drop.classList.add("has"); }
-});
-$("img").addEventListener("change", e => {
-  const f = e.target.files && e.target.files[0];
-  state.dropFile = null;
-  drop.textContent = f ? f.name : "Drag or click to upload a JPG or PNG";
-  drop.classList.toggle("has", !!f);
-});
 
 // ---- prompt ----------------------------------------------------------------
 const promptEl = $("prompt");
@@ -413,19 +398,6 @@ $("go").addEventListener("click", async () => {
   if (!prompt) return say("Enter a prompt.", "err");
   if (!key)    return say("Enter your API key.", "err");
 
-  let startFrame = null;
-  const file = state.dropFile || ($("img").files && $("img").files[0]);
-  if (file && state.mode === "i2v") {
-    try {
-      startFrame = await new Promise((res, rej) => {
-        const r = new FileReader();
-        r.onload = () => res(String(r.result).split(",", 2)[1]);
-        r.onerror = () => rej(new Error("could not read that image"));
-        r.readAsDataURL(file);
-      });
-    } catch (e) { return say(String(e), "err"); }
-  }
-
   state.busy = true;
   $("go").disabled = true;
   $("donebox").hidden = true;
@@ -445,7 +417,6 @@ $("go").addEventListener("click", async () => {
         prompt, duration_s: Number(state.dur), resolution: state.tier,
         aspect_ratio: state.aspect, background: true,
         ...(Number.isFinite(seedVal) && seedVal >= 0 ? { seed: seedVal } : {}),
-        ...(startFrame ? { image: startFrame } : {}),
       }),
     });
     if (!res.ok) {
@@ -488,6 +459,7 @@ $("go").addEventListener("click", async () => {
     });
     state.gallery = state.gallery.slice(0, 12);
     renderGallery();
+    if (!bannerDismissed()) $("banner").hidden = false;
   } catch (e) {
     say("Request failed: " + e, "err");
   } finally {
@@ -495,10 +467,10 @@ $("go").addEventListener("click", async () => {
     state.busy = false;
     $("go").disabled = false;
     if ($("vid").hidden) showStage("idle");
-    poll();
   }
 });
 updateEstimate();
+updateProHint();
 </script>
 </body>
 </html>
