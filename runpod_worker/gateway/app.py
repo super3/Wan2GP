@@ -182,7 +182,8 @@ def _startup() -> None:
     _seed_env_keys()
     db.adventure_seed(story.STORY_ID, [
         {"id": nid, "position": pos, "depth": story.depth_of(nid),
-         "title": story.NODES[nid]["title"], "prompt": story.NODES[nid]["prompt"]}
+         "title": story.NODES[nid]["title"], "prompt": story.NODES[nid]["prompt"],
+         "parent_id": story.parent_of(nid)}
         for pos, nid in enumerate(story.ORDER)])
     if os.environ.get("GATEWAY_ADVENTURE_AUTOGEN", "1").strip() != "0":
         _start_adventure_renderer()
@@ -563,9 +564,13 @@ def _materialise(job_id: str, st: dict) -> Path | None:
 
 # ---- the adventure ---------------------------------------------------------
 # A fixed choose-your-path story (gateway/story.py). Scenes are generated
-# ONCE, in the order a player could first encounter them, one at a time on
-# the single worker, and kept forever in Postgres -- every player shares the
-# same clips, so after one full pass the whole tree is instant.
+# ONCE, kept forever in Postgres, and shared by every player. Two render
+# lanes work through encounter order concurrently -- the story forks into
+# two paths, so both branches fill in together -- and each child scene
+# starts from its parent's LAST frame (the model is first-last-to-video),
+# so every transition is continuous.
+
+ADVENTURE_LANES = int(os.environ.get("GATEWAY_ADVENTURE_LANES", "2"))
 
 _adventure_started = False
 
@@ -581,10 +586,26 @@ def _start_adventure_renderer() -> None:
 
 def _adventure_loop() -> None:
     db.adventure_requeue_stale(story.STORY_ID)
+    lanes = [threading.Thread(target=_adventure_lane, daemon=True,
+                              name=f"adventure-lane-{i}")
+             for i in range(max(1, ADVENTURE_LANES))]
+    for lane in lanes:
+        lane.start()
+    for lane in lanes:
+        lane.join()
+
+
+def _adventure_lane() -> None:
     while True:
-        scene = db.adventure_next(story.STORY_ID)
+        scene = db.adventure_claim(story.STORY_ID)
         if scene is None:
-            return                     # every scene ready (or out of retries)
+            # Nothing claimable: children may be waiting on a parent another
+            # lane is rendering, or a dead process left a stale claim.
+            db.adventure_requeue_stale(story.STORY_ID)
+            if not db.adventure_any_rendering(story.STORY_ID):
+                return                 # every scene ready (or out of retries)
+            time.sleep(30)
+            continue
         try:
             _adventure_render_one(scene)
         except Exception as exc:  # noqa: BLE001 - one bad scene must not end the run
@@ -592,27 +613,61 @@ def _adventure_loop() -> None:
                               error=f"{type(exc).__name__}: {exc}")
 
 
+def _last_frame_b64(parent_id: str) -> str | None:
+    """The parent clip's final frame as base64 JPEG -- the child's image_start.
+    None when the parent has no stored video (terminally failed) or ffmpeg is
+    unavailable: the child then renders without continuity rather than never."""
+    data = db.adventure_video(parent_id)
+    if data is None:
+        return None
+    import subprocess
+    import tempfile
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            src, out = Path(td) / "parent.mp4", Path(td) / "last.jpg"
+            src.write_bytes(data)
+            proc = subprocess.run(
+                ["ffmpeg", "-nostdin", "-sseof", "-0.25", "-i", str(src),
+                 "-frames:v", "1", "-update", "1", "-q:v", "2", str(out)],
+                capture_output=True, timeout=60)
+            if proc.returncode != 0 or not out.exists():
+                return None
+            return base64.b64encode(out.read_bytes()).decode()
+    except Exception:  # noqa: BLE001 - continuity is best effort
+        return None
+
+
 def _adventure_render_one(scene: dict) -> None:
     """Render one scene to completion and store the bytes. Raises on failure;
-    the loop records it and moves on (with retries via adventure_next)."""
+    the lane records it and moves on (with retries via adventure_claim)."""
     sid = scene["id"]
+    settings: dict[str, Any] = {
+        "prompt": scene["prompt"],
+        "resolution": story.SCENE_RESOLUTION,
+        "video_length": DURATIONS[story.SCENE_DURATION_S],
+        "sample_solver": "euler",
+        "image_prompt_type": "", "video_prompt_type": "", "audio_prompt_type": "",
+        "multi_prompts_gen_type": "FG",
+    }
+    media: dict[str, Any] = {}
+    parent_id = story.parent_of(sid)
+    if parent_id is not None:
+        frame = _last_frame_b64(parent_id)
+        if frame:
+            # wgp reads image_start only when "S" is in image_prompt_type --
+            # the letter and the attachment must be set together.
+            settings["image_prompt_type"] = "S"
+            media["image_start"] = {"b64": frame}
     created = _rp("run", {"input": {
         "model_type": MODEL_TYPE, "profile": ACCEL_PROFILE,
-        "settings": {
-            "prompt": scene["prompt"],
-            "resolution": story.SCENE_RESOLUTION,
-            "video_length": DURATIONS[story.SCENE_DURATION_S],
-            "sample_solver": "euler",
-            "image_prompt_type": "", "video_prompt_type": "", "audio_prompt_type": "",
-            "multi_prompts_gen_type": "FG",
-        },
-        "media": {}, "output": {"mode": "auto"},
+        "settings": settings, "media": media,
+        "output": {"mode": "auto"},
         "runtime": {"timeout_s": 1200},
     }})
     job_id = created.get("id")
     if not job_id:
         raise RuntimeError("submit returned no job id")
-    db.adventure_mark(sid, "rendering", job_id=job_id, bump_attempts=True)
+    db.adventure_mark(sid, "rendering", job_id=job_id)
     deadline = time.monotonic() + 1500      # cold start + a 15 s scene, with slack
     while time.monotonic() < deadline:
         time.sleep(5)

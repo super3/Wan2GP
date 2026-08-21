@@ -72,6 +72,9 @@ adventure_scenes = sa.Table(
     sa.Column("prompt", sa.Text, nullable=False),
     sa.Column("status", sa.String(16), nullable=False, server_default="queued"),
     sa.Column("attempts", sa.Integer, nullable=False, server_default="0"),
+    #: FL2V continuity: this scene's clip starts from parent's last frame,
+    #: so a child is only renderable once its parent is done.
+    sa.Column("parent_id", sa.String(40), nullable=True),
     sa.Column("job_id", sa.String(80), nullable=True),
     sa.Column("seed", sa.Integer, nullable=True),
     sa.Column("generate_s", sa.Float, nullable=True),
@@ -106,11 +109,13 @@ def engine() -> sa.Engine:
         _metadata.create_all(_engine)
         # create_all never alters an existing table; add columns introduced
         # after first deploy by hand and ignore "already exists".
-        try:
-            with _engine.begin() as cx:
-                cx.execute(sa.text("ALTER TABLE jobs ADD COLUMN wall_s FLOAT"))
-        except sa.exc.DBAPIError:
-            pass
+        for ddl in ("ALTER TABLE jobs ADD COLUMN wall_s FLOAT",
+                    "ALTER TABLE adventure_scenes ADD COLUMN parent_id VARCHAR(40)"):
+            try:
+                with _engine.begin() as cx:
+                    cx.execute(sa.text(ddl))
+            except sa.exc.DBAPIError:
+                pass
     return _engine
 
 
@@ -250,17 +255,29 @@ def record_job(job_id: str, key_hash: str, *, resolution: str, duration_s: int,
 
 def adventure_seed(story: str, scenes: list[dict[str, Any]]) -> None:
     """Insert missing scene rows; existing rows (and their videos) are never
-    touched, so re-deploys are free and finished work is never re-done."""
+    touched, so re-deploys are free and finished work is never re-done.
+
+    One deliberate exception: a row whose parent_id is NULL while the
+    definition has one predates the continuity migration -- its clip was
+    rendered without the parent's last frame. Backfill the parent and requeue
+    it so the whole tree is continuous. Runs exactly once per row."""
     with engine().begin() as cx:
-        have = {r[0] for r in cx.execute(
-            sa.select(adventure_scenes.c.id)
+        have = {r[0]: r[1] for r in cx.execute(
+            sa.select(adventure_scenes.c.id, adventure_scenes.c.parent_id)
             .where(adventure_scenes.c.story == story)).all()}
         for scene in scenes:
             if scene["id"] not in have:
                 cx.execute(adventure_scenes.insert().values(
                     id=scene["id"], story=story, position=scene["position"],
                     depth=scene["depth"], title=scene["title"],
-                    prompt=scene["prompt"], updated_at=_now()))
+                    prompt=scene["prompt"], parent_id=scene.get("parent_id"),
+                    updated_at=_now()))
+            elif have[scene["id"]] is None and scene.get("parent_id"):
+                cx.execute(adventure_scenes.update()
+                           .where(adventure_scenes.c.id == scene["id"])
+                           .values(parent_id=scene["parent_id"],
+                                   status="queued", attempts=0,
+                                   updated_at=_now()))
 
 
 def adventure_requeue_stale(story: str, older_than_s: int = 900) -> None:
@@ -288,6 +305,55 @@ def adventure_next(story: str, max_attempts: int = 3) -> dict[str, Any] | None:
                    adventure_scenes.c.attempts < max_attempts)
             .order_by(adventure_scenes.c.position).limit(1)).first()
     return {"id": row[0], "prompt": row[1], "attempts": row[2]} if row else None
+
+
+def adventure_claim(story: str, max_attempts: int = 3) -> dict[str, Any] | None:
+    """Atomically take the next scene in encounter order and flip it to
+    'rendering'. The claim is a compare-and-swap on (status, attempts), so
+    parallel render lanes never double-claim on ANY engine -- a plain
+    select-then-update raced under SQLite's deferred transactions and let
+    two lanes bump the same scene twice. A child is only claimable once its
+    parent's clip exists (its start frame comes from it) or the parent is
+    terminally failed (render without continuity rather than never). The
+    attempt is spent at claim time -- a lane that dies still burned its try."""
+    parent = adventure_scenes.alias("parent")
+    parent_done = sa.or_(
+        adventure_scenes.c.parent_id.is_(None),
+        sa.exists(sa.select(parent.c.id).where(
+            parent.c.id == adventure_scenes.c.parent_id,
+            sa.or_(parent.c.status == "ready",
+                   sa.and_(parent.c.status == "failed",
+                           parent.c.attempts >= max_attempts)))))
+    for _ in range(10):                    # races are rare; retries settle them
+        with engine().connect() as cx:
+            row = cx.execute(
+                sa.select(adventure_scenes.c.id, adventure_scenes.c.prompt,
+                          adventure_scenes.c.attempts)
+                .where(adventure_scenes.c.story == story,
+                       adventure_scenes.c.status.in_(("queued", "failed")),
+                       adventure_scenes.c.attempts < max_attempts,
+                       parent_done)
+                .order_by(adventure_scenes.c.position).limit(1)).first()
+        if row is None:
+            return None
+        with engine().begin() as cx:
+            won = cx.execute(adventure_scenes.update().where(
+                adventure_scenes.c.id == row[0],
+                adventure_scenes.c.status.in_(("queued", "failed")),
+                adventure_scenes.c.attempts == row[2],
+            ).values(status="rendering", attempts=row[2] + 1,
+                     updated_at=_now())).rowcount
+        if won:
+            return {"id": row[0], "prompt": row[1]}
+    return None
+
+
+def adventure_any_rendering(story: str) -> bool:
+    with engine().connect() as cx:
+        row = cx.execute(sa.select(adventure_scenes.c.id).where(
+            adventure_scenes.c.story == story,
+            adventure_scenes.c.status == "rendering").limit(1)).first()
+    return row is not None
 
 
 def adventure_mark(scene_id: str, status: str, *, job_id: str | None = None,
