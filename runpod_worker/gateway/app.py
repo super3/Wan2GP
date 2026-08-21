@@ -410,6 +410,17 @@ def health() -> dict:
             "estimate": _estimate_block()}
 
 
+@app.get("/v1/quota")
+def quota(ident: Ident = Depends(auth)) -> dict:
+    """What the caller has left today. Identity resolution matches
+    /v1/videos exactly -- sk_ key, Clerk session, device token, or bare
+    address -- so the page can display the real count instead of keeping a
+    client-side guess that drifts the moment quota outlives the tab."""
+    used = db.usage_today(ident.quota_hash, date.today().isoformat())
+    return {"kind": ident.kind, "limit": ident.limit,
+            "used": used, "remaining": max(0, ident.limit - used)}
+
+
 @app.post("/v1/videos", status_code=202)
 def create(body: VideoRequest, ident: Ident = Depends(auth)) -> dict:
     key = ident.key_hash
