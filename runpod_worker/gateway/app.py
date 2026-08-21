@@ -585,7 +585,12 @@ def _start_adventure_renderer() -> None:
 
 
 def _adventure_loop() -> None:
-    db.adventure_requeue_stale(story.STORY_ID)
+    # At process start no poller can be alive, so ANY 'rendering' row is an
+    # orphan of a previous process: requeue immediately rather than waiting
+    # out the steady-state staleness window. (A deploy's brief old/new
+    # overlap can duplicate one render -- cents -- versus a 15-minute stall
+    # after every deploy.)
+    db.adventure_requeue_stale(story.STORY_ID, older_than_s=0)
     lanes = [threading.Thread(target=_adventure_lane, daemon=True,
                               name=f"adventure-lane-{i}")
              for i in range(max(1, ADVENTURE_LANES))]
