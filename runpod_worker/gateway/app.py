@@ -13,7 +13,8 @@ everything that costs money -- clip length, resolution, model, accelerator
 profile -- is fixed server-side, so a caller cannot ask for a 20-second 4K clip
 and hand you the bill.
 
-    POST /v1/videos   {"prompt": "..."}   -> 200 video/mp4  (waits for it)
+    POST /v1/videos   {"prompt": "...", "duration_s": 5}
+                                          -> 200 video/mp4  (waits for it)
                                           -> 202 {"id"}      (only if it ran long)
     GET  /v1/videos/{id}                  -> status, for the 202 case
     GET  /v1/videos/{id}/content          -> the mp4 bytes
@@ -52,9 +53,12 @@ from pydantic import BaseModel, Field
 RUNPOD_API = "https://api.runpod.ai/v2"
 
 # ---- the fixed product ----------------------------------------------------
-#: 243 frames = 10.125 s at 24 fps. The lattice is 17n + 5, so this is not a
-#: free parameter: 243 is the legal value nearest 10 seconds.
-VIDEO_LENGTH = 243
+#: The frame lattice is 17n + 5, so a duration is not a free number: these are
+#: the legal frame counts nearest 5 and 10 seconds at 24 fps. 5 s generates in
+#: roughly 22 s warm and 10 s in roughly 56 s, so the short one is the default:
+#: it fits inside a 60 s proxy timeout, which the long one does not.
+DURATIONS = {5: 124, 10: 243}
+DEFAULT_DURATION = 5
 RESOLUTION = "832x480"
 ACCEL_PROFILE = "Turbo Lightx2v FL2V 4 Steps v1.0 768p"
 MODEL_TYPE = "minimax_h3_fl2va_pruned"
@@ -129,6 +133,11 @@ def _rp(path: str, payload: dict | None = None, timeout: int = 60) -> dict:
 
 class VideoRequest(BaseModel):
     prompt: str = Field(min_length=1, max_length=4000)
+    #: 5 or 10 seconds. Constrained rather than free: the model's frame lattice
+    #: only admits 17n + 5, and an open duration would let a caller queue a job
+    #: far more expensive than the one they think they are buying.
+    duration_s: int = Field(default=DEFAULT_DURATION,
+                            description="clip length in seconds: 5 or 10")
     #: -1 (or omitted) picks a random seed; the resolved value is returned so a
     #: generation can be reproduced exactly.
     seed: int | None = Field(default=None, ge=-1, le=2**31 - 1)
@@ -149,16 +158,19 @@ def health() -> dict:
 
 @app.post("/v1/videos", status_code=202)
 def create(body: VideoRequest, key: str = Depends(auth)) -> dict:
+    if body.duration_s not in DURATIONS:
+        raise HTTPException(422, f"duration_s must be one of {sorted(DURATIONS)}")
     today = date.today().isoformat()
     with _lock:
         if _usage[(key, today)] >= DAILY_LIMIT:
             raise HTTPException(429, f"daily limit of {DAILY_LIMIT} videos reached")
         _usage[(key, today)] += 1
 
+    frames = DURATIONS[body.duration_s]
     settings: dict[str, Any] = {
         "prompt": body.prompt,
         "resolution": RESOLUTION,
-        "video_length": VIDEO_LENGTH,
+        "video_length": frames,
         "sample_solver": "euler",
         "image_prompt_type": "", "video_prompt_type": "", "audio_prompt_type": "",
     }

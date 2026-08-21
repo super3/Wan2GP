@@ -98,7 +98,8 @@ def test_caller_cannot_choose_length_or_resolution(client):
                    json={"prompt": "x", "video_length": 481, "resolution": "1920x1080"},
                    headers=_hdr(KEY_A))
     assert r.status_code == 200
-    assert seen["video_length"] == 243        # 17n+5, ~10 s
+    # a raw video_length in the body is ignored; only duration_s (5|10) is honoured
+    assert seen["video_length"] == 124        # the 5 s default, not the requested 481
     assert seen["resolution"] == "832x480"
 
 
@@ -168,3 +169,55 @@ def test_docs_page_is_served_same_origin(client):
 def test_docs_page_needs_no_key(client):
     c, _ = client
     assert c.get("/").status_code == 200        # the page loads; the calls need a key
+
+
+# --- duration -------------------------------------------------------------
+
+def test_duration_defaults_to_five_seconds(client):
+    """5 s is the default because it generates in ~22 s, inside a 60 s proxy
+    timeout; 10 s at ~56 s is not."""
+    c, m = client
+    seen = {}
+
+    def fake(path, payload=None, timeout=60):
+        if payload:
+            seen.update(payload["input"]["settings"]); return {"id": "job-1"}
+        return COMPLETED
+
+    with mock.patch.object(m, "_rp", side_effect=fake):
+        c.post("/v1/videos", json={"prompt": "x"}, headers=_hdr(KEY_A))
+    assert seen["video_length"] == 124        # 17n+5, 5.17 s
+
+
+def test_ten_seconds_is_selectable(client):
+    c, m = client
+    seen = {}
+
+    def fake(path, payload=None, timeout=60):
+        if payload:
+            seen.update(payload["input"]["settings"]); return {"id": "job-1"}
+        return COMPLETED
+
+    with mock.patch.object(m, "_rp", side_effect=fake):
+        c.post("/v1/videos", json={"prompt": "x", "duration_s": 10}, headers=_hdr(KEY_A))
+    assert seen["video_length"] == 243        # 10.125 s
+
+
+@pytest.mark.parametrize("bad", [7, 15, 0, -5, 20])
+def test_other_durations_are_refused(client, bad):
+    """Not free-form: an arbitrary duration is both off the frame lattice and a
+    way to queue a job more expensive than the caller thinks."""
+    c, m = client
+    with mock.patch.object(m, "_rp", side_effect=_backend()):
+        r = c.post("/v1/videos", json={"prompt": "x", "duration_s": bad}, headers=_hdr(KEY_A))
+    assert r.status_code == 422
+
+
+def test_refused_duration_does_not_consume_quota(client):
+    c, m = client
+    with mock.patch.object(m, "_rp", side_effect=_backend()):
+        for _ in range(5):
+            c.post("/v1/videos", json={"prompt": "x", "duration_s": 7}, headers=_hdr(KEY_A))
+        # the daily limit is 3; none of the above should have counted
+        for _ in range(3):
+            assert c.post("/v1/videos", json={"prompt": "x"}, headers=_hdr(KEY_A)).status_code == 200
