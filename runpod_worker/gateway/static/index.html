@@ -106,6 +106,9 @@
                   line-height:1; font-variant-numeric:tabular-nums; color:#eeebe5; }
   .stage .clock small { font-size:24px; color:#a09a90; font-weight:400; }
   .stage .busymsg { font-size:13px; color:#a09a90; text-align:center; }
+  .stage .pvwimg { position:absolute; inset:0; width:100%; height:100%; object-fit:cover;
+                   opacity:.45; }
+  .stage .clock, .stage .busymsg { position:relative; text-shadow:0 1px 8px rgba(0,0,0,.7); }
   .stage video { position:absolute; inset:0; width:100%; height:100%; display:block; background:#000; }
   .done { display:flex; align-items:baseline; justify-content:space-between; gap:12px;
           flex-wrap:wrap; margin-top:14px; }
@@ -245,6 +248,7 @@
         <span class="sub">write a prompt — a 5 s clip lands in about 22 seconds</span>
       </div>
       <div class="center" id="busybox" hidden>
+        <img class="pvwimg" id="pvw" alt="" hidden>
         <div class="clock"><span id="clock">0.0</span><small> s</small></div>
         <div class="busymsg" id="busymsg"></div>
       </div>
@@ -533,7 +537,14 @@ function showStage(which) {   // "idle" | "busy" | "video"
   $("busybox").hidden = which !== "busy";
   $("vid").hidden = which !== "video";
 }
-let clockTimer = null, busyEstS = 0, overrunNoted = false;
+let clockTimer = null, busyEstS = 0, overrunNoted = false, busyBase = "";
+// One writer for the busy message: live progress updates and the overrun
+// note compose instead of overwriting each other.
+function setBusy(text) {
+  busyBase = text;
+  $("busymsg").textContent =
+    text + (overrunNoted ? " Taking longer than usual — still running." : "");
+}
 function startClock(started) {
   clearInterval(clockTimer);
   overrunNoted = false;
@@ -543,9 +554,20 @@ function startClock(started) {
     // Own the miss instead of counting silently past the promise.
     if (busyEstS && !overrunNoted && elapsed > busyEstS * 1.5) {
       overrunNoted = true;
-      $("busymsg").textContent += " Taking longer than usual — still running.";
+      setBusy(busyBase);
     }
   }, 100);
+}
+// What the worker is doing right now, from the progress frames it pushes.
+function stepText(p) {
+  if (!p || !p.phase) return null;
+  const stage = /^inference_stage_(\d+)$/.exec(p.phase);
+  let label = stage ? "Generating video"
+    : { encoding_text: "Reading the prompt", vae: "Decoding frames" }[p.phase]
+      || p.phase.replace(/_/g, " ");
+  if (p.step != null && p.total_steps) label += " — step " + p.step + " of " + p.total_steps;
+  if (p.eta_s != null) label += " · ~" + Math.max(1, Math.round(p.eta_s)) + " s left";
+  return label + ".";
 }
 
 // ---- gallery ---------------------------------------------------------------
@@ -675,12 +697,14 @@ $("go").addEventListener("click", async () => {
   state.busy = true;
   $("go").disabled = true;
   $("donebox").hidden = true;
+  $("pvw").hidden = true;
+  $("pvw").removeAttribute("src");
   showStage("busy");
   const est = computeEstimate(await healthInfo());
   busyEstS = est.s;
-  $("busymsg").textContent = "Generating " + state.dur + " s of video — " +
+  setBusy("Generating " + state.dur + " s of video — " +
     fmtDur(est.s).replace("~", "about ") +
-    (est.cold ? ", including worker start." : " on a warm worker.");
+    (est.cold ? ", including worker start." : " on a warm worker."));
   say("");
   const started = Date.now();
   startClock(started);
@@ -718,9 +742,14 @@ $("go").addEventListener("click", async () => {
       info = await p.json();
       if (info.status === "completed") break;
       if (info.status === "failed") return say("Generation failed: " + (info.error || ""), "err");
-      $("busymsg").textContent = info.status === "queued"
-        ? "Queued — a worker is starting (a cold start can take a few minutes)"
-        : "Generating";
+      setBusy(info.status === "queued"
+        ? "Queued — a worker is starting (a cold start can take a few minutes)."
+        : stepText(info.progress) || "Generating " + state.dur + " s of video.");
+      // The denoising preview: a partial image beats a blank stage.
+      if (info.progress && info.progress.preview_jpeg) {
+        $("pvw").src = "data:image/jpeg;base64," + info.progress.preview_jpeg;
+        $("pvw").hidden = false;
+      }
     }
     if (!info || info.status !== "completed") return say("Timed out waiting for the video.", "err");
 

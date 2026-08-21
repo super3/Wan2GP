@@ -419,3 +419,31 @@ def test_engine_module_imports_without_torch_or_wgp():
     assert "torch" not in sys.modules
     assert "wgp" not in sys.modules
     assert threading.current_thread() is threading.main_thread()
+
+
+def test_preview_events_ride_the_next_progress_frame(tmp_path, monkeypatch):
+    """WanGP pushes raw denoising latents as 'preview' events; the engine
+    encodes them (mocked here -- encoding needs wgp + torch) and attaches the
+    JPEG to the NEXT progress payload, so preview traffic can never outpace
+    progress. Encode failures degrade to progress without a preview."""
+    video = tmp_path / "out.mp4"
+    video.write_bytes(b"\x00" * 16)
+    encoded = iter(["JPEG1", None])
+    monkeypatch.setattr(engine, "_encode_preview", lambda payload: next(encoded))
+    job = FakeJob(
+        result=FakeResult(success=True, files=[str(video)]),
+        events=[
+            Event("progress", Progress("encoding_text", "Prompt 1/1", 12, 1, 4)),
+            Event("preview", object()),
+            Event("progress", Progress("inference_stage_1", "Denoising", 44, 2, 4)),
+            Event("preview", object()),          # encoder returns None -> keep last
+            Event("progress", Progress("inference_stage_1", "Denoising", 66, 3, 4)),
+        ],
+    )
+    seen: list[dict] = []
+    outcome = engine.run({"prompt": "x"}, budget_s=30, emit_progress=seen.append,
+                         sess=FakeSession(job))
+    assert outcome.success is True
+    assert "preview_jpeg" not in seen[0]          # nothing encoded yet
+    assert seen[1]["preview_jpeg"] == "JPEG1"
+    assert seen[2]["preview_jpeg"] == "JPEG1"     # failed encode keeps the last good one
