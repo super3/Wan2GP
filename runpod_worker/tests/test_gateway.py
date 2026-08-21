@@ -1218,3 +1218,13 @@ def test_adventure_continuity_migration_requeues_old_clips(client):
     statuses = dbmod.adventure_status("biscuit")
     assert statuses["n0"]["status"] == "ready"            # root untouched
     assert statuses["n_van"]["status"] == "queued"        # re-renders with continuity
+
+
+def test_adventure_startup_requeues_orphaned_renders_immediately(client):
+    """A deploy restart kills the pollers mid-render; the rows must not wait
+    out the 15-minute staleness window when no poller can possibly be alive."""
+    c, m = client
+    from runpod_worker.gateway import db as dbmod
+    dbmod.adventure_claim("biscuit")                      # n0 -> rendering, fresh
+    dbmod.adventure_requeue_stale("biscuit", older_than_s=0)
+    assert dbmod.adventure_status("biscuit")["n0"]["status"] == "queued"
