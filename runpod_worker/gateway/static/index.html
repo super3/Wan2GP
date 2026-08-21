@@ -14,6 +14,10 @@
   src="https://improved-buck-4897.clerk.accounts.dev/npm/@clerk/clerk-js@5/dist/clerk.browser.js"></script>
 <style>
   * { box-sizing:border-box; }
+  /* Author display rules (e.g. .banner { display:flex }) override the UA's
+     [hidden] { display:none } in the cascade, which silently un-hides every
+     element the JS toggles via the hidden property. This wins over both. */
+  [hidden] { display:none !important; }
   body { margin:0; background:#faf9f7; color:#1c1a17;
          font:400 15px/1.65 Archivo, ui-sans-serif, system-ui, sans-serif; }
   a { color:#b4531f; text-decoration:none; }
