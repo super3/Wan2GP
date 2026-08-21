@@ -35,6 +35,8 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setenv("GATEWAY_KEYS", json.dumps({KEY_A: "acme", KEY_B: "globex"}))
     monkeypatch.setenv("GATEWAY_CACHE", str(tmp_path))
     monkeypatch.setenv("GATEWAY_DAILY_LIMIT", "3")
+    # Never let the adventure renderer thread run against the stubbed backend
+    monkeypatch.setenv("GATEWAY_ADVENTURE_AUTOGEN", "0")
     monkeypatch.setenv("DATABASE_URL", f"sqlite:///{tmp_path}/gw.db")
     import importlib
     from runpod_worker.gateway import db as dbmod
@@ -1039,3 +1041,111 @@ def test_status_forwards_the_denoising_preview_size_capped(client):
     with mock.patch.object(m, "_rp", return_value=huge):
         p = c.get("/v1/videos/pv-1", headers=_hdr(KEY_A)).json()["progress"]
     assert "preview_jpeg" not in p
+
+
+# --- the adventure -----------------------------------------------------------
+
+def test_story_tree_is_well_formed():
+    """The story is product configuration: every choice must point at a real
+    node, every prompt must be the structured multi-line H3 format, and the
+    encounter order must be breadth-first so the renderer makes the
+    earliest-needed clips first."""
+    from runpod_worker.gateway import story
+    assert len(story.ORDER) == len(set(story.ORDER)) == len(story.NODES) == 14
+    for node in story.NODES.values():
+        for _label, target in node["choices"]:
+            assert target in story.NODES
+        assert node["prompt"].startswith("integrated_multimodal_description")
+        assert "overall_soundscape" in node["prompt"]
+    depths = [story.depth_of(n) for n in story.ORDER]
+    assert depths == sorted(depths) and depths[0] == 1 and max(depths) == 4
+    ends = [n for n in story.NODES.values() if not n["choices"]]
+    assert len(ends) == 7
+
+
+def test_adventure_state_and_page(client):
+    c, _ = client
+    body = c.get("/adventure").text
+    assert "Begin the adventure" in body
+    assert "Branch map" in body
+    assert "/adventure/state" in body and "/adventure/scene/" in body
+    st = c.get("/adventure/state").json()
+    assert len(st["nodes"]) == 14
+    assert st["nodes"][0]["id"] == "n0" and st["nodes"][0]["status"] == "queued"
+    assert all("prompt" not in n for n in st["nodes"])   # prompts stay private
+
+
+def test_adventure_renders_in_encounter_order_and_serves_from_db(client):
+    c, m = client
+    from runpod_worker.gateway import db as dbmod
+    scene = dbmod.adventure_next("biscuit")
+    assert scene["id"] == "n0"                     # the opening scene first
+    with mock.patch.object(m, "_rp", side_effect=_backend(run_id="adv-1")), \
+         mock.patch.object(m.time, "sleep", lambda s: None):
+        m._adventure_render_one(scene)
+    assert dbmod.adventure_status("biscuit")["n0"]["status"] == "ready"
+    r = c.get("/adventure/scene/n0")
+    assert r.status_code == 200 and r.content == MP4
+    assert r.headers["content-type"].startswith("video/mp4")
+    assert dbmod.adventure_next("biscuit")["id"] == "n_van"   # then depth 2
+    assert c.get("/adventure/scene/n_bakery").status_code == 404  # not yet
+    assert c.get("/adventure/scene/nope").status_code == 404
+
+
+def test_adventure_loop_retries_failures_then_moves_on(client):
+    """A flaky backend must not hole the story forever, and a terminally
+    broken one must not loop forever: each scene retries up to 3 times and
+    then stays failed."""
+    c, m = client
+    from runpod_worker.gateway import db as dbmod
+
+    def boom(path, payload=None, timeout=60):
+        if payload:
+            return {"id": "adv-x"}
+        return {"status": "FAILED", "output": {"message": "cuda meltdown"}}
+
+    with mock.patch.object(m, "_rp", side_effect=boom), \
+         mock.patch.object(m.time, "sleep", lambda s: None):
+        m._adventure_loop()                        # runs to exhaustion
+    statuses = dbmod.adventure_status("biscuit")
+    assert all(v["status"] == "failed" for v in statuses.values())
+    assert all(v["attempts"] == 3 for v in statuses.values())
+    assert dbmod.adventure_next("biscuit") is None
+
+
+def test_adventure_stale_rendering_row_requeues(client):
+    c, m = client
+    from runpod_worker.gateway import db as dbmod
+    import datetime
+    dbmod.adventure_mark("n0", "rendering")
+    with dbmod.engine().begin() as cx:
+        cx.execute(dbmod.adventure_scenes.update()
+                   .where(dbmod.adventure_scenes.c.id == "n0")
+                   .values(updated_at=dbmod._now() - datetime.timedelta(seconds=3600)))
+    dbmod.adventure_requeue_stale("biscuit")
+    assert dbmod.adventure_status("biscuit")["n0"]["status"] == "queued"
+
+
+def test_adventure_seed_never_clobbers_finished_work(client):
+    c, m = client
+    from runpod_worker.gateway import db as dbmod
+    from runpod_worker.gateway import story as st
+    dbmod.adventure_mark("n0", "ready", video=b"precious bytes")
+    dbmod.adventure_seed(st.STORY_ID, [
+        {"id": nid, "position": pos, "depth": st.depth_of(nid),
+         "title": st.NODES[nid]["title"], "prompt": st.NODES[nid]["prompt"]}
+        for pos, nid in enumerate(st.ORDER)])
+    assert dbmod.adventure_status("biscuit")["n0"]["status"] == "ready"
+    assert dbmod.adventure_video("n0") == b"precious bytes"
+
+
+def test_studio_limit_modal_markers(client):
+    """The free-account modal replaces the inline nudge when a visitor's
+    clips are spent; the paid upgrade flow is deliberately absent."""
+    c, _ = client
+    body = c.get("/").text
+    assert "Keep creating for free" in body
+    assert "A free account gets you 20 clips a day." in body
+    assert "Continue with Google" in body
+    assert "showLimitModal" in body
+    assert "Upgrade" not in body                   # no paid flow anywhere

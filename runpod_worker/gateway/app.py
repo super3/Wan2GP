@@ -39,6 +39,7 @@ import base64
 import json
 import os
 import re
+import threading
 import time
 import urllib.request
 from datetime import date
@@ -47,12 +48,14 @@ from typing import Any, NamedTuple
 
 try:
     from . import db                     # imported as runpod_worker.gateway.app
+    from . import story
 except ImportError:                      # flat /app layout in the container
     import db                            # type: ignore[no-redef]
+    import story                         # type: ignore[no-redef]
 
 import jwt
 from fastapi import Depends, FastAPI, HTTPException, Header, Request
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel, Field
 
 RUNPOD_API = "https://api.runpod.ai/v2"
@@ -177,6 +180,12 @@ if _EXAMPLES.exists():
 @app.on_event("startup")
 def _startup() -> None:
     _seed_env_keys()
+    db.adventure_seed(story.STORY_ID, [
+        {"id": nid, "position": pos, "depth": story.depth_of(nid),
+         "title": story.NODES[nid]["title"], "prompt": story.NODES[nid]["prompt"]}
+        for pos, nid in enumerate(story.ORDER)])
+    if os.environ.get("GATEWAY_ADVENTURE_AUTOGEN", "1").strip() != "0":
+        _start_adventure_renderer()
 
 
 @app.get("/healthz", include_in_schema=False)
@@ -550,6 +559,117 @@ def _materialise(job_id: str, st: dict) -> Path | None:
             return None
         path.write_bytes(base64.b64decode(video["data"]))
     return path
+
+
+# ---- the adventure ---------------------------------------------------------
+# A fixed choose-your-path story (gateway/story.py). Scenes are generated
+# ONCE, in the order a player could first encounter them, one at a time on
+# the single worker, and kept forever in Postgres -- every player shares the
+# same clips, so after one full pass the whole tree is instant.
+
+_adventure_started = False
+
+
+def _start_adventure_renderer() -> None:
+    global _adventure_started
+    if _adventure_started:
+        return
+    _adventure_started = True
+    threading.Thread(target=_adventure_loop, daemon=True,
+                     name="adventure-renderer").start()
+
+
+def _adventure_loop() -> None:
+    db.adventure_requeue_stale(story.STORY_ID)
+    while True:
+        scene = db.adventure_next(story.STORY_ID)
+        if scene is None:
+            return                     # every scene ready (or out of retries)
+        try:
+            _adventure_render_one(scene)
+        except Exception as exc:  # noqa: BLE001 - one bad scene must not end the run
+            db.adventure_mark(scene["id"], "failed",
+                              error=f"{type(exc).__name__}: {exc}")
+
+
+def _adventure_render_one(scene: dict) -> None:
+    """Render one scene to completion and store the bytes. Raises on failure;
+    the loop records it and moves on (with retries via adventure_next)."""
+    sid = scene["id"]
+    created = _rp("run", {"input": {
+        "model_type": MODEL_TYPE, "profile": ACCEL_PROFILE,
+        "settings": {
+            "prompt": scene["prompt"],
+            "resolution": story.SCENE_RESOLUTION,
+            "video_length": DURATIONS[story.SCENE_DURATION_S],
+            "sample_solver": "euler",
+            "image_prompt_type": "", "video_prompt_type": "", "audio_prompt_type": "",
+            "multi_prompts_gen_type": "FG",
+        },
+        "media": {}, "output": {"mode": "auto"},
+        "runtime": {"timeout_s": 1200},
+    }})
+    job_id = created.get("id")
+    if not job_id:
+        raise RuntimeError("submit returned no job id")
+    db.adventure_mark(sid, "rendering", job_id=job_id, bump_attempts=True)
+    deadline = time.monotonic() + 1500      # cold start + a 15 s scene, with slack
+    while time.monotonic() < deadline:
+        time.sleep(5)
+        try:
+            st = _rp(f"status/{job_id}", timeout=30)
+        except Exception:
+            continue                        # a blip mid-render is not a failure
+        state = st.get("status")
+        if state in ("IN_QUEUE", "IN_PROGRESS"):
+            continue
+        if state != "COMPLETED":
+            raise RuntimeError((st.get("output") or {}).get("message", f"job {state}"))
+        out = st.get("output") or {}
+        video = out.get("video") or {}
+        if video.get("kind") != "base64":
+            raise RuntimeError("no inline video in the job output")
+        db.adventure_mark(
+            sid, "ready", seed=out.get("seed"),
+            generate_s=(out.get("metrics") or {}).get("generate_s"),
+            video=base64.b64decode(video["data"]))
+        return
+    raise RuntimeError("timed out waiting for the scene")
+
+
+@app.get("/adventure", include_in_schema=False)
+def adventure_page():
+    page = STATIC / "adventure.html"
+    if not page.exists():
+        raise HTTPException(404, "adventure page not installed")
+    return FileResponse(page, media_type="text/html")
+
+
+@app.get("/adventure/state")
+def adventure_state() -> dict:
+    """The story tree (no prompts) with each scene's live render status --
+    the page builds the branch map from this and polls it while scenes are
+    still rendering. Public: the story is shared by everyone."""
+    statuses = db.adventure_status(story.STORY_ID)
+    nodes = []
+    for node in story.public_tree():
+        row = statuses.get(node["id"], {})
+        nodes.append({**node, "status": row.get("status", "queued"),
+                      "seed": row.get("seed")})
+    return {"story": story.STORY_ID,
+            "scene_s": story.SCENE_DURATION_S, "nodes": nodes}
+
+
+@app.get("/adventure/scene/{scene_id}")
+def adventure_scene(scene_id: str):
+    if scene_id not in story.NODES:
+        raise HTTPException(404, "no such scene")
+    data = db.adventure_video(scene_id)
+    if data is None:
+        raise HTTPException(404, "scene not rendered yet")
+    # Immutable once rendered: let the browser cache aggressively.
+    return Response(content=data, media_type="video/mp4",
+                    headers={"Cache-Control": "public, max-age=86400"})
 
 
 def _video_response(job_id: str, path: Path, st: dict) -> FileResponse:
