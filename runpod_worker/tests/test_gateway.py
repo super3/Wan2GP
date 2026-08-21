@@ -999,3 +999,43 @@ def test_quota_endpoint_shares_visitor_identity_with_submit(client):
         c.post("/v1/videos", json={"prompt": "x", "background": True}, headers=vt)
     assert c.get("/v1/quota", headers=vt).json()["remaining"] == 1
     assert c.get("/v1/quota").json()["remaining"] == 1  # same address, no token
+
+
+def test_status_forwards_worker_progress(client):
+    """The page shows which generation step the worker is on; the gateway
+    forwards a sanitized copy of the worker's progress frame instead of
+    collapsing everything to a bare 'processing'."""
+    c, m = client
+    with mock.patch.object(m, "_rp", side_effect=_backend(run_id="prog-1")):
+        c.post("/v1/videos", json={"prompt": "x", "background": True}, headers=_hdr(KEY_A))
+    frame = {"status": "IN_PROGRESS", "output": {
+        "phase": "inference_stage_1", "status": "Denoising", "pct": 50,
+        "step": 2, "total_steps": 4, "elapsed_s": 12.0, "eta_s": 11.5,
+        "junk": "not for customers", "pct_evil": {"nested": True}}}
+    with mock.patch.object(m, "_rp", return_value=frame):
+        body = c.get("/v1/videos/prog-1", headers=_hdr(KEY_A)).json()
+    assert body["status"] == "processing"
+    p = body["progress"]
+    assert p["phase"] == "inference_stage_1"
+    assert p["step"] == 2 and p["total_steps"] == 4 and p["eta_s"] == 11.5
+    assert "junk" not in p and "pct_evil" not in p
+    # queued jobs have no frame yet -- no progress key rather than a fake one
+    with mock.patch.object(m, "_rp", return_value={"status": "IN_QUEUE"}):
+        queued = c.get("/v1/videos/prog-1", headers=_hdr(KEY_A)).json()
+    assert queued["status"] == "queued" and "progress" not in queued
+
+
+def test_status_forwards_the_denoising_preview_size_capped(client):
+    c, m = client
+    with mock.patch.object(m, "_rp", side_effect=_backend(run_id="pv-1")):
+        c.post("/v1/videos", json={"prompt": "x", "background": True}, headers=_hdr(KEY_A))
+    ok = {"status": "IN_PROGRESS", "output": {"phase": "inference_stage_1",
+          "preview_jpeg": "aGVsbG8="}}
+    huge = {"status": "IN_PROGRESS", "output": {"phase": "inference_stage_1",
+            "preview_jpeg": "A" * 400_000}}
+    with mock.patch.object(m, "_rp", return_value=ok):
+        p = c.get("/v1/videos/pv-1", headers=_hdr(KEY_A)).json()["progress"]
+    assert p["preview_jpeg"] == "aGVsbG8="
+    with mock.patch.object(m, "_rp", return_value=huge):
+        p = c.get("/v1/videos/pv-1", headers=_hdr(KEY_A)).json()["progress"]
+    assert "preview_jpeg" not in p
