@@ -860,3 +860,12 @@ def test_malformed_device_token_is_refused(client):
                   headers=_hdr("vt_x")).status_code == 401
     assert c.post("/v1/videos", json={"prompt": "x"},
                   headers=_hdr("vt_" + "A" * 200)).status_code == 401
+
+
+def test_hidden_attribute_beats_author_display_rules(client):
+    """Regression: .banner/.gate/.done set display:flex, which outranks the
+    UA's [hidden]{display:none} in the cascade -- sign-up prompts and an
+    empty 'Generated in' row showed through their hidden attributes. The
+    page must carry an author-level [hidden] override."""
+    c, _ = client
+    assert "[hidden] { display:none !important; }" in c.get("/").text
