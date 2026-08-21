@@ -362,6 +362,40 @@ class VideoRequest(BaseModel):
     seed: int | None = Field(default=None, ge=-1, le=2**31 - 1)
 
 
+#: Warm-worker generation seconds per (tier, duration), measured on the
+#: PRO 6000. These are only the floor: rolling averages from the jobs table
+#: override each cell once it has MIN_SAMPLES real completions, so the
+#: advertised estimate tracks what the fleet actually does.
+BASE_TIMES = {"480p": {5: 24, 10: 56, 15: 100},
+              "720p": {5: 48, 10: 103, 15: 185}}
+#: Observed full cold start (weight download, no network volume) ~150 s.
+COLD_START_S = int(os.environ.get("GATEWAY_COLD_START_S", "150"))
+MIN_SAMPLES = 3
+
+_TIER_OF_DIMS = {dims: tier for (tier, _aspect), dims in DIMENSIONS.items()}
+
+
+def _estimate_block() -> dict:
+    """What the page needs to compute an honest time estimate: warm per-combo
+    seconds (rolling averages over recorded generate_s where available), the
+    cold-start penalty, and a mean job time for queue-wait math."""
+    times = {tier: dict(cells) for tier, cells in BASE_TIMES.items()}
+    merged: dict[tuple[str, int], list[float]] = {}
+    for (dims, dur), vals in db.recent_generate_times().items():
+        tier = _TIER_OF_DIMS.get(dims)
+        if tier:
+            merged.setdefault((tier, dur), []).extend(vals)
+    all_vals: list[float] = []
+    for (tier, dur), vals in merged.items():
+        all_vals.extend(vals)
+        if len(vals) >= MIN_SAMPLES and dur in times[tier]:
+            times[tier][dur] = round(sum(vals) / len(vals))
+    avg_job = round(sum(all_vals) / len(all_vals)) if all_vals else 45
+    return {"times": {t: {str(d): s for d, s in cells.items()}
+                      for t, cells in times.items()},
+            "cold_start_s": COLD_START_S, "avg_job_s": avg_job}
+
+
 @app.get("/v1/health")
 def health() -> dict:
     try:
@@ -372,7 +406,8 @@ def health() -> dict:
     w, j = h.get("workers", {}), h.get("jobs", {})
     return {"status": "ok",
             "queue": {"waiting": j.get("inQueue", 0), "running": j.get("inProgress", 0)},
-            "capacity": {"ready": w.get("ready", 0), "starting": w.get("initializing", 0)}}
+            "capacity": {"ready": w.get("ready", 0), "starting": w.get("initializing", 0)},
+            "estimate": _estimate_block()}
 
 
 @app.post("/v1/videos", status_code=202)
@@ -411,6 +446,12 @@ def create(body: VideoRequest, ident: Ident = Depends(auth)) -> dict:
         "video_length": frames,
         "sample_solver": "euler",
         "image_prompt_type": "", "video_prompt_type": "", "audio_prompt_type": "",
+        # prompt_parser.split_prompt_units turns a multi-line prompt into one
+        # prompt PER LINE unless this says the lines are a single prompt
+        # ("FG"). The H3 structured caption format is multi-line by design,
+        # so without the pin a caller's prompt silently becomes several
+        # generations' worth of fragments.
+        "multi_prompts_gen_type": "FG",
     }
     media: dict[str, Any] = {}
     if body.image:
