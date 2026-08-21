@@ -164,6 +164,14 @@ def studio_page():
     return FileResponse(index, media_type="text/html")
 
 
+#: Real example generations the Studio gallery seeds itself with, so a
+#: first-time visitor sees the product before spending a free generation.
+_EXAMPLES = STATIC / "examples"
+if _EXAMPLES.exists():
+    from fastapi.staticfiles import StaticFiles
+    app.mount("/examples", StaticFiles(directory=_EXAMPLES), name="examples")
+
+
 @app.on_event("startup")
 def _startup() -> None:
     _seed_env_keys()
