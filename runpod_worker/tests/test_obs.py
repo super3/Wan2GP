@@ -190,10 +190,19 @@ def test_shipper_failure_never_raises(monkeypatch):
     obs.LOG.info("doomed_event")  # must not raise, block, or kill the worker
 
 
-def test_shipper_disabled_without_url():
-    before = obs._SHIP_QUEUE.qsize()
+def test_shipper_disabled_without_url(monkeypatch):
+    """With no LOG_SHIP_URL, a log call must not enqueue anything. Measured
+    against an explicitly emptied queue: a before/after qsize comparison was
+    racy -- the ship thread started by an earlier test could drain that
+    test's leftover record between the two reads (flaked once in CI)."""
+    monkeypatch.delenv("LOG_SHIP_URL", raising=False)
+    try:
+        while True:
+            obs._SHIP_QUEUE.get_nowait()
+    except Exception:
+        pass                       # empty -- and the thread only ever removes
     obs.LOG.info("not_shipped")
-    assert obs._SHIP_QUEUE.qsize() == before
+    assert obs._SHIP_QUEUE.qsize() == 0
 
 
 def test_stream_events_reach_ring_at_debug_level(monkeypatch):
