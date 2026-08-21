@@ -34,10 +34,16 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setenv("GATEWAY_KEYS", json.dumps({KEY_A: "acme", KEY_B: "globex"}))
     monkeypatch.setenv("GATEWAY_CACHE", str(tmp_path))
     monkeypatch.setenv("GATEWAY_DAILY_LIMIT", "3")
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{tmp_path}/gw.db")
     import importlib
+    from runpod_worker.gateway import db as dbmod
+    dbmod.reset_for_tests()
     from runpod_worker.gateway import app as module
     importlib.reload(module)
-    return TestClient(module.app), module
+    # TestClient's context manager fires the startup hook that seeds env keys.
+    c = TestClient(module.app)
+    c.__enter__()
+    return c, module
 
 
 def _hdr(key):
@@ -459,3 +465,91 @@ def test_api_never_accepts_a_key_as_a_query_parameter(client):
     with mock.patch.object(m, "_rp", side_effect=_backend()):
         r = c.post("/v1/videos?key=" + KEY_A, json={"prompt": "x"})
     assert r.status_code == 401
+
+
+# --- durability: the reason the database exists ------------------------------
+
+def _restarted(module):
+    """Simulate a gateway restart: new app object, same DATABASE_URL."""
+    import importlib
+    from runpod_worker.gateway import db as dbmod
+    dbmod.reset_for_tests()
+    fresh = importlib.reload(module)
+    c = TestClient(fresh.app)
+    c.__enter__()
+    return c, fresh
+
+
+def test_job_ownership_survives_a_restart(client):
+    """The in-memory version orphaned every paid job on restart: the customer
+    had an id, the gateway had no idea whose it was, and the 404-for-unowned
+    rule turned their own job into 'no such job'."""
+    c, m = client
+    with mock.patch.object(m, "_rp", side_effect=_backend(status={"status": "IN_QUEUE"})):
+        job = c.post("/v1/videos", json={"prompt": "x", "background": True},
+                     headers=_hdr(KEY_A)).json()["id"]
+    c2, m2 = _restarted(m)
+    with mock.patch.object(m2, "_rp", side_effect=_backend()):
+        r = c2.get(f"/v1/videos/{job}", headers=_hdr(KEY_A))
+    assert r.status_code == 200 and r.json()["status"] == "completed"
+    # and it is still invisible to the other key
+    assert c2.get(f"/v1/videos/{job}", headers=_hdr(KEY_B)).status_code == 404
+
+
+def test_quota_survives_a_restart(client):
+    """A restart must not hand every key a fresh daily allowance."""
+    c, m = client
+    with mock.patch.object(m, "_rp", side_effect=_backend(status={"status": "IN_QUEUE"})):
+        for _ in range(3):
+            assert c.post("/v1/videos", json={"prompt": "x", "background": True},
+                          headers=_hdr(KEY_A)).status_code == 202
+    c2, m2 = _restarted(m)
+    with mock.patch.object(m2, "_rp", side_effect=_backend(status={"status": "IN_QUEUE"})):
+        assert c2.post("/v1/videos", json={"prompt": "x", "background": True},
+                       headers=_hdr(KEY_A)).status_code == 429
+
+
+def test_revocation_beats_the_env_var(client):
+    """GATEWAY_KEYS seeds the database; it does not resurrect. A key revoked in
+    the DB stays dead even though it is still sitting in the env, because env
+    vars linger in deploy configs long after a credential should be gone."""
+    c, m = client
+    from runpod_worker.gateway import db as dbmod
+    import sqlalchemy as sa, datetime
+    with dbmod.engine().begin() as cx:
+        cx.execute(dbmod.api_keys.update()
+                   .where(dbmod.api_keys.c.key_hash == dbmod.hash_key(KEY_A))
+                   .values(revoked_at=datetime.datetime.utcnow()))
+    assert c.post("/v1/videos", json={"prompt": "x"}, headers=_hdr(KEY_A)).status_code == 401
+    # ...and a restart (which re-seeds from the env) must NOT un-revoke it
+    c2, _ = _restarted(m)
+    assert c2.post("/v1/videos", json={"prompt": "x"}, headers=_hdr(KEY_A)).status_code == 401
+
+
+def test_generate_seconds_lands_in_the_jobs_table(client):
+    """generate_s is what per-second billing computes from; losing it means
+    billing from estimates."""
+    c, m = client
+    with mock.patch.object(m, "_rp", side_effect=_backend()):
+        job = c.post("/v1/videos", json={"prompt": "x", "background": True},
+                     headers=_hdr(KEY_A)).json()["id"]
+        c.get(f"/v1/videos/{job}", headers=_hdr(KEY_A))
+    from runpod_worker.gateway import db as dbmod
+    import sqlalchemy as sa
+    with dbmod.engine().connect() as cx:
+        row = cx.execute(sa.select(dbmod.jobs).where(dbmod.jobs.c.id == job)).mappings().first()
+    assert row["status"] == "completed"
+    assert row["generate_s"] == 55.8
+    assert row["resolution"] == "480p" and row["duration_s"] == 5
+
+
+def test_raw_keys_never_touch_the_database(client):
+    """A database dump must not be a credential dump."""
+    c, m = client
+    from runpod_worker.gateway import db as dbmod
+    import sqlalchemy as sa
+    with dbmod.engine().connect() as cx:
+        rows = [dict(r) for r in cx.execute(sa.select(dbmod.api_keys)).mappings()]
+    blob = json.dumps(rows, default=str)
+    assert KEY_A not in blob and KEY_B not in blob
+    assert dbmod.hash_key(KEY_A) in blob
