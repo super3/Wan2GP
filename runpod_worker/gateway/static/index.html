@@ -7,6 +7,11 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;500;650&family=JetBrains+Mono:wght@400;500&display=swap">
+<!-- The publishable key is public by design: it ships in the page source of
+     every Clerk site and only names which instance to talk to. -->
+<script async crossorigin="anonymous"
+  data-clerk-publishable-key="pk_test_aW1wcm92ZWQtYnVjay00ODk3LmNsZXJrLmFjY291bnRzLmRldiQ"
+  src="https://improved-buck-4897.clerk.accounts.dev/npm/@clerk/clerk-js@5/dist/clerk.browser.js"></script>
 <style>
   * { box-sizing:border-box; }
   body { margin:0; background:#faf9f7; color:#1c1a17;
@@ -17,9 +22,10 @@
   header { border-bottom:1px solid #e3e0da; background:#fff; }
   .hwrap { max-width:1200px; margin:0 auto; padding:14px 28px;
            display:flex; align-items:center; justify-content:space-between; gap:16px; }
-  .brand { display:flex; align-items:baseline; gap:10px; }
+  .brand { display:flex; align-items:center; gap:10px; }
   .brand b { font-weight:650; font-size:16px; }
-  .brand span { font-size:11px; letter-spacing:.12em; text-transform:uppercase; color:#6b665e; }
+  .brand span { font-size:11px; letter-spacing:.12em; text-transform:uppercase; color:#6b665e;
+                padding-top:2px; }
   .hbtns { display:flex; align-items:center; gap:18px; }
   .signin { font-size:13px; font-weight:500; color:#1c1a17; background:none; border:none; padding:0; }
   .signin:hover { color:#b4531f; }
@@ -59,6 +65,12 @@
                  font-size:13px; font-weight:500; border-radius:7px; height:36px; padding:0;
                  background:#fff; border:1px solid #e3e0da; color:#6b665e; }
   .segs button.on { border-color:#b4531f; color:#b4531f; }
+  .lock { display:inline-flex; align-items:center; }
+  body.signedin .lock { display:none; }
+  .gate { display:flex; align-items:center; gap:10px; margin:0 0 16px; padding:10px 12px;
+          background:#faf5f1; border:1px solid #ecd9cc; border-radius:8px; }
+  .gate span { flex:1; font-size:12.5px; color:#8f3f14; line-height:1.45; }
+  .gate .signup { font-size:12px; padding:5px 11px; border-radius:6px; flex:none; }
   .adv-toggle { display:inline-flex; align-items:center; gap:5px; font-size:12.5px; font-weight:500;
                 color:#6b665e; background:none; border:none; padding:0; }
   .adv-toggle:hover { color:#b4531f; }
@@ -68,15 +80,15 @@
     font-size:13px; color:#1c1a17; background:#faf9f7; border:1px solid #e3e0da;
     border-radius:7px; padding:9px 11px; }
   input[type=password] { font-family:Archivo, ui-sans-serif, system-ui, sans-serif; font-size:14px; }
-  .est { display:flex; align-items:center; justify-content:space-between; gap:12px; margin-top:16px;
-         padding:11px 14px; background:#faf5f1; border:1px solid #ecd9cc; border-radius:9px; }
-  .est span:first-child { font-size:13px; color:#8f3f14; }
-  .est b { font-size:18px; font-weight:650; color:#b4531f; font-family:"JetBrains Mono",monospace;
-           font-variant-numeric:tabular-nums; }
-  .create { display:flex; align-items:center; justify-content:center; gap:8px; width:100%;
-            font-weight:650; font-size:16px; margin-top:16px; background:#b4531f; color:#fff;
-            border:1px solid #b4531f; border-radius:9px; padding:13px 20px; }
-  .create:hover { background:#9c4517; border-color:#9c4517; }
+  .create { display:flex; align-items:center; justify-content:center; gap:12px; width:100%;
+            margin-top:16px; background:#b4531f; color:#fff; border:1px solid #9c4517;
+            border-radius:10px; padding:12px 16px; box-shadow:0 1px 2.5px rgba(28,26,23,.18); }
+  .create .clabel { display:inline-flex; align-items:center; gap:9px; font-weight:650;
+                    font-size:16px; letter-spacing:.01em; }
+  .create .cpill { display:inline-flex; align-items:center; gap:6px; font-size:12px; color:#fff;
+                   font-family:"JetBrains Mono",monospace; background:rgba(255,255,255,.16);
+                   padding:4px 11px; border-radius:20px; font-variant-numeric:tabular-nums; }
+  .create:hover { background:#9c4517; }
   .create:disabled { opacity:.5; cursor:not-allowed; }
   .stagecol { flex:1.4 1 420px; min-width:320px; }
   .stage { position:relative; aspect-ratio:16/9; border-radius:12px; overflow:hidden;
@@ -101,7 +113,6 @@
   h2 { font-size:13px; font-weight:650; text-transform:uppercase; letter-spacing:.09em;
        color:#6b665e; margin:32px 0 6px; }
   .retention { font-size:13px; color:#9a6b12; margin:0 0 14px; }
-  .prohint { font-size:12px; color:#9a6b12; margin:0 0 16px; line-height:1.5; }
   .freeline { font-size:12px; color:#6b665e; margin:10px 0 0; text-align:center; }
   .banner { display:flex; align-items:center; gap:14px; margin-top:14px; padding:13px 16px;
             background:#fff; border:1px solid #e3e0da; border-radius:10px; }
@@ -134,17 +145,20 @@
   .tile .ghost { display:inline-flex; align-items:center; gap:4px; font-size:12px; color:#6b665e;
                  background:none; border:none; padding:0; }
   .tile .ghost:hover { text-decoration:underline; color:#b4531f; }
-  .tile .del { margin-left:auto; }
   .tile .del:hover { color:#6b665e; }
   footer { max-width:1200px; margin:0 auto; padding:0 28px 40px; font-size:13px; color:#6b665e; }
 </style>
 </head>
 <body>
 <header><div class="hwrap">
-  <div class="brand"><b>Minimax H3</b><span>Video generation</span></div>
+  <div class="brand">
+    <svg width="26" height="26" viewBox="0 0 26 26"><rect width="26" height="26" rx="7" fill="#b4531f"/><path d="M13 5.5l1.7 5.3 5.5 2.2-5.5 2.2L13 20.5l-1.7-5.3L5.8 13l5.5-2.2z" fill="#fff"/></svg>
+    <b>Minimax H3 Studio</b><span>Fast video generation</span>
+  </div>
   <div class="hbtns">
     <button type="button" class="signin" id="signin">Sign in</button>
     <button type="button" class="signup" id="signup">Sign up free</button>
+    <div id="userbtn" hidden></div>
   </div>
 </div></header>
 
@@ -169,8 +183,8 @@ non_diegetic_music: None.</textarea>
       <div class="field"><label>Length</label>
         <div class="segs" id="durs">
           <button type="button" data-v="5" class="on">5 s</button>
-          <button type="button" data-v="10">10 s</button>
-          <button type="button" data-v="15">15 s</button>
+          <button type="button" data-v="10"><span class="lock"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg></span>10 s</button>
+          <button type="button" data-v="15"><span class="lock"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg></span>15 s</button>
         </div>
       </div>
 
@@ -178,7 +192,7 @@ non_diegetic_music: None.</textarea>
         <div style="flex:1.1"><label>Resolution</label>
           <div class="segs" id="tiers">
             <button type="button" data-v="480p" class="on">480p</button>
-            <button type="button" data-v="720p">720p</button>
+            <button type="button" data-v="720p"><span class="lock"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg></span>720p</button>
           </div>
         </div>
         <div style="flex:1"><label>Aspect</label>
@@ -190,8 +204,10 @@ non_diegetic_music: None.</textarea>
         </div>
       </div>
 
-      <p class="prohint" id="prohint" hidden>Pro feature — free during the preview.
-        <a href="#" id="prolink">Sign up</a> to keep access when limits land.</p>
+      <div class="gate" id="gate" hidden>
+        <span id="gatemsg"></span>
+        <button type="button" class="signup" id="gateup">Sign up free</button>
+      </div>
 
       <div>
         <button type="button" class="adv-toggle" id="advtoggle"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18l6-6-6-6"/></svg>Advanced</button>
@@ -207,9 +223,11 @@ non_diegetic_music: None.</textarea>
         <input id="key" type="password" placeholder="sk_live_…" autocomplete="off" spellcheck="false">
       </div>
 
-      <div class="est"><span>Estimated generation time</span><b id="est">~22 s</b></div>
-      <button type="button" class="create" id="go"><svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2l2.4 7.6L22 12l-7.6 2.4L12 22l-2.4-7.6L2 12l7.6-2.4z"/></svg>Create</button>
-      <p class="freeline">Free while in preview · no account needed for 5 s at 480p</p>
+      <button type="button" class="create" id="go">
+        <span class="clabel"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2l2.4 7.6L22 12l-7.6 2.4L12 22l-2.4-7.6L2 12l7.6-2.4z"/></svg>Create</span>
+        <span class="cpill"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3.5 2"/></svg><span id="est">~22 s</span></span>
+      </button>
+      <p class="freeline" id="quotaline"></p>
     </div>
   </div>
 
@@ -217,7 +235,7 @@ non_diegetic_music: None.</textarea>
     <div class="stage" id="stage">
       <div class="center" id="idlebox">
         <span class="mono">the generated video appears here</span>
-        <span class="sub">write a prompt and press create</span>
+        <span class="sub">write a prompt — a 5 s clip lands in about 22 seconds</span>
       </div>
       <div class="center" id="busybox" hidden>
         <div class="clock"><span id="clock">0.0</span><small> s</small></div>
@@ -230,7 +248,7 @@ non_diegetic_music: None.</textarea>
       <div class="meta" id="meta"></div>
     </div>
     <div class="banner" id="banner" hidden>
-      <div class="txt">Like the speed? A free account keeps your clips past the 1-hour limit and saves your history.</div>
+      <div class="txt">Like the speed? A free account unlocks longer lengths, 720p, and 20 generations a day during the beta.</div>
       <button type="button" class="signup" id="bannerup">Sign up free</button>
       <button type="button" class="x" id="bannerx" title="Dismiss">✕</button>
     </div>
@@ -265,17 +283,44 @@ $("key").addEventListener("change", () => {
   try { sessionStorage.setItem("gw.key", $("key").value); } catch {}
 });
 
-// ---- accounts (not wired up yet) ------------------------------------------
-// The header buttons and banner exist ahead of the auth launch; until then
-// they explain the preview instead of navigating anywhere.
-function accountsSoon(e) {
-  if (e) e.preventDefault();
-  say("Accounts are coming soon — everything here is free during the preview.", "ok");
+// ---- Clerk -----------------------------------------------------------------
+// The script tag in <head> loads ClerkJS async, so window.Clerk may not exist
+// yet when this runs -- wait for it rather than racing it. If it never shows
+// up (ad blocker, offline), the page still works as a signed-out visitor.
+let clerkReady = false;
+(async function initClerk() {
+  for (let i = 0; i < 100 && typeof window.Clerk === "undefined"; i++)
+    await new Promise(r => setTimeout(r, 100));
+  if (typeof window.Clerk === "undefined") return;
+  try { await Clerk.load(); } catch { return; }
+  clerkReady = true;
+  renderAuth();
+  Clerk.addListener(renderAuth);
+})();
+function signedIn() { return clerkReady && !!Clerk.user; }
+function renderAuth() {
+  const yes = signedIn();
+  document.body.classList.toggle("signedin", yes);   // hides the lock icons
+  $("signin").hidden = yes;
+  $("signup").hidden = yes;
+  $("userbtn").hidden = !yes;
+  if (yes && !$("userbtn").hasChildNodes()) Clerk.mountUserButton($("userbtn"));
+  $("key").placeholder = yes ? "optional — you're signed in" : "sk_live_…";
+  if (yes) { $("banner").hidden = true; $("gate").hidden = true; }
+  updateQuotaLine();
 }
-$("signin").addEventListener("click", accountsSoon);
-$("signup").addEventListener("click", accountsSoon);
-$("prolink").addEventListener("click", accountsSoon);
-$("bannerup").addEventListener("click", accountsSoon);
+function openSignUp(e) {
+  if (e) e.preventDefault();
+  if (!clerkReady) return say("Sign-in is still loading — try again in a second.", "err");
+  Clerk.openSignUp({ afterSignInUrl: location.href, afterSignUpUrl: location.href });
+}
+$("signin").addEventListener("click", () => {
+  if (!clerkReady) return say("Sign-in is still loading — try again in a second.", "err");
+  Clerk.openSignIn({ afterSignInUrl: location.href, afterSignUpUrl: location.href });
+});
+$("signup").addEventListener("click", openSignUp);
+$("gateup").addEventListener("click", openSignUp);
+$("bannerup").addEventListener("click", openSignUp);
 $("bannerx").addEventListener("click", () => {
   $("banner").hidden = true;
   try { sessionStorage.setItem("gw.bannerDismissed", "1"); } catch {}
@@ -284,17 +329,41 @@ function bannerDismissed() {
   try { return sessionStorage.getItem("gw.bannerDismissed") === "1"; } catch { return false; }
 }
 
-// ---- pickers ---------------------------------------------------------------
-// Anything past the free tier (5 s at 480p) shows the Pro hint.
-function updateProHint() {
-  $("prohint").hidden = !(state.dur !== "5" || state.tier === "720p");
+// ---- free-tier gating ------------------------------------------------------
+// The display counts are session-local; the server enforces the real per-day
+// quota and answers 429 when it is spent, so this is UX, not security.
+const FREE_CAP = 2, BETA_CAP = 20;
+function gensUsed() {
+  try { return parseInt(sessionStorage.getItem("gw.gens"), 10) || 0; } catch { return 0; }
 }
+function countGen() {
+  try { sessionStorage.setItem("gw.gens", String(gensUsed() + 1)); } catch {}
+  updateQuotaLine();
+}
+function showGate(msg) {
+  $("gatemsg").textContent = msg;
+  $("gate").hidden = false;
+}
+function updateQuotaLine() {
+  const used = gensUsed();
+  $("quotaline").textContent = signedIn()
+    ? Math.max(0, BETA_CAP - used) + " of " + BETA_CAP + " beta generations left today"
+    : Math.max(0, FREE_CAP - used) + " of " + FREE_CAP +
+      " free generations left — sign up for " + BETA_CAP + " a day in the beta";
+}
+
+// ---- pickers ---------------------------------------------------------------
 function pick(groupId, value, stateKey) {
+  // Anything past 5 s at 480p needs an account (or a pasted API key).
+  const gated = (stateKey === "dur" && value !== "5") ||
+                (stateKey === "tier" && value === "720p");
+  if (gated && !signedIn() && !$("key").value.trim())
+    return showGate("Longer lengths and 720p need a free account.");
+  $("gate").hidden = true;
   for (const b of $(groupId).querySelectorAll("button"))
     b.classList.toggle("on", b.dataset.v === value);
   state[stateKey] = value;
   updateEstimate();
-  updateProHint();
 }
 $("durs").addEventListener("click", e => { const b = e.target.closest("button"); if (b) pick("durs", b.dataset.v, "dur"); });
 $("tiers").addEventListener("click", e => { const b = e.target.closest("button"); if (b) pick("tiers", b.dataset.v, "tier"); });
@@ -389,14 +458,35 @@ function renderGallery() {
 }
 
 // ---- generate --------------------------------------------------------------
+// Auth is a pasted sk_ key, a Clerk session, or nothing at all (the free
+// visitor tier). A Clerk session token expires after about a minute, so every
+// request fetches a fresh one rather than reusing the first.
+async function authHeaders() {
+  const key = $("key").value.trim();
+  if (key) return { Authorization: "Bearer " + key };
+  if (signedIn() && Clerk.session) {
+    try {
+      const t = await Clerk.session.getToken();
+      if (t) return { Authorization: "Bearer " + t };
+    } catch {}
+  }
+  return {};
+}
+
 // Always background:true + short polls: a phone browser aborts a held fetch
 // the moment the screen locks, which surfaced as "Failed to fetch" while the
 // identical curl call succeeded. Short polls survive backgrounding.
 $("go").addEventListener("click", async () => {
   const prompt = promptEl.value.trim();
-  const key = $("key").value.trim();
+  const hasKey = !!$("key").value.trim();
   if (!prompt) return say("Enter a prompt.", "err");
-  if (!key)    return say("Enter your API key.", "err");
+  if (!hasKey && !signedIn()) {
+    if (state.dur !== "5" || state.tier === "720p")
+      return showGate("Longer lengths and 720p need a free account.");
+    if (gensUsed() >= FREE_CAP)
+      return showGate("You've used your " + FREE_CAP + " free generations. " +
+                      "Create a free account for " + BETA_CAP + " a day during the beta.");
+  }
 
   state.busy = true;
   $("go").disabled = true;
@@ -412,7 +502,7 @@ $("go").addEventListener("click", async () => {
     const seedVal = parseInt($("seed").value, 10);
     const res = await fetch("/v1/videos", {
       method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: "Bearer " + key },
+      headers: { "Content-Type": "application/json", ...(await authHeaders()) },
       body: JSON.stringify({
         prompt, duration_s: Number(state.dur), resolution: state.tier,
         aspect_ratio: state.aspect, background: true,
@@ -422,15 +512,19 @@ $("go").addEventListener("click", async () => {
     if (!res.ok) {
       let d = res.statusText;
       try { d = (await res.json()).detail || d; } catch {}
+      if (res.status === 429 && !hasKey && !signedIn())
+        return showGate("You've used your " + FREE_CAP + " free generations. " +
+                        "Create a free account for " + BETA_CAP + " a day during the beta.");
       return say("HTTP " + res.status + " — " + d, "err");
     }
+    if (!hasKey) countGen();          // display only -- the server keeps the real count
     const { poll_url } = await res.json();
 
     let info = null;
     for (let i = 0; i < 240; i++) {
       await new Promise(r => setTimeout(r, 3000));
       let p;
-      try { p = await fetch(poll_url, { headers: { Authorization: "Bearer " + key } }); }
+      try { p = await fetch(poll_url, { headers: await authHeaders() }); }
       catch { continue; }                       // a blip mid-generation is not a failure
       if (!p.ok) continue;
       info = await p.json();
@@ -442,7 +536,7 @@ $("go").addEventListener("click", async () => {
     }
     if (!info || info.status !== "completed") return say("Timed out waiting for the video.", "err");
 
-    const v = await fetch(info.content_url, { headers: { Authorization: "Bearer " + key } });
+    const v = await fetch(info.content_url, { headers: await authHeaders() });
     if (!v.ok) return say("Could not download the video.", "err");
     const blob = await v.blob();
     const url = URL.createObjectURL(blob);
@@ -459,7 +553,7 @@ $("go").addEventListener("click", async () => {
     });
     state.gallery = state.gallery.slice(0, 12);
     renderGallery();
-    if (!bannerDismissed()) $("banner").hidden = false;
+    if (!bannerDismissed() && !signedIn()) $("banner").hidden = false;
   } catch (e) {
     say("Request failed: " + e, "err");
   } finally {
@@ -470,7 +564,7 @@ $("go").addEventListener("click", async () => {
   }
 });
 updateEstimate();
-updateProHint();
+updateQuotaLine();
 </script>
 </body>
 </html>
