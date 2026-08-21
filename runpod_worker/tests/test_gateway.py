@@ -689,8 +689,9 @@ def test_bad_aspect_refused(client):
 
 
 def test_cache_purge_honours_retention(client, tmp_path, monkeypatch):
-    """The Studio page says 'kept for 1 hour'; the purge is what makes that
-    true. Billing rows must survive the bytes expiring."""
+    """The server is a delivery buffer, not storage: the page saves clips
+    into the viewer's browser and the server copy expires minutes later.
+    Billing rows must survive the bytes expiring."""
     import os, time as _t
     c, m = client
     old = m.CACHE / "ancient.mp4"; old.write_bytes(b"x")
@@ -707,7 +708,9 @@ def test_studio_page_is_the_landing_page(client):
     body = c.get("/").text
     assert "Minimax H3 Studio" in body
     assert "aspect_ratio: state.aspect" in body       # the page sends the new field
-    assert "kept for 1 hour" in body
+    # Clips persist in the BROWSER (IndexedDB); the server copy is short-lived.
+    assert "Clips save to this browser" in body
+    assert "indexedDB.open" in body
     # The Studio page is the only page: no legacy demo, no auto-generated docs.
     assert c.get("/legacy").status_code == 404
     assert c.get("/docs").status_code == 404
