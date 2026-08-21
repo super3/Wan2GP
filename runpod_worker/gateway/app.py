@@ -145,6 +145,12 @@ class VideoRequest(BaseModel):
     #: far more expensive than the one they think they are buying.
     duration_s: int = Field(default=DEFAULT_DURATION,
                             description="clip length in seconds: 5 or 10")
+    #: Return 202 + a job id immediately instead of holding the connection.
+    #: Browsers -- phones especially -- abort a fetch when the screen locks or
+    #: the tab is backgrounded, so a 30 s held connection is unreliable there
+    #: even though it is perfectly fine for curl or a server-side caller.
+    background: bool = Field(default=False,
+                             description="return a job id immediately instead of the file")
     #: -1 (or omitted) picks a random seed; the resolved value is returned so a
     #: generation can be reproduced exactly.
     seed: int | None = Field(default=None, ge=-1, le=2**31 - 1)
@@ -200,6 +206,13 @@ def create(body: VideoRequest, key: str = Depends(auth)) -> dict:
         raise HTTPException(503, "could not queue the job")
     with _lock:
         _jobs[job_id] = {"owner": key, "created": time.time(), "seed": body.seed}
+
+    if body.background:
+        return JSONResponse(
+            status_code=202,
+            headers={"Retry-After": "10", "Location": f"/v1/videos/{job_id}"},
+            content={"id": job_id, "status": "queued",
+                     "poll_url": f"/v1/videos/{job_id}"})
 
     # Hold the connection and hand back the mp4 itself. One call, one file, no
     # polling -- which is the whole point of this route.
