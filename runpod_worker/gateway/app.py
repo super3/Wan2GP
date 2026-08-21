@@ -60,24 +60,48 @@ RUNPOD_API = "https://api.runpod.ai/v2"
 #: the legal frame counts nearest 5 and 10 seconds at 24 fps. 5 s generates in
 #: roughly 22 s warm and 10 s in roughly 56 s, so the short one is the default:
 #: it fits inside a 60 s proxy timeout, which the long one does not.
-DURATIONS = {5: 124, 10: 243}
+#: 17n + 5 frames at 24 fps. 362 (15.08 s) is the model's maximum single
+#: window; beyond it WanGP starts chaining sliding windows internally.
+DURATIONS = {5: 124, 10: 243, 15: 362}
 DEFAULT_DURATION = 5
-#: NOT 1280x720: the VAE's 16x spatial compression and the patch size mean the
-#: height must land on the model's lattice, and 720 does not -- schema.py:1909
-#: rejects it with "nearest valid: 1280x704". 704 is the real 16:9-ish 720p.
-#: 2.26x the pixels of 480p, so it generates far slower; the turbo LoRA is
-#: 768p-trained so this is near its native size.
-RESOLUTIONS = {
-    "480p": "832x480",     # 16:9, every measurement in the README
-    "720p": "1280x704",    # 16:9
-    "square": "960x960",   # 1:1, 1.02x the pixels of 720p so it costs the same
+#: The Studio design's aspect x tier matrix. Every cell is a multiple of 32 in
+#: both dimensions -- the model's block lattice. NOT 1280x720 / 720x1280: 720
+#: is off the lattice and schema.py:1909 rejects it instantly ("nearest valid:
+#: 1280x704"); 704 is the real 16:9-ish 720p. The turbo LoRA is 768p-trained,
+#: so the 720p tier sits near its native size.
+DIMENSIONS = {
+    ("480p", "horizontal"): "832x480",     # every measurement in the README
+    ("480p", "portrait"):  "480x832",
+    ("480p", "square"):    "640x640",
+    ("720p", "horizontal"): "1280x704",
+    ("720p", "portrait"):  "704x1280",
+    ("720p", "square"):    "960x960",      # 1.02x the pixels of 1280x704
 }
+RESOLUTION_TIERS = ("480p", "720p")
+ASPECTS = ("horizontal", "portrait", "square")
 DEFAULT_RESOLUTION = "480p"
+DEFAULT_ASPECT = "horizontal"
 ACCEL_PROFILE = "Turbo Lightx2v FL2V 4 Steps v1.0 768p"
 MODEL_TYPE = "minimax_h3_fl2va_pruned"
 
 CACHE = Path(os.environ.get("GATEWAY_CACHE", "/tmp/gateway-videos"))
 CACHE.mkdir(parents=True, exist_ok=True)
+
+#: How long a finished mp4 stays downloadable. The Studio page tells people
+#: "generations are only kept for 1 hour -- save what you want"; this is what
+#: makes that sentence true rather than aspirational. Billing rows in the jobs
+#: table are unaffected -- only the bytes expire.
+RETENTION_S = int(os.environ.get("GATEWAY_RETENTION_S", "3600"))
+
+
+def _purge_expired_cache() -> None:
+    cutoff = time.time() - RETENTION_S
+    try:
+        for f in CACHE.glob("*.mp4"):
+            if f.stat().st_mtime < cutoff:
+                f.unlink(missing_ok=True)
+    except OSError:
+        pass                                  # purging is best effort
 
 
 def _env(name: str) -> str:
@@ -123,11 +147,19 @@ STATIC = Path(__file__).parent / "static"
 
 
 @app.get("/", include_in_schema=False)
-def docs_page():
+def studio_page():
     index = STATIC / "index.html"
     if not index.exists():
-        raise HTTPException(404, "docs page not installed")
+        raise HTTPException(404, "studio page not installed")
     return FileResponse(index, media_type="text/html")
+
+
+@app.get("/legacy", include_in_schema=False)
+def legacy_page():
+    page = STATIC / "legacy.html"
+    if not page.exists():
+        raise HTTPException(404, "legacy page not installed")
+    return FileResponse(page, media_type="text/html")
 
 @app.on_event("startup")
 def _startup() -> None:
@@ -175,11 +207,15 @@ class VideoRequest(BaseModel):
     #: Browsers -- phones especially -- abort a fetch when the screen locks or
     #: the tab is backgrounded, so a 30 s held connection is unreliable there
     #: even though it is perfectly fine for curl or a server-side caller.
-    #: 720p is 2.31x the pixels of 480p and takes minutes rather than seconds,
+    #: 720p is ~2.3x the pixels of 480p and takes minutes rather than seconds,
     #: which is why it is background-only below -- no synchronous route can
-    #: outlast the proxy for it.
+    #: outlast the proxy for it. "square" stays accepted as a legacy alias for
+    #: resolution=720p tier + aspect_ratio=square (960x960), the shape the
+    #: first customer integration was given.
     resolution: str = Field(default=DEFAULT_RESOLUTION,
-                            description="480p (default), 720p, or square (960x960)")
+                            description="480p (default) or 720p")
+    aspect_ratio: str = Field(default=DEFAULT_ASPECT,
+                              description="horizontal (default), portrait, or square")
     #: A start frame, base64 (raw or a data: URI). The model is first-last-to-
     #: video, so this conditions the opening frame and the motion follows from
     #: it. Its aspect should match `resolution` or the model letterboxes.
@@ -208,23 +244,28 @@ def health() -> dict:
 def create(body: VideoRequest, key: str = Depends(auth)) -> dict:
     if body.duration_s not in DURATIONS:
         raise HTTPException(422, f"duration_s must be one of {sorted(DURATIONS)}")
-    if body.resolution not in RESOLUTIONS:
-        raise HTTPException(422, f"resolution must be one of {sorted(RESOLUTIONS)}")
+    tier, aspect = body.resolution, body.aspect_ratio
+    if tier == "square":                     # legacy alias, pre-aspect API
+        tier, aspect = "720p", "square"
+    if tier not in RESOLUTION_TIERS:
+        raise HTTPException(422, f"resolution must be one of {sorted(RESOLUTION_TIERS)}")
+    if aspect not in ASPECTS:
+        raise HTTPException(422, f"aspect_ratio must be one of {sorted(ASPECTS)}")
     today = date.today().isoformat()
     if not db.try_consume_quota(key, today, DAILY_LIMIT):
         raise HTTPException(429, f"daily limit of {DAILY_LIMIT} videos reached")
 
     frames = DURATIONS[body.duration_s]
-    # 720p cannot finish inside SYNC_TIMEOUT, and holding the connection until
-    # the proxy kills it loses the job id -- which is the one thing the caller
-    # needs. Force background rather than let them pick a combination that
-    # cannot work.
-    # Anything above 480p takes minutes; a held connection cannot outlast the
-    # proxy, and losing the job id is worse than waiting.
-    background = body.background or body.resolution != "480p"
+    # Only 480p at 5 or 10 s fits inside SYNC_TIMEOUT (measured ~22 s and
+    # ~56 s). Everything else takes minutes; a held connection cannot outlast
+    # the proxy, and losing the job id is worse than waiting -- so those are
+    # forced to background rather than offered as a combination that cannot
+    # work.
+    background = body.background or tier != "480p" or body.duration_s > 10
+    _purge_expired_cache()
     settings: dict[str, Any] = {
         "prompt": body.prompt,
-        "resolution": RESOLUTIONS[body.resolution],
+        "resolution": DIMENSIONS[(tier, aspect)],
         "video_length": frames,
         "sample_solver": "euler",
         "image_prompt_type": "", "video_prompt_type": "", "audio_prompt_type": "",
@@ -253,7 +294,7 @@ def create(body: VideoRequest, key: str = Depends(auth)) -> dict:
     job_id = created.get("id")
     if not job_id:
         raise HTTPException(503, "could not queue the job")
-    db.record_job(job_id, key, resolution=body.resolution,
+    db.record_job(job_id, key, resolution=DIMENSIONS[(tier, aspect)],
                   duration_s=body.duration_s, seed=body.seed)
 
     if background:
