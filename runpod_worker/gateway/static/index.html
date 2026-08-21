@@ -124,7 +124,7 @@ non_diegetic_music: None.</textarea>
       <label for="res">Resolution</label>
       <select id="res">
         <option value="480p" selected>480p &middot; 832&times;480</option>
-        <option value="720p">720p &middot; 1280&times;720, several minutes</option>
+        <option value="720p">720p &middot; 1280&times;704, several minutes</option>
       </select>
     </div>
     <p class="note" id="esti"></p>
@@ -159,7 +159,7 @@ non_diegetic_music: None.</textarea>
     <tr><th>Field</th><th></th></tr>
     <tr><td><code>prompt</code></td><td>Required. The three-block format below.</td></tr>
     <tr><td><code>duration_s</code></td><td>Optional. <code>5</code> (default) or <code>10</code>. Anything else is a 422 — the model's frame lattice only admits certain lengths.</td></tr>
-    <tr><td><code>resolution</code></td><td>Optional. <code>480p</code> (default, 832&times;480) or <code>720p</code> (1280&times;720). 720p is always returned as a job id to poll — it cannot finish inside a synchronous request.</td></tr>
+    <tr><td><code>resolution</code></td><td>Optional. <code>480p</code> (default, 832&times;480) or <code>720p</code> (1280&times;704). 720p is always returned as a job id to poll — it cannot finish inside a synchronous request.</td></tr>
     <tr><td><code>seed</code></td><td>Optional integer. Omit or <code>-1</code> for random.</td></tr>
     <tr><td><code>background</code></td><td>Optional. <code>true</code> returns a job id immediately instead of the file. Use it from a browser — a held connection dies when a phone locks its screen.</td></tr>
   </table>
