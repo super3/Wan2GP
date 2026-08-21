@@ -152,6 +152,7 @@ non_diegetic_music: None.</textarea>
     <tr><td><code>prompt</code></td><td>Required. The three-block format below.</td></tr>
     <tr><td><code>duration_s</code></td><td>Optional. <code>5</code> (default) or <code>10</code>. Anything else is a 422 — the model's frame lattice only admits certain lengths.</td></tr>
     <tr><td><code>seed</code></td><td>Optional integer. Omit or <code>-1</code> for random.</td></tr>
+    <tr><td><code>background</code></td><td>Optional. <code>true</code> returns a job id immediately instead of the file. Use it from a browser — a held connection dies when a phone locks its screen.</td></tr>
   </table>
 
   <h3>When it can't finish in time</h3>
@@ -266,31 +267,43 @@ $("go").addEventListener("click", async () => {
 
   const started = Date.now();
   try {
+    // background:true so the connection closes immediately. A phone browser
+    // aborts a held fetch the moment the screen locks or the tab is
+    // backgrounded, which surfaced here as "TypeError: Failed to fetch" after
+    // ~30 s while the identical curl call succeeded. Short polls survive that.
     const res = await fetch("/v1/videos", {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: "Bearer " + key },
-      body: JSON.stringify({ prompt, duration_s: Number($("dur").value) }),
+      body: JSON.stringify({ prompt, duration_s: Number($("dur").value), background: true }),
     });
-
-    if (res.status === 202) {
-      const body = await res.json();
-      return say("Still generating past the synchronous limit — a worker is booting. "
-               + "Job id " + body.id + "; poll " + body.poll_url + ".", "err");
-    }
     if (!res.ok) {
       let detail = res.statusText;
       try { detail = (await res.json()).detail || detail; } catch {}
       return say("HTTP " + res.status + " — " + detail, "err");
     }
+    const { id, poll_url } = await res.json();
 
-    const blob = await res.blob();
+    let info = null;
+    for (let i = 0; i < 200; i++) {
+      await new Promise((r) => setTimeout(r, 3000));
+      const p = await fetch(poll_url, { headers: { Authorization: "Bearer " + key } });
+      if (!p.ok) continue;                       // a blip mid-generation is not a failure
+      info = await p.json();
+      if (info.status === "completed") break;
+      if (info.status === "failed") return say("Generation failed: " + (info.error || ""), "err");
+      say(`${info.status === "queued" ? "Queued — a worker is starting" : "Generating"}`
+        + ` — ${Math.round((Date.now() - started) / 1000)}s elapsed`);
+    }
+    if (!info || info.status !== "completed") return say("Timed out waiting for the video.", "err");
+
+    const vres = await fetch(info.content_url, { headers: { Authorization: "Bearer " + key } });
+    if (!vres.ok) return say("Could not download the video.", "err");
+    const blob = await vres.blob();
     $("vid").src = URL.createObjectURL(blob);
     $("vid").style.display = "block";
-    const h = (n) => res.headers.get(n) || "—";
     $("meta").textContent =
-      `seed ${h("X-Seed")} · ${h("X-Duration-Seconds")}s · ${h("X-Width")}×${h("X-Height")}`
-      + ` · audio ${h("X-Has-Audio")} · generated in ${h("X-Generate-Seconds")}s`
-      + ` · round trip ${((Date.now() - started) / 1000).toFixed(1)}s`;
+      `seed ${info.seed} · ${info.duration_s}s · ${info.width}×${info.height}`
+      + ` · audio ${info.has_audio} · round trip ${((Date.now() - started) / 1000).toFixed(1)}s`;
     $("meta").style.display = "block";
     say("Done. Play with sound on — the audio is generated with the video.", "ok");
   } catch (e) {
