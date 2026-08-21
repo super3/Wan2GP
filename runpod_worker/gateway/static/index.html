@@ -44,6 +44,16 @@
        border-bottom:1px solid var(--line); }
   td { padding:8px 12px 8px 0; border-bottom:1px solid var(--line); vertical-align:top; }
   td:first-child { white-space:nowrap; }
+  .status { display:flex; align-items:center; gap:9px; margin:0 0 12px;
+    padding:9px 13px; border:1px solid var(--line); border-radius:9px;
+    background:var(--panel); font-size:13px; color:var(--dim);
+    font-variant-numeric:tabular-nums; }
+  .status .dot { width:8px; height:8px; border-radius:50%; background:var(--dim); flex:none; }
+  .status.warm .dot { background:var(--ok); }
+  .status.busy .dot { background:var(--warn); }
+  .status.cold .dot { background:var(--dim); }
+  .status.down .dot { background:var(--accent); }
+  .status .ago { margin-left:auto; opacity:.6; font-size:11.5px; }
   .card { background:var(--panel); border:1px solid var(--line); border-radius:11px;
           padding:20px; margin:0 0 18px; }
   label { display:block; font-size:12px; text-transform:uppercase; letter-spacing:.07em;
@@ -86,6 +96,11 @@
 
 <main>
   <h2>Try it</h2>
+  <div class="status" id="status" hidden>
+    <span class="dot" id="sdot"></span>
+    <span id="stext">checking…</span>
+    <span class="ago" id="sago"></span>
+  </div>
   <div class="card">
     <div class="field">
       <label for="key">API key</label>
@@ -187,6 +202,55 @@ const $ = (id) => document.getElementById(id);
 // in a query string, and nothing to configure.
 const say = (text, cls) => { const m = $("msg"); m.textContent = text; m.className = cls || ""; m.style.display = "block"; };
 
+// Live capacity. /v1/health needs no key, so this works from page load and
+// tells a first-time caller whether they are about to pay a cold start --
+// which is the difference between a ~22 s reply and a 202.
+let lastPoll = 0;
+
+function renderStatus(body, failed) {
+  const box = $("status");
+  box.hidden = false;
+  if (failed) {
+    box.className = "status down";
+    $("stext").textContent = "service unreachable";
+    return;
+  }
+  const q = body.queue || {}, cap = body.capacity || {};
+  const pending = (q.waiting || 0) + (q.running || 0);
+  const ready = cap.ready || 0, starting = cap.starting || 0;
+  if (pending) {
+    box.className = "status busy";
+    $("stext").textContent =
+      `${pending} job${pending === 1 ? "" : "s"} in flight`
+      + ` — ${ready} worker${ready === 1 ? "" : "s"} ready`
+      + (starting ? `, ${starting} starting` : "");
+  } else if (ready) {
+    box.className = "status warm";
+    $("stext").textContent = `warm — ${ready} worker ready, a 5 s clip returns in about 22 s`;
+  } else if (starting) {
+    box.className = "status cold";
+    $("stext").textContent = "a worker is starting — the next request may take a few minutes";
+  } else {
+    box.className = "status cold";
+    $("stext").textContent = "idle — the first request starts a worker and can take a few minutes";
+  }
+  lastPoll = Date.now();
+}
+
+async function poll() {
+  try {
+    const r = await fetch("/v1/health");
+    renderStatus(r.ok ? await r.json() : null, !r.ok);
+  } catch { renderStatus(null, true); }
+}
+poll();
+setInterval(poll, 10000);
+setInterval(() => {
+  if (!lastPoll) return;
+  const s = Math.round((Date.now() - lastPoll) / 1000);
+  $("sago").textContent = s < 2 ? "just now" : `${s}s ago`;
+}, 1000);
+
 $("key").value = sessionStorage.getItem("gw.key") || "";
 $("key").addEventListener("change", () => { try { sessionStorage.setItem("gw.key", $("key").value); } catch {} });
 
@@ -233,6 +297,7 @@ $("go").addEventListener("click", async () => {
     say("Request failed: " + e, "err");
   } finally {
     $("go").disabled = false;
+    poll();
   }
 });
 </script>
