@@ -316,7 +316,7 @@ function renderAuth() {
   for (const b of document.querySelectorAll(
       '#durs button[data-v="10"], #durs button[data-v="15"], #tiers button[data-v="720p"]'))
     b.title = yes ? "" : "Requires a free account";
-  updateQuotaLine();
+  refreshQuota();                       // the identity just changed
   // Mounting last: a throw inside ClerkJS must not leave sign-up prompts
   // showing to a signed-in user.
   if (yes && !$("userbtn").hasChildNodes()) {
@@ -348,20 +348,25 @@ function bannerDismissed() {
 }
 
 // ---- free-tier gating ------------------------------------------------------
-// The display counts are session-local; the server enforces the real per-day
-// quota and answers 429 when it is spent, so this is UX, not security.
-const FREE_CAP = 2, BETA_CAP = 20;
-// Counted per identity: clips burned as an anonymous visitor must not eat
-// into the account allowance shown after signing in.
-function gensKey() {
-  return "gw.gens." + (signedIn() ? Clerk.user.id : "anon");
-}
-function gensUsed() {
-  try { return parseInt(sessionStorage.getItem(gensKey()), 10) || 0; } catch { return 0; }
-}
-function countGen() {
-  try { sessionStorage.setItem(gensKey(), String(gensUsed() + 1)); } catch {}
+const FREE_CAP = 2, BETA_CAP = 20;      // gate copy only; limits live server-side
+// The quota line shows what the SERVER says is left. An earlier version kept
+// a sessionStorage counter, which promised "2 of 2 left" to a visitor whose
+// address had already spent both -- the server then 429'd the "first" clip.
+let quota = null;
+async function refreshQuota() {
+  try {
+    const r = await fetch("/v1/quota", { headers: await authHeaders() });
+    if (r.ok) quota = await r.json();
+  } catch {}
   updateQuotaLine();
+}
+function updateQuotaLine() {
+  if (!quota) { $("quotaline").textContent = ""; return; }
+  $("quotaline").textContent = quota.kind === "visitor"
+    ? quota.remaining + " of " + quota.limit +
+      " free generations left — sign up for " + BETA_CAP + " a day in the beta"
+    : quota.remaining + " of " + quota.limit +
+      (quota.kind === "clerk" ? " beta" : "") + " generations left today";
 }
 // The gate and the free hint share the slot: whichever applies is visible.
 function showGate(msg) {
@@ -372,13 +377,6 @@ function showGate(msg) {
 function hideGate() {
   $("gate").hidden = true;
   $("freehint").hidden = signedIn();
-}
-function updateQuotaLine() {
-  const used = gensUsed();
-  $("quotaline").textContent = signedIn()
-    ? Math.max(0, BETA_CAP - used) + " of " + BETA_CAP + " beta generations left today"
-    : Math.max(0, FREE_CAP - used) + " of " + FREE_CAP +
-      " free generations left — sign up for " + BETA_CAP + " a day in the beta";
 }
 
 // ---- pickers ---------------------------------------------------------------
@@ -594,7 +592,7 @@ $("go").addEventListener("click", async () => {
   if (!hasKey && !signedIn()) {
     if (state.dur !== "5" || state.tier === "720p")
       return showGate("Longer lengths and 720p need a free account.");
-    if (gensUsed() >= FREE_CAP)
+    if (quota && quota.kind === "visitor" && quota.remaining <= 0)
       return showGate("You've used your " + FREE_CAP + " free generations. " +
                       "Create a free account for " + BETA_CAP + " a day during the beta.");
   }
@@ -625,12 +623,13 @@ $("go").addEventListener("click", async () => {
     if (!res.ok) {
       let d = res.statusText;
       try { d = (await res.json()).detail || d; } catch {}
+      refreshQuota();
       if (res.status === 429 && !hasKey && !signedIn())
         return showGate("You've used your " + FREE_CAP + " free generations. " +
                         "Create a free account for " + BETA_CAP + " a day during the beta.");
       return say("HTTP " + res.status + " — " + d, "err");
     }
-    if (!hasKey) countGen();          // display only -- the server keeps the real count
+    refreshQuota();                   // the server just counted this one
     const { poll_url } = await res.json();
 
     let info = null;
@@ -677,7 +676,7 @@ $("go").addEventListener("click", async () => {
   }
 });
 updateEstimate();
-updateQuotaLine();
+refreshQuota();
 </script>
 </body>
 </html>

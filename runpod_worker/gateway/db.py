@@ -174,6 +174,13 @@ def try_consume_quota(key_hash: str, day: str, limit: int) -> bool:
     return True
 
 
+def usage_today(key_hash: str, day: str) -> int:
+    with engine().connect() as cx:
+        row = cx.execute(sa.select(usage.c.count).where(
+            usage.c.key_hash == key_hash, usage.c.day == day)).first()
+    return row[0] if row else 0
+
+
 def refund_quota(key_hash: str, day: str) -> None:
     """A failed submit must not bill the quota."""
     with engine().begin() as cx:

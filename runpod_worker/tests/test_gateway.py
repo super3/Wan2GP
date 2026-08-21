@@ -935,3 +935,35 @@ def test_multiline_prompts_stay_one_prompt(client):
                headers=_hdr(KEY_A))
     assert seen["multi_prompts_gen_type"] == "FG"
     assert "\n" in seen["prompt"]                     # the newline survives intact
+
+
+# --- /v1/quota ---------------------------------------------------------------
+
+def test_quota_endpoint_reports_server_truth(client):
+    """The page displays what this returns instead of a client-side counter,
+    which drifted the moment quota outlived the tab."""
+    c, m = client
+    q = c.get("/v1/quota").json()
+    assert q == {"kind": "visitor", "limit": 2, "used": 0, "remaining": 2}
+    with mock.patch.object(m, "_rp", side_effect=_backend()):
+        c.post("/v1/videos", json={"prompt": "x", "background": True})
+    q = c.get("/v1/quota").json()
+    assert q["used"] == 1 and q["remaining"] == 1
+
+
+def test_quota_endpoint_for_api_keys(client):
+    c, _ = client
+    q = c.get("/v1/quota", headers=_hdr(KEY_A)).json()
+    assert q["kind"] == "key" and q["limit"] == 3      # fixture's daily limit
+    assert c.get("/v1/quota", headers=_hdr("sk_bogus")).status_code == 401
+
+
+def test_quota_endpoint_shares_visitor_identity_with_submit(client):
+    """A device token's quota is still the address's quota, so the number the
+    page shows matches what a submit will be judged against."""
+    c, m = client
+    vt = _hdr("vt_55555555-aaaa-bbbb-cccc-666666666666")
+    with mock.patch.object(m, "_rp", side_effect=_backend()):
+        c.post("/v1/videos", json={"prompt": "x", "background": True}, headers=vt)
+    assert c.get("/v1/quota", headers=vt).json()["remaining"] == 1
+    assert c.get("/v1/quota").json()["remaining"] == 1  # same address, no token
