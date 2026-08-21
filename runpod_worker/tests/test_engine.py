@@ -447,3 +447,20 @@ def test_preview_events_ride_the_next_progress_frame(tmp_path, monkeypatch):
     assert "preview_jpeg" not in seen[0]          # nothing encoded yet
     assert seen[1]["preview_jpeg"] == "JPEG1"
     assert seen[2]["preview_jpeg"] == "JPEG1"     # failed encode keeps the last good one
+
+
+def test_encode_preview_encodes_the_bridged_pil_image():
+    """The CLI bridge hands the engine a PreviewUpdate with a decoded PIL
+    image, NOT raw latents -- the encoder must use it directly. (The first
+    version re-ran wgp.generate_preview on the already-converted object and
+    silently produced nothing.)"""
+    PIL = pytest.importorskip("PIL.Image")
+    from types import SimpleNamespace
+    import base64
+    out = engine._encode_preview(SimpleNamespace(image=PIL.new("RGB", (400, 240), "red")))
+    assert isinstance(out, str)
+    jpeg = base64.b64decode(out)
+    assert jpeg[:3] == b"\xff\xd8\xff"                # a real JPEG
+    assert len(jpeg) < 60_000
+    assert engine._encode_preview(SimpleNamespace(image=None)) is None
+    assert engine._encode_preview(object()) is None
