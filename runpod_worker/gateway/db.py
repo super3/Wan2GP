@@ -57,6 +57,29 @@ jobs = sa.Table(
     sa.Column("created_at", sa.DateTime, nullable=False),
 )
 
+#: One row per adventure scene. Unlike customer clips (delivery-buffered and
+#: deleted), these ARE the product: generated once, kept forever, shared by
+#: every player. The mp4 bytes live in the row -- 14 scenes at a few MB each
+#: is nothing to Postgres, and it inherits Railway's durability with no new
+#: storage service.
+adventure_scenes = sa.Table(
+    "adventure_scenes", _metadata,
+    sa.Column("id", sa.String(40), primary_key=True),
+    sa.Column("story", sa.String(40), nullable=False, index=True),
+    sa.Column("position", sa.Integer, nullable=False),   # encounter order
+    sa.Column("depth", sa.Integer, nullable=False),
+    sa.Column("title", sa.String(200), nullable=False),
+    sa.Column("prompt", sa.Text, nullable=False),
+    sa.Column("status", sa.String(16), nullable=False, server_default="queued"),
+    sa.Column("attempts", sa.Integer, nullable=False, server_default="0"),
+    sa.Column("job_id", sa.String(80), nullable=True),
+    sa.Column("seed", sa.Integer, nullable=True),
+    sa.Column("generate_s", sa.Float, nullable=True),
+    sa.Column("error", sa.String(500), nullable=True),
+    sa.Column("video", sa.LargeBinary, nullable=True),
+    sa.Column("updated_at", sa.DateTime, nullable=False),
+)
+
 _engine: sa.Engine | None = None
 
 
@@ -219,6 +242,92 @@ def record_job(job_id: str, key_hash: str, *, resolution: str, duration_s: int,
         cx.execute(jobs.insert().values(
             id=job_id, key_hash=key_hash, resolution=resolution,
             duration_s=duration_s, seed=seed, created_at=_now()))
+
+
+# ---------------------------------------------------------------------------
+# adventure scenes
+# ---------------------------------------------------------------------------
+
+def adventure_seed(story: str, scenes: list[dict[str, Any]]) -> None:
+    """Insert missing scene rows; existing rows (and their videos) are never
+    touched, so re-deploys are free and finished work is never re-done."""
+    with engine().begin() as cx:
+        have = {r[0] for r in cx.execute(
+            sa.select(adventure_scenes.c.id)
+            .where(adventure_scenes.c.story == story)).all()}
+        for scene in scenes:
+            if scene["id"] not in have:
+                cx.execute(adventure_scenes.insert().values(
+                    id=scene["id"], story=story, position=scene["position"],
+                    depth=scene["depth"], title=scene["title"],
+                    prompt=scene["prompt"], updated_at=_now()))
+
+
+def adventure_requeue_stale(story: str, older_than_s: int = 900) -> None:
+    """A 'rendering' row whose app died mid-job would block forever; put it
+    back in the queue after a generous timeout."""
+    cutoff = _now() - _dt.timedelta(seconds=older_than_s)
+    with engine().begin() as cx:
+        cx.execute(adventure_scenes.update().where(
+            adventure_scenes.c.story == story,
+            adventure_scenes.c.status == "rendering",
+            adventure_scenes.c.updated_at < cutoff,
+        ).values(status="queued", updated_at=_now()))
+
+
+def adventure_next(story: str, max_attempts: int = 3) -> dict[str, Any] | None:
+    """The next scene to render: strictly by encounter order. Failed scenes
+    come back around until max_attempts so one flake cannot hole the story,
+    then stay failed for a human to look at."""
+    with engine().connect() as cx:
+        row = cx.execute(
+            sa.select(adventure_scenes.c.id, adventure_scenes.c.prompt,
+                      adventure_scenes.c.attempts)
+            .where(adventure_scenes.c.story == story,
+                   adventure_scenes.c.status.in_(("queued", "failed")),
+                   adventure_scenes.c.attempts < max_attempts)
+            .order_by(adventure_scenes.c.position).limit(1)).first()
+    return {"id": row[0], "prompt": row[1], "attempts": row[2]} if row else None
+
+
+def adventure_mark(scene_id: str, status: str, *, job_id: str | None = None,
+                   seed: int | None = None, generate_s: float | None = None,
+                   error: str | None = None, video: bytes | None = None,
+                   bump_attempts: bool = False) -> None:
+    values: dict[str, Any] = {"status": status, "updated_at": _now()}
+    if job_id is not None:
+        values["job_id"] = job_id
+    if seed is not None:
+        values["seed"] = seed
+    if generate_s is not None:
+        values["generate_s"] = generate_s
+    if error is not None:
+        values["error"] = error[:500]
+    if video is not None:
+        values["video"] = video
+    if bump_attempts:
+        values["attempts"] = adventure_scenes.c.attempts + 1
+    with engine().begin() as cx:
+        cx.execute(adventure_scenes.update()
+                   .where(adventure_scenes.c.id == scene_id).values(**values))
+
+
+def adventure_status(story: str) -> dict[str, dict[str, Any]]:
+    """Per-scene status WITHOUT the video bytes -- the page polls this."""
+    with engine().connect() as cx:
+        rows = cx.execute(
+            sa.select(adventure_scenes.c.id, adventure_scenes.c.status,
+                      adventure_scenes.c.seed, adventure_scenes.c.attempts)
+            .where(adventure_scenes.c.story == story)).all()
+    return {r[0]: {"status": r[1], "seed": r[2], "attempts": r[3]} for r in rows}
+
+
+def adventure_video(scene_id: str) -> bytes | None:
+    with engine().connect() as cx:
+        row = cx.execute(sa.select(adventure_scenes.c.video).where(
+            adventure_scenes.c.id == scene_id,
+            adventure_scenes.c.status == "ready")).first()
+    return row[0] if row else None
 
 
 def recent_wall_times(limit: int = 200) -> dict[tuple[str, int], list[float]]:
