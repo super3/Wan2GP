@@ -267,3 +267,32 @@ def test_docs_page_polls_capacity(client):
     # the strip must not hijack the message box the generate flow writes to
     strip = body[body.index("function renderStatus"):body.index("async function poll")]
     assert "say(" not in strip
+
+
+def test_background_returns_immediately(client):
+    """A browser cannot hold a 30 s fetch: phones abort it when the screen
+    locks. background:true closes the connection at once and the caller polls."""
+    c, m = client
+    with mock.patch.object(m, "_rp", side_effect=_backend(status={"status": "IN_QUEUE"})):
+        r = c.post("/v1/videos", json={"prompt": "x", "background": True}, headers=_hdr(KEY_A))
+    assert r.status_code == 202
+    body = r.json()
+    assert body["status"] == "queued" and body["poll_url"] == "/v1/videos/job-1"
+    assert r.headers["location"] == "/v1/videos/job-1"
+
+
+def test_background_still_counts_against_quota(client):
+    c, m = client
+    with mock.patch.object(m, "_rp", side_effect=_backend(status={"status": "IN_QUEUE"})):
+        for _ in range(3):
+            assert c.post("/v1/videos", json={"prompt": "x", "background": True},
+                          headers=_hdr(KEY_A)).status_code == 202
+        assert c.post("/v1/videos", json={"prompt": "x", "background": True},
+                      headers=_hdr(KEY_A)).status_code == 429
+
+
+def test_page_uses_background_and_polls(client):
+    c, _ = client
+    body = c.get("/").text
+    assert "background: true" in body
+    assert "poll_url" in body
