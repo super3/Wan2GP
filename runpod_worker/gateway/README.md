@@ -27,35 +27,54 @@ No GPU. It is stdlib + FastAPI, so it runs on the cheapest CPU box you have.
 
 ## The API
 
-Interactive docs at `/docs`.
+One call in, an mp4 out. Interactive docs at `/docs`.
 
 ```bash
-# submit
 curl -X POST https://api.example.com/v1/videos \
   -H "Authorization: Bearer sk_live_abc123" \
   -H "Content-Type: application/json" \
-  -d '{"prompt": "integrated_multimodal_description: [Shot 1] ...\noverall_soundscape: ...\nnon_diegetic_music: None."}'
-# -> {"id":"...","status":"queued","duration_s":10.12,"resolution":"832x480"}
-
-# poll
-curl https://api.example.com/v1/videos/$ID -H "Authorization: Bearer sk_live_abc123"
-# -> {"status":"queued"|"processing"|"completed"|"failed", ...}
-
-# download
-curl https://api.example.com/v1/videos/$ID/content \
-  -H "Authorization: Bearer sk_live_abc123" -o out.mp4
+  -d '{"prompt": "integrated_multimodal_description: [Shot 1] ...\noverall_soundscape: ...\nnon_diegetic_music: None."}' \
+  -o out.mp4 --max-time 300
 ```
 
-`seed` is optional; the resolved value comes back on completion so a generation
-can be reproduced exactly.
+That is the whole integration. The response body is the video; the metadata a
+caller needs rides on headers, because the body has to be the file:
+
+```
+X-Video-Id  X-Seed  X-Duration-Seconds  X-Width  X-Height
+X-Has-Audio  X-Generate-Seconds
+```
+
+`seed` is optional in the request; `X-Seed` returns the resolved value so a
+generation can be reproduced exactly.
+
+### The one case that is not synchronous
+
+A warm generation is ~56 s, comfortably inside a normal HTTP timeout. A **cold
+start** adds 90–330 s of queue while a worker boots, and fits inside no sane
+timeout. Rather than failing and discarding work already paid for, the call
+returns **202** with a job id:
+
+```json
+{"id": "...", "status": "processing", "poll_url": "/v1/videos/..."}
+```
+
+with `Location` and `Retry-After: 30`. Poll `GET /v1/videos/{id}` until
+`completed`, then `GET /v1/videos/{id}/content`. Clients should handle 202;
+in steady use they will rarely see it.
+
+Set `GATEWAY_SYNC_TIMEOUT` (default 240 s) to how long you want the connection
+held. Note what sits in front of you: **Cloudflare cuts at 100 s**, AWS ALB and
+nginx default to 60 s. Raise those, or lower the gateway's timeout to match, or
+callers will see a proxy error instead of the clean 202.
 
 ## What a customer should expect
 
 | | |
 |---|---|
 | output | 10.125 s, 832x480, H.264 + AAC, ~2 MB |
-| warm generation | ~56 s (measured mean, n=5) |
-| cold start | +90–330 s of queue while a worker boots |
+| warm generation | ~56 s (measured mean, n=5), returned inline |
+| cold start | +90–330 s of queue; returns 202 + job id instead |
 | audio | generated with the video, synchronized |
 
 The endpoint scales to zero, so **the first request after an idle period pays a
