@@ -38,13 +38,16 @@ from __future__ import annotations
 import base64
 import json
 import os
-import threading
 import time
 import urllib.request
-from collections import defaultdict
 from datetime import date
 from pathlib import Path
 from typing import Any
+
+try:
+    from . import db                     # imported as runpod_worker.gateway.app
+except ImportError:                      # flat /app layout in the container
+    import db                            # type: ignore[no-redef]
 
 from fastapi import Depends, FastAPI, HTTPException, Header
 from fastapi.responses import FileResponse, JSONResponse
@@ -84,12 +87,15 @@ def _env(name: str) -> str:
     return value
 
 
-def _keys() -> dict[str, str]:
-    """``{api_key: customer label}``. Revoke by removing one and restarting."""
+def _seed_env_keys() -> None:
+    """GATEWAY_KEYS stays supported as a bootstrap path: keys named there are
+    upserted into the database at startup. The database is the authority --
+    revoking a key there beats its presence in the env."""
     try:
-        return json.loads(os.environ.get("GATEWAY_KEYS", "{}"))
+        mapping = json.loads(os.environ.get("GATEWAY_KEYS", "{}"))
     except json.JSONDecodeError as exc:
         raise RuntimeError(f"GATEWAY_KEYS is not valid JSON: {exc}") from exc
+    db.seed_keys(mapping)
 
 
 DAILY_LIMIT = int(os.environ.get("GATEWAY_DAILY_LIMIT", "100"))
@@ -123,17 +129,27 @@ def docs_page():
         raise HTTPException(404, "docs page not installed")
     return FileResponse(index, media_type="text/html")
 
-_lock = threading.Lock()
-_jobs: dict[str, dict[str, Any]] = {}          # our id -> {runpod_id, owner, ...}
-_usage: dict[tuple[str, str], int] = defaultdict(int)   # (key, YYYY-MM-DD) -> count
+@app.on_event("startup")
+def _startup() -> None:
+    _seed_env_keys()
+
+
+@app.get("/healthz", include_in_schema=False)
+def healthz() -> dict:
+    """Process-liveness only, for the platform's health check. /v1/health
+    reports the GPU backend and returns 503 when it is down -- pointing a
+    restart-on-unhealthy probe at THAT turns a RunPod outage into a gateway
+    restart loop."""
+    return {"ok": True}
 
 
 def auth(authorization: str = Header(default="")) -> str:
+    """Returns the key HASH -- everything downstream keys off the hash so the
+    raw credential never sits in the job table or the logs."""
     token = authorization.removeprefix("Bearer ").strip()
-    owner = _keys().get(token)
-    if not owner:
+    if not token or db.lookup_key(token) is None:
         raise HTTPException(401, "invalid or missing API key")
-    return token
+    return db.hash_key(token)
 
 
 def _rp(path: str, payload: dict | None = None, timeout: int = 60) -> dict:
@@ -195,10 +211,8 @@ def create(body: VideoRequest, key: str = Depends(auth)) -> dict:
     if body.resolution not in RESOLUTIONS:
         raise HTTPException(422, f"resolution must be one of {sorted(RESOLUTIONS)}")
     today = date.today().isoformat()
-    with _lock:
-        if _usage[(key, today)] >= DAILY_LIMIT:
-            raise HTTPException(429, f"daily limit of {DAILY_LIMIT} videos reached")
-        _usage[(key, today)] += 1
+    if not db.try_consume_quota(key, today, DAILY_LIMIT):
+        raise HTTPException(429, f"daily limit of {DAILY_LIMIT} videos reached")
 
     frames = DURATIONS[body.duration_s]
     # 720p cannot finish inside SYNC_TIMEOUT, and holding the connection until
@@ -233,15 +247,14 @@ def create(body: VideoRequest, key: str = Depends(auth)) -> dict:
             "runtime": {"timeout_s": 1200},
         }})
     except Exception:
-        with _lock:
-            _usage[(key, today)] -= 1        # a failed submit must not bill the quota
+        db.refund_quota(key, today)          # a failed submit must not bill the quota
         raise HTTPException(503, "could not queue the job") from None
 
     job_id = created.get("id")
     if not job_id:
         raise HTTPException(503, "could not queue the job")
-    with _lock:
-        _jobs[job_id] = {"owner": key, "created": time.time(), "seed": body.seed}
+    db.record_job(job_id, key, resolution=body.resolution,
+                  duration_s=body.duration_s, seed=body.seed)
 
     if background:
         return JSONResponse(
@@ -264,7 +277,10 @@ def create(body: VideoRequest, key: str = Depends(auth)) -> dict:
             continue
         if state != "COMPLETED":
             message = (st.get("output") or {}).get("message", "generation failed")
+            db.mark_job(job_id, "failed")
             raise HTTPException(502, message)
+        db.mark_job(job_id, "completed",
+                    generate_s=((st.get("output") or {}).get("metrics") or {}).get("generate_s"))
         path = _materialise(job_id, st)
         if path is None:
             raise HTTPException(502, "generation produced no video")
@@ -313,14 +329,13 @@ def _video_response(job_id: str, path: Path, st: dict) -> FileResponse:
         })
 
 
-def _owned(job_id: str, key: str) -> dict:
-    with _lock:
-        job = _jobs.get(job_id)
+def _owned(job_id: str, key: str) -> None:
     # 404 rather than 403 for someone else's job: a customer should not be able
-    # to probe which ids exist.
-    if not job or job["owner"] != key:
+    # to probe which ids exist. Ownership lives in the database, so it survives
+    # a gateway restart -- with the in-memory dict, a restart mid-generation
+    # orphaned every paid job.
+    if not db.job_owned_by(job_id, key):
         raise HTTPException(404, "no such job")
-    return job
 
 
 @app.get("/v1/videos/{job_id}")
@@ -335,11 +350,15 @@ def status(job_id: str, key: str = Depends(auth)) -> dict:
     if state in ("IN_QUEUE", "IN_PROGRESS"):
         return {"id": job_id, "status": "queued" if state == "IN_QUEUE" else "processing"}
     if state != "COMPLETED":
+        db.mark_job(job_id, "failed")
         return {"id": job_id, "status": "failed",
                 "error": (st.get("output") or {}).get("message", "generation failed")}
 
     out = st.get("output") or {}
     video = out.get("video") or {}
+    # generate_s is the number per-second billing computes from; capture it at
+    # the moment the completion is observed rather than hoping to re-fetch it.
+    db.mark_job(job_id, "completed", generate_s=(out.get("metrics") or {}).get("generate_s"))
     path = _materialise(job_id, st) or CACHE / f"{job_id}.mp4"
     return {"id": job_id, "status": "completed",
             "seed": out.get("seed"),

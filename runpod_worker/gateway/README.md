@@ -18,12 +18,43 @@ export RUNPOD_API_KEY=rpa_...            # never returned to a caller
 export RUNPOD_ENDPOINT_ID=59kne66vo58331
 export GATEWAY_KEYS='{"sk_live_abc123":"acme corp"}'
 export GATEWAY_DAILY_LIMIT=100           # per key, per day
+export DATABASE_URL=postgresql://...     # omit locally -> SQLite in /tmp
 
 uvicorn runpod_worker.gateway.app:app --host 0.0.0.0 --port 8000
 # or: docker build -t video-api runpod_worker/gateway && docker run -p 8000:8000 --env-file .env video-api
 ```
 
-No GPU. It is stdlib + FastAPI, so it runs on the cheapest CPU box you have.
+No GPU. FastAPI + SQLAlchemy; runs on the cheapest CPU box you have.
+
+## Deploy on Railway
+
+The control plane belongs on a PaaS, not on GPU infra: the RunPod-pod era of
+this gateway burned through seven URLs in one night (pods bake their boot
+script in and cannot reliably restart after a patch), had no readable logs,
+and kept every key, quota and job in process memory. Railway fixes all four:
+stable domain, git deploys, visible logs, and a Postgres addon for the state.
+
+1. New project -> **Deploy from GitHub repo** -> pick this repo, and set the
+   deploy branch (any branch works; it does not have to be main).
+2. Service settings -> **Root Directory** = `runpod_worker/gateway`. Railway
+   finds the Dockerfile there.
+3. Add the **Postgres** addon; Railway injects `DATABASE_URL` automatically.
+   Without it the gateway falls back to SQLite in the container, which is
+   EPHEMERAL on Railway -- fine for a smoke test, wrong for billing.
+4. Variables: `RUNPOD_API_KEY`, `RUNPOD_ENDPOINT_ID`, `GATEWAY_KEYS` (seeds
+   the DB at startup; the DB is the authority afterwards -- revoking a key in
+   the DB beats its presence in the env), `GATEWAY_DAILY_LIMIT`.
+5. Health check path: `/healthz`. NOT `/v1/health` -- that one reports the GPU
+   backend and returns 503 when RunPod is down, which would turn a backend
+   outage into a gateway restart loop.
+6. Before telling customers the synchronous route works: measure Railway's
+   edge timeout against `GATEWAY_SYNC_TIMEOUT` (90 s). RunPod's proxy cut at
+   ~100 s; if Railway cuts sooner, lower the gateway value to match. The 202
+   fallback makes this safe to get wrong, but the error message is uglier.
+
+State lives in three tables: `api_keys` (SHA-256 hashes only -- a DB dump is
+not a credential dump), `usage` (per key per day), and `jobs` (ownership plus
+`generate_s`, the number per-second billing computes from).
 
 ## The API
 
