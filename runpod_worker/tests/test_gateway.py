@@ -338,7 +338,7 @@ def test_720p_is_forced_to_background(client):
                    json={"prompt": "x", "resolution": "720p", "background": False},
                    headers=_hdr(KEY_A))
     assert r.status_code == 202              # not 200, despite background:false
-    assert seen["resolution"] == "1280x720"
+    assert seen["resolution"] == "1280x704"
 
 
 @pytest.mark.parametrize("bad", ["1080p", "4k", "832x480", ""])
@@ -347,3 +347,14 @@ def test_unknown_resolution_refused(client, bad):
     with mock.patch.object(m, "_rp", side_effect=_backend()):
         r = c.post("/v1/videos", json={"prompt": "x", "resolution": bad}, headers=_hdr(KEY_A))
     assert r.status_code == 422
+
+
+def test_720p_uses_a_resolution_the_model_actually_accepts():
+    """1280x720 is REJECTED by the worker: the VAE's 16x spatial compression and
+    the patch size put the height on a lattice that 720 misses, and schema.py
+    answers "nearest valid: 1280x704". A live job failed in 63 ms on exactly
+    this before it was corrected."""
+    from runpod_worker.gateway import app as module
+    assert module.RESOLUTIONS["720p"] == "1280x704"
+    for w, h in (tuple(map(int, v.split("x"))) for v in module.RESOLUTIONS.values()):
+        assert w % 16 == 0 and h % 16 == 0, f"{w}x{h} is off the VAE lattice"
