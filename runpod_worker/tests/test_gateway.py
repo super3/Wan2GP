@@ -1149,3 +1149,72 @@ def test_studio_limit_modal_markers(client):
     assert "Continue with Google" in body
     assert "showLimitModal" in body
     assert "Upgrade" not in body                   # no paid flow anywhere
+
+
+def test_adventure_claim_two_lanes_and_parent_gating(client):
+    """Two lanes render in parallel, but a child is only claimable once its
+    parent's clip exists -- the child starts from the parent's last frame."""
+    c, m = client
+    from runpod_worker.gateway import db as dbmod
+    first = dbmod.adventure_claim("biscuit")
+    assert first["id"] == "n0"
+    # Everything else is a descendant of n0 -- nothing to claim yet.
+    assert dbmod.adventure_claim("biscuit") is None
+    dbmod.adventure_mark("n0", "ready", video=b"clip")
+    a, b = dbmod.adventure_claim("biscuit"), dbmod.adventure_claim("biscuit")
+    assert {a["id"], b["id"]} == {"n_van", "n_bakery"}    # both paths at once
+    assert dbmod.adventure_claim("biscuit") is None       # depth 3 blocked
+
+
+def test_adventure_children_start_from_parents_last_frame(client):
+    c, m = client
+    from runpod_worker.gateway import db as dbmod
+    from runpod_worker.gateway import story as st
+    assert st.parent_of("n0") is None
+    assert st.parent_of("end_roll") == "n_eyes"           # canonical, not n_cat
+    dbmod.adventure_claim("biscuit")
+    dbmod.adventure_mark("n0", "ready", video=b"clip")
+    scene = dbmod.adventure_claim("biscuit")
+    seen = {}
+
+    def fake(path, payload=None, timeout=60):
+        if payload:
+            seen.update(payload["input"])
+            return {"id": "adv-c"}
+        return COMPLETED
+
+    with mock.patch.object(m, "_rp", side_effect=fake), \
+         mock.patch.object(m, "_last_frame_b64", return_value="FRAME64"), \
+         mock.patch.object(m.time, "sleep", lambda s: None):
+        m._adventure_render_one(scene)
+    assert seen["settings"]["image_prompt_type"] == "S"
+    assert seen["media"]["image_start"] == {"b64": "FRAME64"}
+    # and the root scene submits with no start image at all
+    seen.clear()
+    with mock.patch.object(m, "_rp", side_effect=fake), \
+         mock.patch.object(m.time, "sleep", lambda s: None):
+        m._adventure_render_one({"id": "n0", "prompt": "x"})
+    assert seen["settings"]["image_prompt_type"] == "" and seen["media"] == {}
+
+
+def test_adventure_continuity_migration_requeues_old_clips(client):
+    """Rows rendered before the continuity migration have no parent_id; the
+    seed backfills it ONCE and requeues them so the tree becomes continuous.
+    The root keeps its clip -- it has no parent to be continuous with."""
+    c, m = client
+    from runpod_worker.gateway import db as dbmod
+    from runpod_worker.gateway import story as st
+    import sqlalchemy as sa
+    # Simulate the pre-migration state: rendered, but parent_id NULL.
+    with dbmod.engine().begin() as cx:
+        cx.execute(dbmod.adventure_scenes.update()
+                   .where(dbmod.adventure_scenes.c.id.in_(("n0", "n_van")))
+                   .values(status="ready", video=b"old", parent_id=None))
+    dbmod.adventure_seed(st.STORY_ID, [
+        {"id": nid, "position": pos, "depth": st.depth_of(nid),
+         "title": st.NODES[nid]["title"], "prompt": st.NODES[nid]["prompt"],
+         "parent_id": st.parent_of(nid)}
+        for pos, nid in enumerate(st.ORDER)])
+    statuses = dbmod.adventure_status("biscuit")
+    assert statuses["n0"]["status"] == "ready"            # root untouched
+    assert statuses["n_van"]["status"] == "queued"        # re-renders with continuity

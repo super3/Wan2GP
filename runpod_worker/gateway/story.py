@@ -296,6 +296,17 @@ def depth_of(node_id: str) -> int:
     return depths.get(node_id, 4)
 
 
+def parent_of(node_id: str) -> str | None:
+    """The scene whose last frame this one starts from (FL2V continuity).
+    end_roll is reachable from two parents; the FIRST in encounter order is
+    canonical, so the other transition is a cut rather than a match."""
+    for pid in ORDER:
+        for _label, target in NODES[pid]["choices"]:
+            if target == node_id:
+                return pid
+    return None
+
+
 def public_tree() -> list[dict]:
     """The story without prompts, in encounter order -- what the page needs."""
     return [{"id": nid, "depth": depth_of(nid),

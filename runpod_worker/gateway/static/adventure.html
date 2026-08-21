@@ -45,7 +45,7 @@
             font-size:14.5px; font-weight:650; color:#141312;
             background:rgba(245,243,240,.95); border:1px solid rgba(245,243,240,.95);
             border-radius:9px; padding:13px 16px; }
-  .choice:hover { background:#e8874a; border-color:#e8874a; }
+  .choice:hover, .choice.sel { background:#e8874a; border-color:#e8874a; }
   .choice .key { flex:none; width:24px; height:24px; border-radius:6px;
                  background:rgba(20,19,18,.12); font-family:"JetBrains Mono",monospace;
                  font-size:12px; display:inline-flex; align-items:center; justify-content:center; }
@@ -188,8 +188,28 @@ function pollWhileRendering() {
   }, 5000);
 }
 
+// ---- clip preloading -------------------------------------------------------
+// Both children download as blobs while the current clip plays, so a choice
+// starts instantly -- and with each child generated from its parent's last
+// frame, an end-of-clip transition is a seamless cut.
+const CLIPS = {};
+async function preloadClip(id) {
+  if (CLIPS[id] || !NODES[id] || NODES[id].status !== "ready") return;
+  CLIPS[id] = "pending";
+  try {
+    const r = await fetch("/adventure/scene/" + id);
+    if (r.ok) CLIPS[id] = URL.createObjectURL(await r.blob());
+    else delete CLIPS[id];
+  } catch { delete CLIPS[id]; }
+}
+function clipUrl(id) {
+  return (typeof CLIPS[id] === "string" && CLIPS[id] !== "pending")
+    ? CLIPS[id] : "/adventure/scene/" + id;
+}
+
 // ---- the stage -------------------------------------------------------------
 const vid = $("vid");
+let pendingChoice = null;
 function showPhase(phase) {
   state.phase = phase;
   $("beginbox").hidden = phase !== "begin";
@@ -214,6 +234,8 @@ function setSceneText(id) {
 }
 function startScene(id, num, path) {
   state.nodeId = id; state.sceneNum = num; state.path = path;
+  pendingChoice = null;
+  document.querySelectorAll(".choice.sel").forEach(b => b.classList.remove("sel"));
   setSceneText(id);
   $("prog").style.width = "0%";
   if (NODES[id].status !== "ready") {
@@ -223,19 +245,32 @@ function startScene(id, num, path) {
     showPhase("waiting");
     return;
   }
-  vid.src = "/adventure/scene/" + id;
+  vid.src = clipUrl(id);
   showPhase("playing");
   vid.play().catch(() => {});          // begin-button gesture unlocks sound
+  NODES[id].choices.forEach(ch => preloadClip(ch[1]));
 }
 function finishScene() {
   vid.pause();
   $("prog").style.width = "100%";
   showPhase(NODES[state.nodeId].choices.length ? "choosing" : "ended");
 }
+// Choices surface at the 10-second mark, while the clip keeps playing
+// underneath -- picking a path never means sitting through the tail.
+const CHOICE_AT_S = 10;
 vid.addEventListener("timeupdate", () => {
   if (vid.duration) $("prog").style.width = Math.min(100, vid.currentTime / vid.duration * 100) + "%";
+  if (state.phase === "playing" && vid.currentTime >= CHOICE_AT_S &&
+      NODES[state.nodeId] && NODES[state.nodeId].choices.length)
+    showPhase("choosing");                 // the clip plays on underneath
 });
-vid.addEventListener("ended", finishScene);
+vid.addEventListener("ended", () => {
+  if (pendingChoice) {                                   // chosen mid-clip:
+    const pick = pendingChoice;                          // seamless hand-off
+    startScene(pick[1], state.sceneNum + 1, [...state.path, pick[0]]);
+  } else if (state.phase === "playing") finishScene();   // end scenes: THE END
+  else if (state.phase === "choosing") $("prog").style.width = "100%";
+});
 $("skip").addEventListener("click", finishScene);
 $("begin").addEventListener("click", () => startScene(ORDER[0], 1, []));
 $("again").addEventListener("click", () => startScene(ORDER[0], 1, []));
@@ -243,7 +278,16 @@ $("choices").addEventListener("click", (e) => {
   const b = e.target.closest("button.choice");
   if (!b) return;
   const pick = NODES[state.nodeId].choices[Number(b.dataset.i)];
-  if (pick) startScene(pick[1], state.sceneNum + 1, [...state.path, pick[0]]);
+  if (!pick) return;
+  if (!vid.paused && !vid.ended) {
+    // The clip is still playing: queue the choice and let the scene finish,
+    // then hand off on its final frame -- which is the next clip's first.
+    pendingChoice = pick;
+    document.querySelectorAll(".choice").forEach(btn =>
+      btn.classList.toggle("sel", btn === b));
+    return;
+  }
+  startScene(pick[1], state.sceneNum + 1, [...state.path, pick[0]]);
 });
 
 // ---- the branch map --------------------------------------------------------

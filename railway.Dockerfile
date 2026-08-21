@@ -8,6 +8,11 @@
 # The gateway itself: FastAPI + SQLAlchemy, no GPU, no torch, no weights.
 FROM python:3.12-slim
 
+# ffmpeg: the adventure renderer extracts each parent clip's last frame
+# as the child scene's start image (FL2V continuity).
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 COPY runpod_worker/gateway/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
