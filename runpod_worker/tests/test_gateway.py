@@ -439,3 +439,23 @@ def test_no_image_means_no_attachment(client):
         c.post("/v1/videos", json={"prompt": "x"}, headers=_hdr(KEY_A))
     assert sent["media"] == {}
     assert sent["settings"]["image_prompt_type"] == ""
+
+
+def test_page_accepts_a_key_in_the_url_but_does_not_keep_it_there(client):
+    """?key=... makes one link the whole demo, but the key must not linger in
+    the address bar: it would leak into browser history, the Referer header on
+    any outbound link, and every proxy log in between."""
+    c, _ = client
+    body = c.get("/").text
+    assert 'searchParams.get("key")' in body
+    assert 'searchParams.delete("key")' in body
+    assert "history.replaceState" in body
+
+
+def test_api_never_accepts_a_key_as_a_query_parameter(client):
+    """Convenience on the docs page is one thing; query-string auth on the API
+    would write the key into a server log line on every request."""
+    c, m = client
+    with mock.patch.object(m, "_rp", side_effect=_backend()):
+        r = c.post("/v1/videos?key=" + KEY_A, json={"prompt": "x"})
+    assert r.status_code == 401
