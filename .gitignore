@@ -26,6 +26,7 @@
 # once ate .dockerignore and the CI workflow.
 !runpod_worker/webdemo/*.html
 !runpod_worker/gateway/static/*.html
+!runpod_worker/gateway/static/examples/*.mp4
 !plugins/motion_designer/assets/motion_designer_iframe_template.html
 *.pdf
 *.whl
