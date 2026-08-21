@@ -398,11 +398,50 @@ $("durs").addEventListener("click", e => { const b = e.target.closest("button");
 $("tiers").addEventListener("click", e => { const b = e.target.closest("button"); if (b) pick("tiers", b.dataset.v, "tier"); });
 $("aspects").addEventListener("click", e => { const b = e.target.closest("button"); if (b) pick("aspects", b.dataset.v, "aspect"); });
 
-// Warm-worker figures. 480p 5/10 s and 720p 5/10 s are measured; the 15 s
-// column is extrapolated from the measured frame scaling and marked so.
-const EST = { "480p": { "5": "~22 s", "10": "~56 s", "15": "~1 min 40*" },
-              "720p": { "5": "~50 s", "10": "~1 min 45", "15": "~3 min*" } };
-function updateEstimate() { $("est").textContent = EST[state.tier][state.dur]; }
+// ---- smart estimate --------------------------------------------------------
+// The pill is computed, not hardcoded: warm per-combo seconds come from the
+// server (rolling averages of real completions), plus a queue-wait term and
+// the cold-start penalty when no worker is ready. The static numbers below
+// only paint the first frame and cover a failed fetch. This is one cached
+// fetch on demand, not the old 10-second heartbeat.
+const FALLBACK = { "480p": { "5": 24, "10": 56, "15": 100 },
+                   "720p": { "5": 48, "10": 103, "15": 185 } };
+let healthCache = null, healthAt = 0;
+async function healthInfo() {
+  if (healthCache && Date.now() - healthAt < 30000) return healthCache;
+  try {
+    const r = await fetch("/v1/health");
+    if (r.ok) { healthCache = await r.json(); healthAt = Date.now(); }
+  } catch {}
+  return healthCache;
+}
+function fmtDur(s) {
+  if (s < 60) return "~" + Math.max(5, Math.round(s / 5) * 5) + " s";
+  const m = s / 60;
+  return "~" + (m < 3 ? (Math.round(m * 2) / 2).toString().replace(".5", "½") : Math.round(m)) + " min";
+}
+function computeEstimate(h) {
+  const times = h && h.estimate && h.estimate.times[state.tier];
+  let s = (times && times[state.dur]) || FALLBACK[state.tier][state.dur];
+  if (!h) return { s, cold: false };
+  const q = h.queue || {}, c = h.capacity || {};
+  const inflight = (q.waiting || 0) + (q.running || 0);
+  s += inflight * ((h.estimate && h.estimate.avg_job_s) || 45);
+  let cold = false;
+  if (!(c.ready > 0)) {
+    // A starting worker is partway through the cold start already.
+    s += (h.estimate ? h.estimate.cold_start_s : 150) / (c.starting > 0 ? 2 : 1);
+    cold = true;
+  }
+  return { s, cold: cold || inflight > 0 };
+}
+let estSeq = 0;
+async function updateEstimate() {
+  const seq = ++estSeq;
+  $("est").textContent = fmtDur(FALLBACK[state.tier][state.dur]);  // instant paint
+  const h = await healthInfo();
+  if (h && seq === estSeq) $("est").textContent = fmtDur(computeEstimate(h).s);
+}
 
 // ---- prompt ----------------------------------------------------------------
 const promptEl = $("prompt");
@@ -543,9 +582,15 @@ async function authHeaders() {
 // the moment the screen locks, which surfaced as "Failed to fetch" while the
 // identical curl call succeeded. Short polls survive backgrounding.
 $("go").addEventListener("click", async () => {
-  const prompt = promptEl.value.trim();
+  let prompt = promptEl.value.trim();
   const hasKey = !!$("key").value.trim();
-  if (!prompt) return say("Enter a prompt.", "err");
+  if (!prompt) {
+    // An empty prompt falls back to the default the placeholder promises,
+    // written into the box so the user sees exactly what ran.
+    prompt = EXAMPLES[0].prompt;
+    promptEl.value = prompt;
+    syncChars();
+  }
   if (!hasKey && !signedIn()) {
     if (state.dur !== "5" || state.tier === "720p")
       return showGate("Longer lengths and 720p need a free account.");
@@ -558,8 +603,10 @@ $("go").addEventListener("click", async () => {
   $("go").disabled = true;
   $("donebox").hidden = true;
   showStage("busy");
-  $("busymsg").textContent = "Generating " + state.dur + "s of video — " +
-    EST[state.tier][state.dur].replace("~", "about ") + " on a warm worker.";
+  const est = computeEstimate(await healthInfo());
+  $("busymsg").textContent = "Generating " + state.dur + " s of video — " +
+    fmtDur(est.s).replace("~", "about ") +
+    (est.cold ? ", including worker start." : " on a warm worker.");
   say("");
   const started = Date.now();
   startClock(started);
