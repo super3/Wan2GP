@@ -551,10 +551,15 @@ class MiniMaxH3Pipeline:
                 video_velocity, audio_velocity = self.transformer(video, audio, sigmas_video[step:step + 1], sigmas_audio[step:step + 1], context, payload, spectrum=spectrum, first_block_cache=first_block_cache)
                 if spectrum is not None:
                     spectrum.finish_step()
+                # Previews show the model's denoised PREDICTION, not the noisy
+                # state x_t: with a 4-step schedule x_t stays noise-dominated
+                # until the last step and previews of it are useless static.
+                denoised_preview = None
                 if sample_solver == "euler":
                     video_ratio = sigmas_video[step + 1] / sigmas_video[step]
                     if not target_video_condition_frames:
                         video_velocity.mul_(sigmas_video[step]).add_(video)
+                        denoised_preview = video_velocity
                         video.mul_(video_ratio).add_(video_velocity, alpha=1.0 - video_ratio)
                     audio_ratio = sigmas_audio[step + 1] / sigmas_audio[step]
                     if audio_tail.shape[-1]:
@@ -565,6 +570,7 @@ class MiniMaxH3Pipeline:
                     coefficients = res_coefficients[step]
                     if not target_video_condition_frames:
                         video_denoised = video_velocity.mul_(sigmas_video[step]).add_(video)
+                        denoised_preview = video_denoised
                         _res_multistep_update(video, video_denoised, old_video_denoised, coefficients)
                         old_video_denoised = video_denoised
                     if audio_tail.shape[-1]:
@@ -615,7 +621,9 @@ class MiniMaxH3Pipeline:
                     _reinject_video_source(source_video, source_latents, source_noise, source_mask, sigmas_video[step + 1], source_buffer)
                 video_velocity = audio_velocity = None
                 if callback is not None:
-                    preview = video[0].detach().cpu() if not offline_spectrum or spectrum.replaying else None
+                    preview_src = denoised_preview if denoised_preview is not None else video
+                    preview = preview_src[0].detach().cpu() if not offline_spectrum or spectrum.replaying else None
+                    denoised_preview = None
                     callback(step, preview, False, denoising_extra=denoising_extra) if denoising_extra else callback(step, preview, False)
 
         initial_video = initial_audio = None
