@@ -328,7 +328,9 @@ def test_studio_signup_and_gating_markers(client):
     assert "body.signedin .lock" in body
     assert "Requires a free account" in body          # lock tooltips
     assert "5 s at 480p is free" in body              # the free-tier hint line
-    assert 'fetch("/v1/health")' not in body
+    # The estimate pill fetches /v1/health on demand (cached), but the old
+    # 10-second status heartbeat must not come back.
+    assert "computeEstimate" in body
     assert "setInterval(poll" not in body
 
 
@@ -884,3 +886,52 @@ def test_hidden_attribute_beats_author_display_rules(client):
     page must carry an author-level [hidden] override."""
     c, _ = client
     assert "[hidden] { display:none !important; }" in c.get("/").text
+
+
+# --- the smart estimate ------------------------------------------------------
+
+def test_health_carries_the_estimate_block(client):
+    c, m = client
+    with mock.patch.object(m, "_rp", return_value={"jobs": {}, "workers": {"ready": 1}}):
+        body = c.get("/v1/health").json()
+    est = body["estimate"]
+    assert est["times"]["480p"]["5"] == 24            # measured floor
+    assert est["times"]["720p"]["10"] == 103
+    assert est["cold_start_s"] > 0 and est["avg_job_s"] > 0
+
+
+def test_estimate_learns_from_recorded_generations(client):
+    """Three real completions for a combo override the hand-measured floor;
+    combos without samples keep it."""
+    c, m = client
+    from runpod_worker.gateway import db as dbmod
+    for i in range(3):
+        dbmod.record_job(f"est-{i}", "somehash", resolution="832x480",
+                         duration_s=5, seed=None)
+        dbmod.mark_job(f"est-{i}", "completed", generate_s=30.0)
+    with mock.patch.object(m, "_rp", return_value={"jobs": {}, "workers": {"ready": 1}}):
+        est = c.get("/v1/health").json()["estimate"]
+    assert est["times"]["480p"]["5"] == 30            # rolling average wins
+    assert est["times"]["720p"]["5"] == 48            # untouched without samples
+    assert est["avg_job_s"] == 30
+
+
+def test_multiline_prompts_stay_one_prompt(client):
+    """prompt_parser.split_prompt_units makes one prompt PER LINE unless
+    multi_prompts_gen_type is FG; the H3 structured caption format is
+    multi-line by design, so the gateway pins FG server-side."""
+    c, m = client
+    seen = {}
+
+    def fake(path, payload=None, timeout=60):
+        if payload:
+            seen.update(payload["input"]["settings"])
+            return {"id": "job-1"}
+        return COMPLETED
+
+    with mock.patch.object(m, "_rp", side_effect=fake):
+        c.post("/v1/videos",
+               json={"prompt": "integrated_multimodal_description: x\noverall_soundscape: y"},
+               headers=_hdr(KEY_A))
+    assert seen["multi_prompts_gen_type"] == "FG"
+    assert "\n" in seen["prompt"]                     # the newline survives intact
