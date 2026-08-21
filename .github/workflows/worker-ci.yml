@@ -114,8 +114,15 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       # pytest and nothing else. No torch, no runpod, no boto3, no requirements.txt.
+      # pytest, plus the gateway's own deps (FastAPI/SQLAlchemy) and httpx for
+      # its TestClient. Without these the gateway suite silently SKIPS via
+      # importorskip -- the durability tests (quota/ownership across restart)
+      # would be green in CI without ever running.
       - name: Install test dependencies
-        run: python -m pip install --disable-pip-version-check --quiet pytest
+        run: |
+          python -m pip install --disable-pip-version-check --quiet pytest httpx
+          python -m pip install --disable-pip-version-check --quiet \
+            -r runpod_worker/gateway/requirements.txt
 
       - name: Assert the CPU modules import with no heavy dependencies
         run: |
@@ -167,9 +174,14 @@ jobs:
       # silent rename would otherwise surface as a dead endpoint in production.
       - name: Install the runpod SDK
         run: |
-          python -m pip install --disable-pip-version-check --quiet pytest
+          python -m pip install --disable-pip-version-check --quiet pytest httpx
           python -m pip install --disable-pip-version-check \
             -c runpod_worker/constraints.txt -r runpod_worker/requirements-worker.txt
+          # The runpod SDK brings fastapi with it, so the gateway tests RUN in
+          # this job rather than skipping -- they need sqlalchemy too, or every
+          # one of them errors on import (that exact failure shipped once).
+          python -m pip install --disable-pip-version-check --quiet \
+            -r runpod_worker/gateway/requirements.txt
 
       - name: Assert the SDK surface the worker calls
         run: |
