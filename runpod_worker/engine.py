@@ -932,7 +932,6 @@ def run(
         interval = float(getattr(C.CONFIG, "progress_interval_s", 5))
         last_emit = float("-inf")
         last_preview_b64: str | None = None
-        last_preview_at = float("-inf")
 
         # DO NOT use job.events.iter(): SessionStream.iter (shared/api.py:263-271)
         # `continue`s on a queue timeout without yielding, so the loop body -- and
@@ -991,14 +990,14 @@ def run(
                         _emit(callback, payload)
 
                 elif kind == "preview":
-                    # WanGP pushes raw denoising latents; encode at most one
-                    # per progress interval and let the NEXT progress frame
-                    # carry it, so preview traffic can never outpace progress.
-                    if now - last_preview_at >= interval:
-                        encoded = _encode_preview(data)
-                        if encoded is not None:
-                            last_preview_b64 = encoded
-                            last_preview_at = now
+                    # Encode EVERY frame (the bridge already decoded it to a
+                    # small PIL image; JPEG encoding is milliseconds) and let
+                    # the next progress frame carry the latest one. A 4-step
+                    # turbo model goes from pure noise to the scene in seconds
+                    # -- an interval-throttled encode shipped the noise.
+                    encoded = _encode_preview(data)
+                    if encoded is not None:
+                        last_preview_b64 = encoded
 
                 elif kind in ("status", "info"):
                     text = str(data)
