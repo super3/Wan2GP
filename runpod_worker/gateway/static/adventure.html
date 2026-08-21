@@ -41,7 +41,11 @@
             margin:8px 0; max-width:60ch; }
   .sdesc { font-size:14px; color:#c9c4bb; margin:0; line-height:1.65; max-width:60ch;
            text-shadow:0 1px 3px rgba(0,0,0,.5); }
-  .choices { display:flex; gap:12px; flex-wrap:wrap; animation:omRise .35s ease-out; }
+  .choices { display:flex; gap:12px; flex-wrap:wrap; animation:omRise .35s ease-out;
+             opacity:1; transition:opacity .5s ease-out .4s; }
+  .choices.fading { opacity:0; }
+  .choice { transition:opacity .3s; }
+  .choice.dim { opacity:.35; }
   .choice { flex:1 1 260px; display:flex; align-items:center; gap:12px; text-align:left;
             font-size:14.5px; font-weight:650; color:#141312;
             background:rgba(245,243,240,.95); border:1px solid rgba(245,243,240,.95);
@@ -210,7 +214,7 @@ function clipUrl(id) {
 
 // ---- the stage -------------------------------------------------------------
 const vid = $("vid");
-let pendingChoice = null;
+let pendingChoice = null, choiceFadeTimer = null;
 function showPhase(phase) {
   state.phase = phase;
   $("beginbox").hidden = phase !== "begin";
@@ -236,7 +240,9 @@ function setSceneText(id) {
 function startScene(id, num, path) {
   state.nodeId = id; state.sceneNum = num; state.path = path;
   pendingChoice = null;
-  document.querySelectorAll(".choice.sel").forEach(b => b.classList.remove("sel"));
+  clearTimeout(choiceFadeTimer);
+  $("choices").classList.remove("fading");
+  document.querySelectorAll(".choice").forEach(b => b.classList.remove("sel", "dim"));
   setSceneText(id);
   $("prog").style.width = "0%";
   if (NODES[id].status !== "ready") {
@@ -283,9 +289,20 @@ $("choices").addEventListener("click", (e) => {
   if (!vid.paused && !vid.ended) {
     // The clip is still playing: queue the choice and let the scene finish,
     // then hand off on its final frame -- which is the next clip's first.
+    // Feedback: the pick lights up, the other dims, and the row fades out
+    // so the tail of the clip plays clean.
     pendingChoice = pick;
-    document.querySelectorAll(".choice").forEach(btn =>
-      btn.classList.toggle("sel", btn === b));
+    document.querySelectorAll(".choice").forEach(btn => {
+      btn.classList.toggle("sel", btn === b);
+      btn.classList.toggle("dim", btn !== b);
+    });
+    $("choices").classList.add("fading");
+    clearTimeout(choiceFadeTimer);
+    choiceFadeTimer = setTimeout(() => {
+      $("choices").hidden = true;
+      $("choices").classList.remove("fading");
+      document.querySelectorAll(".choice").forEach(x => x.classList.remove("sel", "dim"));
+    }, 1000);
     return;
   }
   startScene(pick[1], state.sceneNum + 1, [...state.path, pick[0]]);
