@@ -203,6 +203,22 @@ def record_job(job_id: str, key_hash: str, *, resolution: str, duration_s: int,
             duration_s=duration_s, seed=seed, created_at=_now()))
 
 
+def recent_generate_times(limit: int = 200) -> dict[tuple[str, int], list[float]]:
+    """The last `limit` completed generations' timings, grouped by
+    (resolution, duration_s). The estimate the Studio page advertises is
+    computed from these rather than hand-measured constants, so it tracks
+    what the fleet actually does as hardware or profiles change."""
+    with engine().connect() as cx:
+        rows = cx.execute(
+            sa.select(jobs.c.resolution, jobs.c.duration_s, jobs.c.generate_s)
+            .where(jobs.c.generate_s.is_not(None))
+            .order_by(jobs.c.created_at.desc()).limit(limit)).all()
+    out: dict[tuple[str, int], list[float]] = {}
+    for res, dur, gen in rows:
+        out.setdefault((res, dur), []).append(gen)
+    return out
+
+
 def job_owned_by(job_id: str, key_hash: str) -> bool:
     with engine().connect() as cx:
         row = cx.execute(sa.select(jobs.c.id).where(
