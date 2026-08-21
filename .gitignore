@@ -25,6 +25,7 @@
 # makes `git add -A` skip it with no error, exactly as the bare `.*` on line 1
 # once ate .dockerignore and the CI workflow.
 !runpod_worker/webdemo/*.html
+!runpod_worker/gateway/static/*.html
 !plugins/motion_designer/assets/motion_designer_iframe_template.html
 *.pdf
 *.whl

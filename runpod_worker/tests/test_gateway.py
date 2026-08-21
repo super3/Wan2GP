@@ -17,6 +17,10 @@ from unittest import mock
 
 import pytest
 
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
 fastapi = pytest.importorskip("fastapi")
 from fastapi.testclient import TestClient  # noqa: E402
 
@@ -221,3 +225,26 @@ def test_refused_duration_does_not_consume_quota(client):
         # the daily limit is 3; none of the above should have counted
         for _ in range(3):
             assert c.post("/v1/videos", json={"prompt": "x"}, headers=_hdr(KEY_A)).status_code == 200
+
+
+def test_every_file_the_app_serves_is_tracked_by_git():
+    """.gitignore line 23 is a bare `*.html`. It has now silently dropped a
+    committed file three times in this repo (.dockerignore and the CI workflow
+    via the bare `.*` on line 1, the sage wheel via `*.whl`, and both the
+    webdemo and this gateway page via `*.html`). Every time, `git add -A`
+    reported success and CI failed on a file that existed locally.
+
+    So: assert the asset actually exists in git's index, not just on disk."""
+    import subprocess
+    from runpod_worker.gateway import app as module
+
+    for asset in module.STATIC.rglob("*"):
+        if not asset.is_file():
+            continue
+        rel = asset.relative_to(REPO_ROOT)
+        tracked = subprocess.run(["git", "ls-files", "--error-unmatch", str(rel)],
+                                 cwd=REPO_ROOT, capture_output=True)
+        assert tracked.returncode == 0, (
+            f"{rel} is served by the app but is NOT tracked by git -- it will be "
+            f"missing in CI and in any fresh clone. Check .gitignore."
+        )
