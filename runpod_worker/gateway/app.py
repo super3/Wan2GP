@@ -59,10 +59,12 @@ RUNPOD_API = "https://api.runpod.ai/v2"
 #: it fits inside a 60 s proxy timeout, which the long one does not.
 DURATIONS = {5: 124, 10: 243}
 DEFAULT_DURATION = 5
-#: shared/resolutions.py:46,55 -- both 16:9. The turbo LoRA is 768p-trained, so
-#: 720p is near its native size; 480p is what every measurement in the README
-#: was taken at. 720p is 2.31x the pixels and generates far slower.
-RESOLUTIONS = {"480p": "832x480", "720p": "1280x720"}
+#: NOT 1280x720: the VAE's 16x spatial compression and the patch size mean the
+#: height must land on the model's lattice, and 720 does not -- schema.py:1909
+#: rejects it with "nearest valid: 1280x704". 704 is the real 16:9-ish 720p.
+#: 2.26x the pixels of 480p, so it generates far slower; the turbo LoRA is
+#: 768p-trained so this is near its native size.
+RESOLUTIONS = {"480p": "832x480", "720p": "1280x704"}
 DEFAULT_RESOLUTION = "480p"
 ACCEL_PROFILE = "Turbo Lightx2v FL2V 4 Steps v1.0 768p"
 MODEL_TYPE = "minimax_h3_fl2va_pruned"
