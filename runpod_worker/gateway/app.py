@@ -42,14 +42,15 @@ import time
 import urllib.request
 from datetime import date
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 try:
     from . import db                     # imported as runpod_worker.gateway.app
 except ImportError:                      # flat /app layout in the container
     import db                            # type: ignore[no-redef]
 
-from fastapi import Depends, FastAPI, HTTPException, Header
+import jwt
+from fastapi import Depends, FastAPI, HTTPException, Header, Request
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 
@@ -123,6 +124,12 @@ def _seed_env_keys() -> None:
 
 
 DAILY_LIMIT = int(os.environ.get("GATEWAY_DAILY_LIMIT", "100"))
+#: The Studio page's freemium ladder, enforced here rather than trusted to the
+#: page: a visitor with no credential at all gets a 2-clip taste of the free
+#: tier (5 s at 480p only), and a free Clerk account gets the beta allowance
+#: the page advertises. sk_ API customers keep GATEWAY_DAILY_LIMIT.
+ANON_DAILY_LIMIT = int(os.environ.get("GATEWAY_ANON_DAILY_LIMIT", "2"))
+CLERK_DAILY_LIMIT = int(os.environ.get("GATEWAY_CLERK_DAILY_LIMIT", "20"))
 
 #: How long POST /v1/videos will hold the connection before handing back a job
 #: id instead. This MUST sit below whatever proxy fronts this service, or the
@@ -175,13 +182,110 @@ def healthz() -> dict:
     return {"ok": True}
 
 
-def auth(authorization: str = Header(default="")) -> str:
-    """Returns the key HASH -- everything downstream keys off the hash so the
-    raw credential never sits in the job table or the logs."""
+# ---- Clerk sign-in ---------------------------------------------------------
+#: The Studio page signs people in with Clerk; API customers keep sk_ keys.
+#: The publishable key is public by design -- it ships in the page source of
+#: every Clerk site -- and encodes the instance domain, which is where ClerkJS
+#: is served from and the issuer of session tokens. Override for another
+#: instance (a production pk_live_) without a code change.
+CLERK_PUBLISHABLE_KEY = os.environ.get(
+    "CLERK_PUBLISHABLE_KEY",
+    "pk_test_aW1wcm92ZWQtYnVjay00ODk3LmNsZXJrLmFjY291bnRzLmRldiQ").strip()
+
+
+def _clerk_domain() -> str | None:
+    """pk_test_<base64 of "domain$"> -> the instance's frontend API domain."""
+    try:
+        b64 = CLERK_PUBLISHABLE_KEY.split("_", 2)[2]
+        domain = base64.b64decode(b64 + "=" * (-len(b64) % 4)).decode().rstrip("$")
+        return domain or None
+    except Exception:
+        return None
+
+
+_clerk_jwks: jwt.PyJWKClient | None = None
+
+
+def _jwks_client() -> jwt.PyJWKClient:
+    """Signing keys for Clerk session tokens. With CLERK_SECRET_KEY set they
+    come from Clerk's backend API -- the same source the official SDK's
+    verifyToken uses -- otherwise from the instance's public well-known URL,
+    which needs no credential at all."""
+    global _clerk_jwks
+    if _clerk_jwks is None:
+        secret = os.environ.get("CLERK_SECRET_KEY", "").strip()
+        if secret:
+            _clerk_jwks = jwt.PyJWKClient(
+                "https://api.clerk.com/v1/jwks",
+                headers={"Authorization": f"Bearer {secret}"}, lifespan=3600)
+        else:
+            _clerk_jwks = jwt.PyJWKClient(
+                f"https://{_clerk_domain()}/.well-known/jwks.json", lifespan=3600)
+    return _clerk_jwks
+
+
+class Ident(NamedTuple):
+    """Who is calling, reduced to what the handlers need. key_hash is what
+    quota and job ownership key off -- the raw credential never sits in the
+    job table or the logs. kind gates what the caller may buy."""
+    key_hash: str
+    kind: str            # "key" | "clerk" | "visitor"
+    limit: int
+
+
+def _auth_clerk(token: str) -> Ident:
+    """The signature is verified against Clerk's JWKS before ANY claim is
+    trusted -- a forged token must not impersonate a user -- and only the
+    verified sub becomes the identity that quota and jobs key off."""
+    domain = _clerk_domain()
+    if domain is None:
+        raise HTTPException(401, "sign-in is not enabled on this deployment")
+    try:
+        key = _jwks_client().get_signing_key_from_jwt(token)
+        claims = jwt.decode(
+            token, key.key, algorithms=["RS256"],
+            issuer=f"https://{domain}",
+            options={"verify_aud": False},    # session tokens carry azp, not aud
+            leeway=10)
+    except jwt.exceptions.PyJWKClientConnectionError:
+        raise HTTPException(503, "could not reach the sign-in service") from None
+    except (jwt.exceptions.PyJWTError, jwt.exceptions.PyJWKClientError):
+        raise HTTPException(401, "invalid or expired session") from None
+    sub = claims.get("sub")
+    if not sub:
+        raise HTTPException(401, "invalid or expired session")
+    row = db.ensure_key(f"clerk:{sub}", label=claims.get("email") or sub,
+                        daily_limit=CLERK_DAILY_LIMIT)
+    if row is None:
+        raise HTTPException(401, "this account has been disabled")
+    return Ident(row["key_hash"], "clerk", row["daily_limit"] or CLERK_DAILY_LIMIT)
+
+
+def auth(request: Request, authorization: str = Header(default="")) -> Ident:
+    """Three schemes share the endpoint: sk_ keys are API customers, anything
+    shaped like a JWT is a Clerk session from the Studio page, and NO
+    credential at all is the free visitor tier, quota'd by client address.
+    All three resolve to a row in api_keys, so quota and job ownership
+    downstream do not care which ran."""
     token = authorization.removeprefix("Bearer ").strip()
-    if not token or db.lookup_key(token) is None:
-        raise HTTPException(401, "invalid or missing API key")
-    return db.hash_key(token)
+    if token:
+        if token.count(".") == 2 and not token.startswith("sk_"):
+            return _auth_clerk(token)
+        row = db.lookup_key(token)
+        if row is None:
+            raise HTTPException(401, "invalid or missing API key")
+        return Ident(db.hash_key(token), "key", row.get("daily_limit") or DAILY_LIMIT)
+    # The LAST X-Forwarded-For entry is the one Railway's edge appended; the
+    # first can be whatever the client wrote into the header themselves, and
+    # trusting it would let one machine mint fresh visitor quotas at will.
+    fwd = request.headers.get("x-forwarded-for", "")
+    ip = (fwd.rsplit(",", 1)[-1].strip()
+          or (request.client.host if request.client else "unknown"))
+    row = db.ensure_key(f"ip:{ip}", label=f"visitor {ip}",
+                        daily_limit=ANON_DAILY_LIMIT)
+    if row is None:
+        raise HTTPException(401, "this address has been blocked")
+    return Ident(row["key_hash"], "visitor", row["daily_limit"] or ANON_DAILY_LIMIT)
 
 
 def _rp(path: str, payload: dict | None = None, timeout: int = 60) -> dict:
@@ -241,7 +345,8 @@ def health() -> dict:
 
 
 @app.post("/v1/videos", status_code=202)
-def create(body: VideoRequest, key: str = Depends(auth)) -> dict:
+def create(body: VideoRequest, ident: Ident = Depends(auth)) -> dict:
+    key = ident.key_hash
     if body.duration_s not in DURATIONS:
         raise HTTPException(422, f"duration_s must be one of {sorted(DURATIONS)}")
     tier, aspect = body.resolution, body.aspect_ratio
@@ -251,9 +356,15 @@ def create(body: VideoRequest, key: str = Depends(auth)) -> dict:
         raise HTTPException(422, f"resolution must be one of {sorted(RESOLUTION_TIERS)}")
     if aspect not in ASPECTS:
         raise HTTPException(422, f"aspect_ratio must be one of {sorted(ASPECTS)}")
+    # The visitor tier is a taste, not the product: everything past 5 s at
+    # 480p needs an account, exactly as the Studio page's lock icons promise.
+    if ident.kind == "visitor" and (body.duration_s != 5 or tier != "480p"):
+        raise HTTPException(
+            401, "longer lengths and 720p need a free account -- "
+                 "sign in or pass an API key")
     today = date.today().isoformat()
-    if not db.try_consume_quota(key, today, DAILY_LIMIT):
-        raise HTTPException(429, f"daily limit of {DAILY_LIMIT} videos reached")
+    if not db.try_consume_quota(key, today, ident.limit):
+        raise HTTPException(429, f"daily limit of {ident.limit} videos reached")
 
     frames = DURATIONS[body.duration_s]
     # Only 480p at 5 or 10 s fits inside SYNC_TIMEOUT (measured ~22 s and
@@ -380,8 +491,8 @@ def _owned(job_id: str, key: str) -> None:
 
 
 @app.get("/v1/videos/{job_id}")
-def status(job_id: str, key: str = Depends(auth)) -> dict:
-    _owned(job_id, key)
+def status(job_id: str, ident: Ident = Depends(auth)) -> dict:
+    _owned(job_id, ident.key_hash)
     try:
         st = _rp(f"status/{job_id}", timeout=30)
     except Exception:
@@ -411,8 +522,8 @@ def status(job_id: str, key: str = Depends(auth)) -> dict:
 
 
 @app.get("/v1/videos/{job_id}/content")
-def content(job_id: str, key: str = Depends(auth)):
-    _owned(job_id, key)
+def content(job_id: str, ident: Ident = Depends(auth)):
+    _owned(job_id, ident.key_hash)
     path = CACHE / f"{job_id}.mp4"
     if not path.exists():
         raise HTTPException(404, "video not ready; poll /v1/videos/{id} first")
