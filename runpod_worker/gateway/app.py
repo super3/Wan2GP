@@ -84,11 +84,18 @@ def _keys() -> dict[str, str]:
 
 DAILY_LIMIT = int(os.environ.get("GATEWAY_DAILY_LIMIT", "100"))
 
-#: How long POST /v1/videos will hold the connection before giving up and
-#: handing back a job id instead. A warm generation measured ~56 s; a cold start
-#: adds 90-330 s of queue and cannot fit in any normal HTTP timeout, which is
-#: why the async fallback below exists rather than a longer wait.
-SYNC_TIMEOUT = float(os.environ.get("GATEWAY_SYNC_TIMEOUT", "240"))
+#: How long POST /v1/videos will hold the connection before handing back a job
+#: id instead. This MUST sit below whatever proxy fronts this service, or the
+#: proxy cuts the connection first and the caller gets an opaque gateway error
+#: instead of the clean 202 -- the 202 never gets a chance to be sent.
+#:
+#: 90 s is the default because the common ceilings are low: Cloudflare cuts at
+#: 100 s, and RunPod's own *.proxy.runpod.net is Cloudflare-fronted, so a pod
+#: deployed there is already behind that limit. Measured with a 240 s value on
+#: RunPod's proxy, a slow generation returned HTTP 524 at 125 s.
+#:
+#: A warm 5 s clip generates in ~22 s and returns inline with room to spare.
+SYNC_TIMEOUT = float(os.environ.get("GATEWAY_SYNC_TIMEOUT", "90"))
 POLL_INTERVAL = float(os.environ.get("GATEWAY_POLL_INTERVAL", "2"))
 
 app = FastAPI(title="Video Generation API", version="1.0.0",
