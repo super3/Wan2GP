@@ -262,7 +262,7 @@
     <p class="belowmsg" id="msg" hidden></p>
 
     <h2>Recent generations</h2>
-    <p class="retention">Generations are only kept for 1 hour, then deleted — save anything you want to keep.</p>
+    <p class="retention">Clips save to this browser — the server deletes its copy after 5 minutes.</p>
     <p class="empty" id="empty">Videos you generate this session appear here.</p>
     <div class="grid" id="grid"></div>
   </div>
@@ -305,38 +305,62 @@ const clerkInit = (async function initClerk() {
 })();
 
 // ---- gallery persistence ---------------------------------------------------
-// Generated clips live on the server for an hour; the tab keeps only blob
-// URLs, which die on refresh. Persist the metadata and re-download whatever
-// is still within retention on load, with the credential that owns it.
-function readStore() {
-  try { return JSON.parse(localStorage.getItem("gw.gallery")) || []; } catch { return []; }
+// The browser is the system of record for clips: each mp4 is written into
+// IndexedDB the moment it downloads (localStorage cannot hold binary and
+// caps out around 5 MB), and the server deletes its copy after ~5 minutes.
+// Every helper swallows failure -- private windows and cleared site data
+// degrade to a session-only gallery, never a broken page.
+function idb() {
+  return new Promise((res, rej) => {
+    const rq = indexedDB.open("h3studio", 1);
+    rq.onupgradeneeded = () => rq.result.createObjectStore("clips", { keyPath: "id" });
+    rq.onsuccess = () => res(rq.result);
+    rq.onerror = () => rej(rq.error);
+  });
 }
-function writeStore(list) {
-  try { localStorage.setItem("gw.gallery", JSON.stringify(list.slice(0, 12))); } catch {}
+async function clipPut(entry) {
+  try {
+    const db = await idb();
+    await new Promise((res, rej) => {
+      const tx = db.transaction("clips", "readwrite");
+      tx.objectStore("clips").put(entry);
+      tx.oncomplete = res; tx.onerror = () => rej(tx.error);
+    });
+  } catch {}
 }
-function storeAdd(entry) { writeStore([entry, ...readStore().filter(e => e.id !== entry.id)]); }
-function storeDrop(id) { writeStore(readStore().filter(e => e.id !== id)); }
+async function clipAll() {
+  try {
+    const db = await idb();
+    return await new Promise((res, rej) => {
+      const rq = db.transaction("clips").objectStore("clips").getAll();
+      rq.onsuccess = () => res(rq.result || []);
+      rq.onerror = () => rej(rq.error);
+    });
+  } catch { return []; }
+}
+async function clipDrop(id) {
+  try {
+    const db = await idb();
+    await new Promise((res, rej) => {
+      const tx = db.transaction("clips", "readwrite");
+      tx.objectStore("clips").delete(id);
+      tx.oncomplete = res; tx.onerror = () => rej(tx.error);
+    });
+  } catch {}
+}
+async function pruneClips() {
+  const all = (await clipAll()).sort((a, b) => b.at - a.at);
+  for (const e of all.slice(12)) await clipDrop(e.id);   // storage cap
+}
 async function restoreGallery() {
-  // A signed-in user's jobs need their Clerk token, so wait briefly for the
-  // Clerk script rather than restoring with the wrong credential.
-  await Promise.race([clerkInit, new Promise(r => setTimeout(r, 4000))]);
-  const fresh = readStore().filter(e => Date.now() - e.at < 55 * 60 * 1000);
-  writeStore(fresh);
-  const restored = [];
-  for (const e of fresh) {
-    try {
-      const r = await fetch("/v1/videos/" + e.id + "/content", { headers: await authHeaders() });
-      if (r.status === 404) { storeDrop(e.id); continue; }   // expired or not ours
-      if (!r.ok) continue;
-      restored.push({ ...e, url: URL.createObjectURL(await r.blob()) });
-    } catch {}
-  }
-  if (restored.length) {
-    const ex = state.gallery.filter(g => g.example);
-    const mine = state.gallery.filter(g => !g.example);
-    state.gallery = [...mine, ...restored, ...ex];
-    renderGallery();
-  }
+  const clips = (await clipAll()).sort((a, b) => b.at - a.at).slice(0, 12);
+  if (!clips.length) return;
+  const restored = clips.map(({ blob, ...meta }) =>
+    ({ ...meta, url: URL.createObjectURL(blob) }));
+  const ex = state.gallery.filter(g => g.example);
+  const mine = state.gallery.filter(g => !g.example);
+  state.gallery = [...mine, ...restored, ...ex];
+  renderGallery();
 }
 function signedIn() { return clerkReady && !!Clerk.user; }
 function renderAuth() {
@@ -569,7 +593,7 @@ function renderGallery() {
     tile.querySelector(".del").addEventListener("click", e => {
       e.stopPropagation();
       URL.revokeObjectURL(g.url);
-      if (g.id) storeDrop(g.id);
+      if (g.id) clipDrop(g.id);
       state.gallery.splice(i, 1); renderGallery();
     });
     grid.appendChild(tile);
@@ -717,7 +741,7 @@ $("go").addEventListener("click", async () => {
     };
     state.gallery.unshift({ ...entry, url });
     state.gallery = state.gallery.slice(0, 12);
-    storeAdd(entry);                  // metadata only; the mp4 is re-fetched on load
+    clipPut({ ...entry, blob }).then(pruneClips);   // the browser copy is the durable one
     renderGallery();
     if (!bannerDismissed() && !signedIn()) $("banner").hidden = false;
   } catch (e) {

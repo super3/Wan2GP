@@ -89,11 +89,13 @@ MODEL_TYPE = "minimax_h3_fl2va_pruned"
 CACHE = Path(os.environ.get("GATEWAY_CACHE", "/tmp/gateway-videos"))
 CACHE.mkdir(parents=True, exist_ok=True)
 
-#: How long a finished mp4 stays downloadable. The Studio page tells people
-#: "generations are only kept for 1 hour -- save what you want"; this is what
-#: makes that sentence true rather than aspirational. Billing rows in the jobs
-#: table are unaffected -- only the bytes expire.
-RETENTION_S = int(os.environ.get("GATEWAY_RETENTION_S", "3600"))
+#: How long a finished mp4 stays downloadable. Five minutes: the server is a
+#: delivery buffer, not storage -- the Studio page saves each clip into the
+#: viewer's browser (IndexedDB) the moment it downloads, and that copy is the
+#: durable one. Short retention is also the privacy story: we do not keep
+#: customers' videos. Billing rows in the jobs table are unaffected -- only
+#: the bytes expire.
+RETENTION_S = int(os.environ.get("GATEWAY_RETENTION_S", "300"))
 
 
 def _purge_expired_cache() -> None:
