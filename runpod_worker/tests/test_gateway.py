@@ -1228,3 +1228,16 @@ def test_adventure_startup_requeues_orphaned_renders_immediately(client):
     dbmod.adventure_claim("biscuit")                      # n0 -> rendering, fresh
     dbmod.adventure_requeue_stale("biscuit", older_than_s=0)
     assert dbmod.adventure_status("biscuit")["n0"]["status"] == "queued"
+
+
+def test_adventure_link_unfurls_with_a_poster(client):
+    """Reddit/Discord/Twitter scrape Open Graph tags; without them a shared
+    link is bare text. og:image must be an absolute URL and must serve."""
+    c, _ = client
+    body = c.get("/adventure").text
+    assert 'property="og:image" content="https://h3studio.up.railway.app/adventure/poster.jpg"' in body
+    assert 'name="twitter:card" content="summary_large_image"' in body
+    r = c.get("/adventure/poster.jpg")
+    assert r.status_code == 200
+    assert r.headers["content-type"] == "image/jpeg"
+    assert r.content[:3] == b"\xff\xd8\xff"
