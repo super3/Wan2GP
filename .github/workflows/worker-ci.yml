@@ -1,0 +1,256 @@
+# Tier-1 CI for the RunPod Serverless worker: CPU only, no GPU, no torch, no weights.
+#
+# runpod_worker/{schema,config,errors,obs,media_in,media_out}.py import nothing from
+# WanGP or torch, and handler.py defers every heavy import to a function body. That
+# split is the whole reason this can run on a plain GitHub runner in well under two
+# minutes. Nothing here installs requirements.txt -- it pulls torch, gradio and mmgp,
+# takes many minutes, and proves nothing this suite cannot prove without them.
+#
+# NOTE: .gitignore:1 is `.*`, which matches `.github` and would silently hide this file
+# from a plain `git add`. .gitignore carries `!.dockerignore` and `!.github/` negations
+# to defeat that, alongside the pre-existing `!.gitignore` / `!requirements.txt` pair.
+# If you add a dotfile elsewhere in the tree, expect the same trap.
+name: worker-ci
+
+# The two path lists are duplicated on purpose: GitHub Actions does not support YAML
+# anchors/aliases in workflow files, so `paths: &x` / `paths: *x` would not parse.
+# Keep them in sync.
+#
+# The upstream files below are INPUTS to the suite, not just subjects of it. Every
+# one of them is read at test time, so leaving it out means the test written to
+# catch its drift never runs when it drifts:
+#
+#   wgp.py                                  test_wgp_config_drift (unguarded
+#                                           server_config[...] reads), test_schema
+#                                           (ATTACHMENT_KEYS)
+#   shared/api.py                           test_wgp_config_drift:52
+#   models/_settings.json                   test_schema (the settings universe)
+#   models/minimax_h3/minimax_h3_handler.py  test_schema:34 (letters, lattice, caches)
+#   defaults/<model_type>.json              test_schema:100
+#   shared/utils/frame_scheduler.py         test_schema (the frame lattice)
+#   requirements.txt                        test_wgp_config_drift (constraints.txt
+#                                           mirrors a dozen of its pins by hand)
+on:
+  pull_request:
+    paths:
+      - 'runpod_worker/**'
+      - 'Dockerfile'
+      - 'requirements.txt'
+      - 'wgp.py'
+      - 'shared/api.py'
+      - 'shared/utils/frame_scheduler.py'
+      - 'models/**'
+      - 'defaults/**'
+      - 'profiles/minimax_h3/**'
+      - '.github/workflows/worker-ci.yml'
+  push:
+    paths:
+      - 'runpod_worker/**'
+      - 'Dockerfile'
+      - 'requirements.txt'
+      - 'wgp.py'
+      - 'shared/api.py'
+      - 'shared/utils/frame_scheduler.py'
+      - 'models/**'
+      - 'defaults/**'
+      - 'profiles/minimax_h3/**'
+      - '.github/workflows/worker-ci.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Runs on its own and first: a leaked credential is the one CI finding that
+  # cannot be fixed by a follow-up commit -- pushing it is the disclosure, and
+  # rotation is the only remedy. The pre-commit hook
+  # (runpod_worker/scripts/install_hooks.py) catches it earlier, but .git/hooks
+  # is not version controlled, so this job is what actually holds for everyone.
+  secret-guard:
+    name: no credentials in the diff
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The scanner diffs against the base, so it needs history, not a
+          # depth-1 checkout.
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Scan the added lines
+        run: |
+          BASE="${{ github.event.pull_request.base.sha || github.event.before }}"
+          if [ -z "$BASE" ] || [ "$BASE" = "0000000000000000000000000000000000000000" ]; then
+            echo "no base commit to diff against; scanning the whole worker tree"
+            python3 runpod_worker/scripts/secret_guard.py \
+              $(git ls-files 'runpod_worker/*' '.github/*' 'docs/*')
+          else
+            echo "scanning $BASE..${{ github.sha }}"
+            python3 runpod_worker/scripts/secret_guard.py --range "$BASE..${{ github.sha }}"
+          fi
+
+  tests:
+    name: cpu tests (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        # Floor and ceiling of the supported range. The worker modules are written for
+        # 3.10+ (`from __future__ import annotations` everywhere, no 3.11-only stdlib).
+        python-version: ['3.10', '3.12']
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # pytest and nothing else. No torch, no runpod, no boto3, no requirements.txt.
+      # pytest, plus the gateway's own deps (FastAPI/SQLAlchemy) and httpx for
+      # its TestClient. Without these the gateway suite silently SKIPS via
+      # importorskip -- the durability tests (quota/ownership across restart)
+      # would be green in CI without ever running.
+      - name: Install test dependencies
+        run: |
+          python -m pip install --disable-pip-version-check --quiet pytest httpx
+          python -m pip install --disable-pip-version-check --quiet \
+            -r runpod_worker/gateway/requirements.txt
+
+      - name: Assert the CPU modules import with no heavy dependencies
+        run: |
+          python - <<'PY'
+          import sys
+          import runpod_worker.handler  # pulls schema, config, errors, obs, media_*, engine
+          heavy = sorted(m for m in ('torch', 'wgp', 'gradio', 'numpy', 'cv2', 'transformers')
+                         if m in sys.modules)
+          assert not heavy, f"importing the worker pulled in {heavy}; that breaks CPU CI"
+          assert not runpod_worker.handler.BOOT.ok, "handler booted WanGP at import time"
+          print("ok: worker imports clean on", sys.version.split()[0])
+          PY
+
+      - name: pytest
+        run: pytest runpod_worker/tests -q
+
+      # test_input.json is what Tier 2/3 and every copy-paste example run. A payload
+      # that no longer parses is a broken runbook, and this costs ~50 ms to prove.
+      - name: Validate test_input.json against the real schema
+        run: |
+          python - <<'PY'
+          import json
+          from runpod_worker import schema
+          payload = json.load(open("runpod_worker/test_input.json"))
+          request = schema.parse(payload["input"])
+          print("ok:", request.model_type,
+                "steps=%s" % request.settings.get("num_inference_steps"),
+                "frames=%s" % request.settings.get("video_length"),
+                "budget=%ss" % request.budget_s)
+          for warning in request.warnings:
+              print("warning:", warning)
+          PY
+
+  sdk-contract:
+    name: runpod SDK contract
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # The tier-1 job installs pytest and nothing else, so every SDK behaviour the
+      # worker depends on is exercised against a fake there. This job installs the
+      # real wheel (pure Python, resolves in seconds) and asserts the four contracts
+      # the design actually leans on. None of them is documented as stable, and a
+      # silent rename would otherwise surface as a dead endpoint in production.
+      - name: Install the runpod SDK
+        run: |
+          python -m pip install --disable-pip-version-check --quiet pytest httpx
+          python -m pip install --disable-pip-version-check \
+            -c runpod_worker/constraints.txt -r runpod_worker/requirements-worker.txt
+          # The runpod SDK brings fastapi with it, so the gateway tests RUN in
+          # this job rather than skipping -- they need sqlalchemy too, or every
+          # one of them errors on import (that exact failure shipped once).
+          python -m pip install --disable-pip-version-check --quiet \
+            -r runpod_worker/gateway/requirements.txt
+
+      - name: Assert the SDK surface the worker calls
+        run: |
+          python - <<'PY'
+          import inspect
+          import runpod
+          from runpod.serverless.modules import rp_job
+          from runpod.serverless.utils import rp_upload
+
+          missing = "register_fitness_check is gone; register_fitness_checks() no-ops"
+          assert callable(runpod.serverless.register_fitness_check), missing
+          missing = "progress_update is gone; every job would report no progress"
+          assert callable(runpod.serverless.progress_update), missing
+
+          params = set(inspect.signature(rp_upload.upload_file_to_bucket).parameters)
+          wanted = {"file_name", "file_location", "bucket_name", "prefix", "extra_args"}
+          assert wanted <= params, f"upload_file_to_bucket signature: {sorted(params)}"
+
+          # rp_job.run_job POPS "error"/"refresh_worker" off the handler's return
+          # value and turns refresh_worker into stopPod; error_response() and
+          # _success_response() are written to exactly that shape.
+          source = inspect.getsource(rp_job.run_job)
+          for needle in ('pop("error"', 'pop("refresh_worker"', '"stopPod"'):
+              assert needle in source, f"rp_job.run_job no longer does {needle}"
+          print("ok: runpod", getattr(runpod, "__version__", "?"))
+          PY
+
+      # With the SDK importable, register_fitness_checks() actually registers --
+      # the branch the tier-1 job can never reach because `runpod is None` there.
+      - name: Assert the fitness checks register
+        env:
+          WORKER_FITNESS: '1'
+          WANGP_EAGER_BOOT: '0'
+        run: |
+          python - <<'PY'
+          from runpod_worker import handler
+          names = handler.register_fitness_checks()
+          assert names == ["_fitness_boot", "_fitness_gpu", "_fitness_weights",
+                           "_fitness_transport"], names
+          print("ok: fitness checks", names)
+          PY
+
+      # The worker requirements resolve under the constraints file. This is the
+      # same gate the Dockerfile runs as `pip check`, except that one sits ~60
+      # minutes into an image build; a floor bump in runpod's dependency set
+      # should fail here in seconds instead.
+      - name: Resolve the worker requirements under constraints
+        run: |
+          python -m pip install --disable-pip-version-check --dry-run --quiet \
+            -c runpod_worker/constraints.txt -r runpod_worker/requirements-worker.txt
+          python -m pip check
+
+      - name: pytest with the SDK present
+        run: pytest runpod_worker/tests -q
+
+  hadolint:
+    name: hadolint (runpod_worker/Dockerfile)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      # The Dockerfile carries targeted `# hadolint ignore=` comments where a rule is
+      # deliberately not followed (unpinned apt packages in the CUDA base, consecutive
+      # RUN layers kept separate for build-cache reasons), and currently reports zero
+      # findings at every level under hadolint 2.12.0 -- the version this action ships.
+      # failure-threshold: warning fails the job on error and warning while leaving
+      # room for a future info/style nit to be triaged rather than block a PR.
+      - uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: runpod_worker/Dockerfile
+          failure-threshold: warning
