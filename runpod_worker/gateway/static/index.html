@@ -281,6 +281,21 @@ $("dur").addEventListener("change", estimate);
 $("res").addEventListener("change", estimate);
 estimate();
 
+// ?key=... prefills the field so one link is the whole demo. It is then
+// REMOVED from the address bar immediately: a key left in the URL leaks into
+// browser history, the Referer header on any outbound link, and every proxy or
+// server log along the way. Prefilling is a convenience; leaving it there is a
+// disclosure. The API itself never accepts a key as a query parameter -- that
+// would put it in a log line on every single call.
+(function adoptKeyFromUrl() {
+  const url = new URL(location.href);
+  const fromUrl = url.searchParams.get("key");
+  if (!fromUrl) return;
+  try { sessionStorage.setItem("gw.key", fromUrl); } catch {}
+  url.searchParams.delete("key");
+  history.replaceState(null, "", url.pathname + url.search + url.hash);
+})();
+
 $("key").value = sessionStorage.getItem("gw.key") || "";
 $("key").addEventListener("change", () => { try { sessionStorage.setItem("gw.key", $("key").value); } catch {} });
 
