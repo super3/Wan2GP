@@ -362,12 +362,14 @@ class VideoRequest(BaseModel):
     seed: int | None = Field(default=None, ge=-1, le=2**31 - 1)
 
 
-#: Warm-worker generation seconds per (tier, duration), measured on the
-#: PRO 6000. These are only the floor: rolling averages from the jobs table
-#: override each cell once it has MIN_SAMPLES real completions, so the
-#: advertised estimate tracks what the fleet actually does.
-BASE_TIMES = {"480p": {5: 24, 10: 56, 15: 100},
-              "720p": {5: 48, 10: 103, 15: 185}}
+#: Wall-clock seconds per (tier, duration) a warm request takes end to end
+#: (dispatch + generate + decode + transfer), measured through the gateway on
+#: the PRO 6000. These are only the floor: rolling MEDIANS of recorded wall_s
+#: override each cell once it has MIN_SAMPLES real completions. Medians, not
+#: means -- a cold-start outlier must not poison the warm number, but if
+#: reload-on-first-job becomes the common case, the median follows it.
+BASE_TIMES = {"480p": {5: 30, 10: 65, 15: 110},
+              "720p": {5: 55, 10: 115, 15: 200}}
 #: Observed full cold start (weight download, no network volume) ~150 s.
 COLD_START_S = int(os.environ.get("GATEWAY_COLD_START_S", "150"))
 MIN_SAMPLES = 3
@@ -375,22 +377,27 @@ MIN_SAMPLES = 3
 _TIER_OF_DIMS = {dims: tier for (tier, _aspect), dims in DIMENSIONS.items()}
 
 
+def _median(vals: list[float]) -> float:
+    return sorted(vals)[len(vals) // 2]
+
+
 def _estimate_block() -> dict:
     """What the page needs to compute an honest time estimate: warm per-combo
-    seconds (rolling averages over recorded generate_s where available), the
-    cold-start penalty, and a mean job time for queue-wait math."""
+    wall seconds, the cold-start penalty, and a typical job time for
+    queue-wait math."""
     times = {tier: dict(cells) for tier, cells in BASE_TIMES.items()}
     merged: dict[tuple[str, int], list[float]] = {}
-    for (dims, dur), vals in db.recent_generate_times().items():
+    for (dims, dur), vals in db.recent_wall_times().items():
         tier = _TIER_OF_DIMS.get(dims)
         if tier:
-            merged.setdefault((tier, dur), []).extend(vals)
+            # < 5 s wall for a video generation is a recording glitch, not data
+            merged.setdefault((tier, dur), []).extend(v for v in vals if v >= 5)
     all_vals: list[float] = []
     for (tier, dur), vals in merged.items():
         all_vals.extend(vals)
         if len(vals) >= MIN_SAMPLES and dur in times[tier]:
-            times[tier][dur] = round(sum(vals) / len(vals))
-    avg_job = round(sum(all_vals) / len(all_vals)) if all_vals else 45
+            times[tier][dur] = round(_median(vals))
+    avg_job = round(_median(all_vals)) if all_vals else 60
     return {"times": {t: {str(d): s for d, s in cells.items()}
                       for t, cells in times.items()},
             "cold_start_s": COLD_START_S, "avg_job_s": avg_job}
