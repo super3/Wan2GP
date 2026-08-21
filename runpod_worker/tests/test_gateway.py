@@ -358,3 +358,84 @@ def test_720p_uses_a_resolution_the_model_actually_accepts():
     assert module.RESOLUTIONS["720p"] == "1280x704"
     for w, h in (tuple(map(int, v.split("x"))) for v in module.RESOLUTIONS.values()):
         assert w % 16 == 0 and h % 16 == 0, f"{w}x{h} is off the VAE lattice"
+
+
+# --- square + image input --------------------------------------------------
+
+def test_square_resolution(client):
+    c, m = client
+    seen = {}
+
+    def fake(path, payload=None, timeout=60):
+        if payload:
+            seen.update(payload["input"]["settings"]); return {"id": "job-1"}
+        return COMPLETED
+
+    with mock.patch.object(m, "_rp", side_effect=fake):
+        r = c.post("/v1/videos", json={"prompt": "x", "resolution": "square"}, headers=_hdr(KEY_A))
+    assert r.status_code == 202                 # above 480p -> background
+    assert seen["resolution"] == "960x960"
+
+
+def test_every_offered_resolution_is_on_the_block_lattice():
+    """block_size is 32 (schema.py:465). A resolution off the lattice fails the
+    job instantly -- 1280x720 did exactly that -- so every value the gateway
+    offers must be a multiple of 32 in BOTH dimensions."""
+    from runpod_worker.gateway import app as module
+    for name, value in module.RESOLUTIONS.items():
+        w, h = (int(x) for x in value.split("x"))
+        assert w % 32 == 0 and h % 32 == 0, f"{name}={value} is off the 32px lattice"
+
+
+def test_image_sets_both_the_letter_and_the_attachment(client):
+    """wgp.py:1409 reads image_start ONLY when "S" is in image_prompt_type. Set
+    one without the other and the image is silently ignored -- the caller gets a
+    video that simply does not use their frame, with no error."""
+    c, m = client
+    sent = {}
+
+    def fake(path, payload=None, timeout=60):
+        if payload:
+            sent["settings"] = payload["input"]["settings"]
+            sent["media"] = payload["input"].get("media")
+            return {"id": "job-1"}
+        return COMPLETED
+
+    with mock.patch.object(m, "_rp", side_effect=fake):
+        c.post("/v1/videos", json={"prompt": "x", "image": "aGVsbG8="}, headers=_hdr(KEY_A))
+    assert sent["settings"]["image_prompt_type"] == "S"
+    assert sent["media"]["image_start"] == {"b64": "aGVsbG8="}
+
+
+def test_data_uri_prefix_is_stripped(client):
+    """A browser FileReader yields 'data:image/png;base64,AAAA'; the worker wants
+    the payload only."""
+    c, m = client
+    sent = {}
+
+    def fake(path, payload=None, timeout=60):
+        if payload:
+            sent.update(payload["input"].get("media") or {}); return {"id": "job-1"}
+        return COMPLETED
+
+    with mock.patch.object(m, "_rp", side_effect=fake):
+        c.post("/v1/videos", json={"prompt": "x", "image": "data:image/png;base64,QUJD"},
+               headers=_hdr(KEY_A))
+    assert sent["image_start"] == {"b64": "QUJD"}
+
+
+def test_no_image_means_no_attachment(client):
+    c, m = client
+    sent = {}
+
+    def fake(path, payload=None, timeout=60):
+        if payload:
+            sent["settings"] = payload["input"]["settings"]
+            sent["media"] = payload["input"].get("media")
+            return {"id": "job-1"}
+        return COMPLETED
+
+    with mock.patch.object(m, "_rp", side_effect=fake):
+        c.post("/v1/videos", json={"prompt": "x"}, headers=_hdr(KEY_A))
+    assert sent["media"] == {}
+    assert sent["settings"]["image_prompt_type"] == ""
