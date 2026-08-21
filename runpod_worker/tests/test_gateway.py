@@ -326,8 +326,21 @@ def test_studio_signup_and_gating_markers(client):
     assert "Longer lengths and 720p need a free account" in body
     assert "free generations left" in body
     assert "body.signedin .lock" in body
+    assert "Requires a free account" in body          # lock tooltips
+    assert "5 s at 480p is free" in body              # the free-tier hint line
     assert 'fetch("/v1/health")' not in body
     assert "setInterval(poll" not in body
+
+
+def test_example_clips_are_served(client):
+    """The gallery seeds itself with real example generations; the assets
+    must come off this origin like everything else."""
+    c, _ = client
+    body = c.get("/").text
+    assert "/examples/desk-lamp.mp4" in body
+    r = c.get("/examples/desk-lamp.mp4")
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("video/mp4")
 
 
 def test_background_returns_immediately(client):
