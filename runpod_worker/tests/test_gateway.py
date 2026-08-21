@@ -818,3 +818,45 @@ def test_revoked_clerk_account_is_banned(clerk):
     with mock.patch.object(m, "_rp", side_effect=_backend()):
         assert c.post("/v1/videos", json={"prompt": "x", "background": True},
                       headers=_hdr(tok)).status_code == 401
+
+
+# --- visitor device tokens ---------------------------------------------------
+
+def test_device_token_ownership_survives_an_address_change(client):
+    """Quota is charged per address, but ownership rides on the page's vt_
+    token: a phone that hops from wifi to cellular mid-generation must still
+    be able to poll its job."""
+    c, m = client
+    vt = _hdr("vt_11111111-aaaa-bbbb-cccc-222222222222")
+    with mock.patch.object(m, "_rp", side_effect=_backend(run_id="hop-1")):
+        r = c.post("/v1/videos", json={"prompt": "x", "background": True},
+                   headers={**vt, "X-Forwarded-For": "198.51.100.1"})
+        assert r.status_code == 202
+        # same device, different network address
+        assert c.get("/v1/videos/hop-1",
+                     headers={**vt, "X-Forwarded-For": "203.0.113.9"}).status_code == 200
+        # a different device cannot read it, even from the submitting address
+        other = _hdr("vt_33333333-aaaa-bbbb-cccc-444444444444")
+        assert c.get("/v1/videos/hop-1",
+                     headers={**other, "X-Forwarded-For": "198.51.100.1"}).status_code == 404
+
+
+def test_device_token_does_not_reset_the_address_quota(client):
+    """Clearing browser storage mints a new vt_ token but not a new quota:
+    the daily count stays pinned to the address."""
+    c, m = client
+    codes = []
+    for i in range(3):
+        with mock.patch.object(m, "_rp", side_effect=_backend(run_id=f"vtq-{i}")):
+            codes.append(c.post(
+                "/v1/videos", json={"prompt": "x", "background": True},
+                headers=_hdr(f"vt_{i}0000000-aaaa-bbbb-cccc-000000000000")).status_code)
+    assert codes == [202, 202, 429]
+
+
+def test_malformed_device_token_is_refused(client):
+    c, _ = client
+    assert c.post("/v1/videos", json={"prompt": "x"},
+                  headers=_hdr("vt_x")).status_code == 401
+    assert c.post("/v1/videos", json={"prompt": "x"},
+                  headers=_hdr("vt_" + "A" * 200)).status_code == 401

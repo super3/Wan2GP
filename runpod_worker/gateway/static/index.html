@@ -458,9 +458,19 @@ function renderGallery() {
 }
 
 // ---- generate --------------------------------------------------------------
-// Auth is a pasted sk_ key, a Clerk session, or nothing at all (the free
-// visitor tier). A Clerk session token expires after about a minute, so every
-// request fetches a fresh one rather than reusing the first.
+// Auth is a pasted sk_ key, a Clerk session, or the visitor device token. A
+// Clerk session token expires after about a minute, so every request fetches
+// a fresh one rather than reusing the first. The device token exists because
+// a phone's IP changes mid-generation (wifi to cellular): quota is still
+// counted per address server-side, but job ownership rides on this token so
+// polling keeps working across the hop.
+function visitorToken() {
+  try {
+    let t = localStorage.getItem("gw.visitor");
+    if (!t) { t = "vt_" + crypto.randomUUID(); localStorage.setItem("gw.visitor", t); }
+    return t;
+  } catch { return null; }
+}
 async function authHeaders() {
   const key = $("key").value.trim();
   if (key) return { Authorization: "Bearer " + key };
@@ -470,7 +480,8 @@ async function authHeaders() {
       if (t) return { Authorization: "Bearer " + t };
     } catch {}
   }
-  return {};
+  const vt = visitorToken();
+  return vt ? { Authorization: "Bearer " + vt } : {};
 }
 
 // Always background:true + short polls: a phone browser aborts a held fetch
