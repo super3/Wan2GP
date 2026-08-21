@@ -50,6 +50,10 @@ jobs = sa.Table(
     sa.Column("seed", sa.Integer, nullable=True),
     sa.Column("status", sa.String(20), nullable=False, server_default="queued"),
     sa.Column("generate_s", sa.Float, nullable=True),
+    #: Submit to first observed completion. This is what a caller actually
+    #: waits -- generate_s omits dispatch, model load, decode and transfer,
+    #: which is why estimates built on it under-promised badly.
+    sa.Column("wall_s", sa.Float, nullable=True),
     sa.Column("created_at", sa.DateTime, nullable=False),
 )
 
@@ -77,6 +81,13 @@ def engine() -> sa.Engine:
     if _engine is None:
         _engine = sa.create_engine(_url(), pool_pre_ping=True, future=True)
         _metadata.create_all(_engine)
+        # create_all never alters an existing table; add columns introduced
+        # after first deploy by hand and ignore "already exists".
+        try:
+            with _engine.begin() as cx:
+                cx.execute(sa.text("ALTER TABLE jobs ADD COLUMN wall_s FLOAT"))
+        except sa.exc.DBAPIError:
+            pass
     return _engine
 
 
@@ -210,19 +221,19 @@ def record_job(job_id: str, key_hash: str, *, resolution: str, duration_s: int,
             duration_s=duration_s, seed=seed, created_at=_now()))
 
 
-def recent_generate_times(limit: int = 200) -> dict[tuple[str, int], list[float]]:
-    """The last `limit` completed generations' timings, grouped by
-    (resolution, duration_s). The estimate the Studio page advertises is
-    computed from these rather than hand-measured constants, so it tracks
-    what the fleet actually does as hardware or profiles change."""
+def recent_wall_times(limit: int = 200) -> dict[tuple[str, int], list[float]]:
+    """The last `limit` completions' wall-clock seconds (submit to observed
+    completion), grouped by (resolution, duration_s). The estimate the page
+    advertises is computed from these rather than hand-measured constants,
+    so it tracks what a caller actually waits as the fleet changes."""
     with engine().connect() as cx:
         rows = cx.execute(
-            sa.select(jobs.c.resolution, jobs.c.duration_s, jobs.c.generate_s)
-            .where(jobs.c.generate_s.is_not(None))
+            sa.select(jobs.c.resolution, jobs.c.duration_s, jobs.c.wall_s)
+            .where(jobs.c.wall_s.is_not(None))
             .order_by(jobs.c.created_at.desc()).limit(limit)).all()
     out: dict[tuple[str, int], list[float]] = {}
-    for res, dur, gen in rows:
-        out.setdefault((res, dur), []).append(gen)
+    for res, dur, wall in rows:
+        out.setdefault((res, dur), []).append(wall)
     return out
 
 
@@ -238,4 +249,11 @@ def mark_job(job_id: str, status: str, generate_s: float | None = None) -> None:
     if generate_s is not None:
         values["generate_s"] = generate_s
     with engine().begin() as cx:
+        if status == "completed":
+            # First observation of the completion stamps the wall time; the
+            # status endpoint re-marks on every poll and must not creep it up.
+            row = cx.execute(sa.select(jobs.c.created_at, jobs.c.wall_s)
+                             .where(jobs.c.id == job_id)).first()
+            if row is not None and row[1] is None and row[0] is not None:
+                values["wall_s"] = max(0.0, (_now() - row[0]).total_seconds())
         cx.execute(jobs.update().where(jobs.c.id == job_id).values(**values))
