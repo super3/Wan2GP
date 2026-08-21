@@ -13,10 +13,16 @@ everything that costs money -- clip length, resolution, model, accelerator
 profile -- is fixed server-side, so a caller cannot ask for a 20-second 4K clip
 and hand you the bill.
 
-    POST /v1/videos          {"prompt": "..."}        -> 202 {"id", "status"}
-    GET  /v1/videos/{id}                              -> status, then metadata
-    GET  /v1/videos/{id}/content                      -> the mp4 bytes
+    POST /v1/videos   {"prompt": "..."}   -> 200 video/mp4  (waits for it)
+                                          -> 202 {"id"}      (only if it ran long)
+    GET  /v1/videos/{id}                  -> status, for the 202 case
+    GET  /v1/videos/{id}/content          -> the mp4 bytes
     GET  /v1/health
+
+One call gives you the file. A warm generation measured ~56 s, well inside a
+normal HTTP timeout; a COLD start adds 90-330 s of queue while a worker boots
+and fits inside no sane timeout, so that case degrades to a job id instead of
+failing.
 
     export RUNPOD_API_KEY=...  RUNPOD_ENDPOINT_ID=...
     export GATEWAY_KEYS='{"sk_live_demo123":"acme corp"}'
@@ -40,7 +46,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException, Header
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 RUNPOD_API = "https://api.runpod.ai/v2"
@@ -73,6 +79,13 @@ def _keys() -> dict[str, str]:
 
 
 DAILY_LIMIT = int(os.environ.get("GATEWAY_DAILY_LIMIT", "100"))
+
+#: How long POST /v1/videos will hold the connection before giving up and
+#: handing back a job id instead. A warm generation measured ~56 s; a cold start
+#: adds 90-330 s of queue and cannot fit in any normal HTTP timeout, which is
+#: why the async fallback below exists rather than a longer wait.
+SYNC_TIMEOUT = float(os.environ.get("GATEWAY_SYNC_TIMEOUT", "240"))
+POLL_INTERVAL = float(os.environ.get("GATEWAY_POLL_INTERVAL", "2"))
 
 app = FastAPI(title="Video Generation API", version="1.0.0",
               description="10-second 832x480 video with synchronized audio, from a text prompt.")
@@ -156,8 +169,68 @@ def create(body: VideoRequest, key: str = Depends(auth)) -> dict:
         raise HTTPException(503, "could not queue the job")
     with _lock:
         _jobs[job_id] = {"owner": key, "created": time.time(), "seed": body.seed}
-    return {"id": job_id, "status": "queued",
-            "duration_s": round(VIDEO_LENGTH / 24, 2), "resolution": RESOLUTION}
+
+    # Hold the connection and hand back the mp4 itself. One call, one file, no
+    # polling -- which is the whole point of this route.
+    deadline = time.monotonic() + SYNC_TIMEOUT
+    while time.monotonic() < deadline:
+        time.sleep(POLL_INTERVAL)
+        try:
+            st = _rp(f"status/{job_id}", timeout=30)
+        except Exception:
+            continue                      # a blip mid-generation is not a failure
+        state = st.get("status")
+        if state in ("IN_QUEUE", "IN_PROGRESS"):
+            continue
+        if state != "COMPLETED":
+            message = (st.get("output") or {}).get("message", "generation failed")
+            raise HTTPException(502, message)
+        path = _materialise(job_id, st)
+        if path is None:
+            raise HTTPException(502, "generation produced no video")
+        return _video_response(job_id, path, st)
+
+    # Out of time -- almost always a cold start. The work is still running, so
+    # return the id rather than throwing away a job the customer has paid for.
+    return JSONResponse(
+        status_code=202,
+        headers={"Retry-After": "30", "Location": f"/v1/videos/{job_id}"},
+        content={"id": job_id, "status": "processing",
+                 "message": ("still generating past the synchronous limit "
+                             f"({SYNC_TIMEOUT:.0f}s); poll the url in Location"),
+                 "poll_url": f"/v1/videos/{job_id}"})
+
+
+def _materialise(job_id: str, st: dict) -> Path | None:
+    """Write the returned video to the cache and return its path."""
+    video = ((st.get("output") or {}).get("video") or {})
+    path = CACHE / f"{job_id}.mp4"
+    if not path.exists():
+        if video.get("kind") != "base64":
+            return None
+        path.write_bytes(base64.b64decode(video["data"]))
+    return path
+
+
+def _video_response(job_id: str, path: Path, st: dict) -> FileResponse:
+    """The mp4, with the reproducibility metadata on headers.
+
+    The body has to be the file for this to be a one-call API, so anything a
+    caller needs alongside it goes in headers rather than a JSON envelope.
+    """
+    out = st.get("output") or {}
+    video = out.get("video") or {}
+    return FileResponse(
+        path, media_type="video/mp4", filename=f"{job_id}.mp4",
+        headers={
+            "X-Video-Id": job_id,
+            "X-Seed": str(out.get("seed", "")),
+            "X-Duration-Seconds": str(video.get("duration_s", "")),
+            "X-Width": str(video.get("width", "")),
+            "X-Height": str(video.get("height", "")),
+            "X-Has-Audio": str(bool(video.get("has_audio"))).lower(),
+            "X-Generate-Seconds": str((out.get("metrics") or {}).get("generate_s", "")),
+        })
 
 
 def _owned(job_id: str, key: str) -> dict:
@@ -187,9 +260,7 @@ def status(job_id: str, key: str = Depends(auth)) -> dict:
 
     out = st.get("output") or {}
     video = out.get("video") or {}
-    path = CACHE / f"{job_id}.mp4"
-    if not path.exists() and video.get("kind") == "base64":
-        path.write_bytes(base64.b64decode(video["data"]))
+    path = _materialise(job_id, st) or CACHE / f"{job_id}.mp4"
     return {"id": job_id, "status": "completed",
             "seed": out.get("seed"),
             "duration_s": video.get("duration_s"),
