@@ -1169,23 +1169,18 @@ def _safe_cancel_check(check: Callable[[], bool]) -> bool:
 def _encode_preview(payload: Any) -> str | None:
     """A denoising preview as a small base64 JPEG, or None.
 
-    WanGP pushes raw latents; ``wgp.generate_preview`` converts them with the
-    model's cheap latent->RGB factors -- no VAE involved, so this costs
-    milliseconds. Kept small (120 px tall, JPEG q60, ~15-30 KB) because the
-    frame rides inside RunPod progress updates that the customer gateway
-    polls. Failures are never fatal: no preview beats no progress."""
+    By the time a preview event reaches this queue, the CLI bridge
+    (``shared/api_cli.py`` ``_handle_command``) has already turned WanGP's raw
+    latents into a ``PreviewUpdate`` whose ``.image`` is a small PIL image
+    (via the model's cheap latent->RGB factors -- no VAE involved). Encoding
+    is all that is left. Kept small (120 px tall, JPEG q60, ~15-30 KB)
+    because the frame rides inside RunPod progress updates that the customer
+    gateway polls. Failures are never fatal: no preview beats no progress."""
     try:
         import base64
         import io
 
-        import torch
-        import wgp as _wgp
-
-        if torch.cuda.is_available():
-            # The generation thread copied the latents to CPU non_blocking;
-            # sync before reading them, exactly as wgp's own UI handler does.
-            torch.cuda.current_stream().synchronize()
-        img = _wgp.generate_preview(C.CONFIG.model_type, payload)
+        img = getattr(payload, "image", None)
         if img is None:
             return None
         height = 120
