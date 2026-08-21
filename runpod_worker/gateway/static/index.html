@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Minimax H3 Studio</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 26 26%22><rect width=%2226%22 height=%2226%22 rx=%227%22 fill=%22%23b4531f%22/><path d=%22M13 5.5l1.7 5.3 5.5 2.2-5.5 2.2L13 20.5l-1.7-5.3L5.8 13l5.5-2.2z%22 fill=%22%23fff%22/></svg>">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;500;650&family=JetBrains+Mono:wght@400;500&display=swap">
@@ -116,7 +117,7 @@
   .belowmsg.ok { color:#2f7d52; }
   h2 { font-size:13px; font-weight:650; text-transform:uppercase; letter-spacing:.09em;
        color:#6b665e; margin:32px 0 6px; }
-  .retention { font-size:13px; color:#9a6b12; margin:0 0 14px; }
+  .retention { font-size:12.5px; color:#9a6b12; margin:0 0 14px; }
   .freeline { font-size:12px; color:#6b665e; margin:10px 0 0; text-align:center; }
   .banner { display:flex; align-items:center; gap:14px; margin-top:14px; padding:13px 16px;
             background:#fff; border:1px solid #e3e0da; border-radius:10px; }
@@ -137,15 +138,19 @@
   .thumb .dur { position:absolute; right:8px; bottom:8px; font-family:"JetBrains Mono",monospace;
                 font-size:10.5px; color:#eeebe5; background:rgba(0,0,0,.55); padding:2px 6px;
                 border-radius:4px; }
+  .thumb .extag { position:absolute; left:8px; top:8px; font-family:"JetBrains Mono",monospace;
+                  font-size:10px; color:#eeebe5; background:rgba(0,0,0,.55); padding:2px 6px;
+                  border-radius:4px; }
   .tile .title { padding:9px 12px 0; font-size:13px; font-weight:500; line-height:1.4;
                  color:#1c1a17; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   .tile .sub { padding:3px 12px 0; font-size:11px; color:#6b665e;
                font-family:"JetBrains Mono",monospace; }
-  .tile .acts { display:flex; align-items:center; gap:12px; padding:9px 12px 0; }
-  .tile .save { display:inline-flex; align-items:center; gap:5px; font-size:12px; font-weight:650;
-                color:#fff; background:#b4531f; border:1px solid #b4531f; border-radius:6px;
-                padding:4px 11px; }
-  .tile .save:hover { background:#9c4517; border-color:#9c4517; }
+  .tile .acts { display:flex; align-items:center; gap:12px; padding:9px 12px 0;
+                opacity:.55; transition:opacity .15s; }
+  .tile:hover .acts { opacity:1; }
+  .tile .save { display:inline-flex; align-items:center; gap:4px; font-size:12px; font-weight:650;
+                color:#b4531f; background:none; border:none; padding:0; }
+  .tile .save:hover { text-decoration:underline; }
   .tile .ghost { display:inline-flex; align-items:center; gap:4px; font-size:12px; color:#6b665e;
                  background:none; border:none; padding:0; }
   .tile .ghost:hover { text-decoration:underline; color:#b4531f; }
@@ -173,9 +178,7 @@
           <label style="margin:0">Prompt</label>
           <span class="count"><span id="chars">0</span> / 2000</span>
         </div>
-        <textarea id="prompt" spellcheck="false" maxlength="2000">integrated_multimodal_description: [Shot 1] A cinematic close-up of a brass desk lamp switching on in a dark study, dust drifting through the beam. The camera pushes in slowly.
-overall_soundscape: A single click, a low electrical hum, faint room tone.
-non_diegetic_music: None.</textarea>
+        <textarea id="prompt" spellcheck="false" maxlength="2000" placeholder="A brass desk lamp switches on in a dark study, dust drifting through the beam…"></textarea>
         <div class="chips">
           <button type="button" data-p="integrated_multimodal_description: [Shot 1] A cinematic close-up of a brass desk lamp switching on in a dark study, dust drifting through the beam. The camera pushes in slowly.&#10;overall_soundscape: A single click, a low electrical hum, faint room tone.&#10;non_diegetic_music: None.">Desk lamp</button>
           <button type="button" data-p="integrated_multimodal_description: [Shot 1] Rain streaking down a café window at dusk, neon signs blurring into bokeh beyond the glass. The camera holds still.&#10;overall_soundscape: Steady rain, muffled street noise, a distant tram bell.&#10;non_diegetic_music: None.">Rain on glass</button>
@@ -211,6 +214,8 @@ non_diegetic_music: None.</textarea>
         <span id="gatemsg"></span>
         <button type="button" class="signup" id="gateup">Sign up free</button>
       </div>
+      <p class="freeline" id="freehint" style="margin:0 0 16px">5 s at 480p is free —
+        <a href="#" id="freeup">sign up</a> for 10–15 s and 720p.</p>
 
       <div>
         <button type="button" class="adv-toggle" id="advtoggle"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18l6-6-6-6"/></svg>Advanced</button>
@@ -218,12 +223,11 @@ non_diegetic_music: None.</textarea>
           <label>Seed</label>
           <input id="seed" type="number" value="-1" spellcheck="false">
           <p class="hint">-1 picks a random seed. A fixed seed with an identical prompt reproduces the same video.</p>
+          <div style="margin-top:12px">
+            <label>API key</label>
+            <input id="key" type="password" placeholder="sk_live_…" autocomplete="off" spellcheck="false">
+          </div>
         </div>
-      </div>
-
-      <div class="field">
-        <label>API key</label>
-        <input id="key" type="password" placeholder="sk_live_…" autocomplete="off" spellcheck="false">
       </div>
 
       <button type="button" class="create" id="go">
@@ -258,7 +262,7 @@ non_diegetic_music: None.</textarea>
     <p class="belowmsg" id="msg" hidden></p>
 
     <h2>Recent generations</h2>
-    <p class="retention">Generations are only kept for 1 hour — please save any videos you want to keep.</p>
+    <p class="retention">Generations are only kept for 1 hour, then deleted — save anything you want to keep.</p>
     <p class="empty" id="empty">Videos you generate this session appear here.</p>
     <div class="grid" id="grid"></div>
   </div>
@@ -308,6 +312,10 @@ function renderAuth() {
   $("userbtn").hidden = !yes;
   $("key").placeholder = yes ? "optional — you're signed in" : "sk_live_…";
   if (yes) { $("banner").hidden = true; $("gate").hidden = true; }
+  $("freehint").hidden = yes || !$("gate").hidden;
+  for (const b of document.querySelectorAll(
+      '#durs button[data-v="10"], #durs button[data-v="15"], #tiers button[data-v="720p"]'))
+    b.title = yes ? "" : "Requires a free account";
   updateQuotaLine();
   // Mounting last: a throw inside ClerkJS must not leave sign-up prompts
   // showing to a signed-in user.
@@ -330,6 +338,7 @@ $("signin").addEventListener("click", () => {
 $("signup").addEventListener("click", openSignUp);
 $("gateup").addEventListener("click", openSignUp);
 $("bannerup").addEventListener("click", openSignUp);
+$("freeup").addEventListener("click", openSignUp);
 $("bannerx").addEventListener("click", () => {
   $("banner").hidden = true;
   try { sessionStorage.setItem("gw.bannerDismissed", "1"); } catch {}
@@ -354,9 +363,15 @@ function countGen() {
   try { sessionStorage.setItem(gensKey(), String(gensUsed() + 1)); } catch {}
   updateQuotaLine();
 }
+// The gate and the free hint share the slot: whichever applies is visible.
 function showGate(msg) {
   $("gatemsg").textContent = msg;
   $("gate").hidden = false;
+  $("freehint").hidden = true;
+}
+function hideGate() {
+  $("gate").hidden = true;
+  $("freehint").hidden = signedIn();
 }
 function updateQuotaLine() {
   const used = gensUsed();
@@ -373,7 +388,7 @@ function pick(groupId, value, stateKey) {
                 (stateKey === "tier" && value === "720p");
   if (gated && !signedIn() && !$("key").value.trim())
     return showGate("Longer lengths and 720p need a free account.");
-  $("gate").hidden = true;
+  hideGate();
   for (const b of $(groupId).querySelectorAll("button"))
     b.classList.toggle("on", b.dataset.v === value);
   state[stateKey] = value;
@@ -436,12 +451,14 @@ function renderGallery() {
     tile.className = "tile";
     tile.innerHTML =
       '<div class="thumb"><video muted preload="metadata"></video>' +
-      '<span class="play">▶</span><span class="dur"></span></div>' +
+      '<span class="play">▶</span><span class="dur"></span>' +
+      '<span class="extag" hidden>example</span></div>' +
       '<div class="title"></div><div class="sub"></div>' +
       '<div class="acts"><button type="button" class="save"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12"/><path d="M6 11l6 6 6-6"/><path d="M4 21h16"/></svg>Save</button>' +
       '<button type="button" class="ghost reuse"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 4v6h6"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/></svg>Reuse</button>' +
       '<button type="button" class="ghost del"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16"/><path d="M9 7V4h6v3"/><path d="M6 7l1 14h10l1-14"/></svg>Delete</button></div>';
     tile.querySelector(".thumb video").src = g.url;
+    tile.querySelector(".extag").hidden = !g.example;
     tile.querySelector(".dur").textContent = g.dur + " s";
     tile.querySelector(".title").textContent = g.title;
     tile.querySelector(".sub").textContent = g.sub;
@@ -470,6 +487,20 @@ function renderGallery() {
     grid.appendChild(tile);
   });
 }
+
+// ---- example seed ----------------------------------------------------------
+// Real generations served as static assets, so a first-time visitor sees the
+// product before spending a free generation. They behave like any other tile:
+// reuse, save, and delete all work.
+const EXAMPLES = [
+  { title: "A brass desk lamp switching on in a dark study", dur: "5",
+    sub: "21.9 s · seed 164572212", t: "21.9", url: "/examples/desk-lamp.mp4",
+    example: true, meta: "seed 164572212 · 5.17s · 832×480", seed: 164572212,
+    durV: "5", tierV: "480p", aspectV: "horizontal",
+    prompt: "integrated_multimodal_description: [Shot 1] A cinematic close-up of a brass desk lamp switching on in a dark study, dust drifting through the beam. The camera pushes in slowly.\noverall_soundscape: A single click, a low electrical hum, faint room tone.\nnon_diegetic_music: None." },
+];
+state.gallery = EXAMPLES.slice();
+renderGallery();
 
 // ---- generate --------------------------------------------------------------
 // Auth is a pasted sk_ key, a Clerk session, or the visitor device token. A
