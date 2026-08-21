@@ -146,8 +146,10 @@ CLERK_DAILY_LIMIT = int(os.environ.get("GATEWAY_CLERK_DAILY_LIMIT", "20"))
 SYNC_TIMEOUT = float(os.environ.get("GATEWAY_SYNC_TIMEOUT", "90"))
 POLL_INTERVAL = float(os.environ.get("GATEWAY_POLL_INTERVAL", "2"))
 
+# No auto-generated docs pages: the Studio page is the product surface, and
+# API customers get reference material directly.
 app = FastAPI(title="Video Generation API", version="1.0.0",
-              description="10-second 832x480 video with synchronized audio, from a text prompt.")
+              docs_url=None, redoc_url=None, openapi_url=None)
 
 #: The docs page is served from this app deliberately: same origin as the API,
 #: so the live demo needs no CORS grant and no key in a query string.
@@ -161,13 +163,6 @@ def studio_page():
         raise HTTPException(404, "studio page not installed")
     return FileResponse(index, media_type="text/html")
 
-
-@app.get("/legacy", include_in_schema=False)
-def legacy_page():
-    page = STATIC / "legacy.html"
-    if not page.exists():
-        raise HTTPException(404, "legacy page not installed")
-    return FileResponse(page, media_type="text/html")
 
 @app.on_event("startup")
 def _startup() -> None:
