@@ -304,11 +304,18 @@ function renderAuth() {
   $("signin").hidden = yes;
   $("signup").hidden = yes;
   $("userbtn").hidden = !yes;
-  if (yes && !$("userbtn").hasChildNodes()) Clerk.mountUserButton($("userbtn"));
   $("key").placeholder = yes ? "optional — you're signed in" : "sk_live_…";
   if (yes) { $("banner").hidden = true; $("gate").hidden = true; }
   updateQuotaLine();
+  // Mounting last: a throw inside ClerkJS must not leave sign-up prompts
+  // showing to a signed-in user.
+  if (yes && !$("userbtn").hasChildNodes()) {
+    try { Clerk.mountUserButton($("userbtn")); } catch {}
+  }
 }
+// Dev-instance sign-in navigates away and back; a bfcache restore brings the
+// old DOM with it, so re-render auth state whenever the page is shown again.
+window.addEventListener("pageshow", () => { if (clerkReady) renderAuth(); });
 function openSignUp(e) {
   if (e) e.preventDefault();
   if (!clerkReady) return say("Sign-in is still loading — try again in a second.", "err");
@@ -333,11 +340,16 @@ function bannerDismissed() {
 // The display counts are session-local; the server enforces the real per-day
 // quota and answers 429 when it is spent, so this is UX, not security.
 const FREE_CAP = 2, BETA_CAP = 20;
+// Counted per identity: clips burned as an anonymous visitor must not eat
+// into the account allowance shown after signing in.
+function gensKey() {
+  return "gw.gens." + (signedIn() ? Clerk.user.id : "anon");
+}
 function gensUsed() {
-  try { return parseInt(sessionStorage.getItem("gw.gens"), 10) || 0; } catch { return 0; }
+  try { return parseInt(sessionStorage.getItem(gensKey()), 10) || 0; } catch { return 0; }
 }
 function countGen() {
-  try { sessionStorage.setItem("gw.gens", String(gensUsed() + 1)); } catch {}
+  try { sessionStorage.setItem(gensKey(), String(gensUsed() + 1)); } catch {}
   updateQuotaLine();
 }
 function showGate(msg) {
