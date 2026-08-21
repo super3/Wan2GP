@@ -208,20 +208,16 @@ _clerk_jwks: jwt.PyJWKClient | None = None
 
 
 def _jwks_client() -> jwt.PyJWKClient:
-    """Signing keys for Clerk session tokens. With CLERK_SECRET_KEY set they
-    come from Clerk's backend API -- the same source the official SDK's
-    verifyToken uses -- otherwise from the instance's public well-known URL,
-    which needs no credential at all."""
+    """Signing keys for Clerk session tokens, from the instance's public
+    well-known URL. Deliberately NOT api.clerk.com with CLERK_SECRET_KEY:
+    that fetch adds a credential that can be misconfigured (any 4xx from it
+    surfaced to customers as a 503 on every signed-in call), while the
+    public URL serves the same keys for free and pins itself to the same
+    instance the issuer check verifies."""
     global _clerk_jwks
     if _clerk_jwks is None:
-        secret = os.environ.get("CLERK_SECRET_KEY", "").strip()
-        if secret:
-            _clerk_jwks = jwt.PyJWKClient(
-                "https://api.clerk.com/v1/jwks",
-                headers={"Authorization": f"Bearer {secret}"}, lifespan=3600)
-        else:
-            _clerk_jwks = jwt.PyJWKClient(
-                f"https://{_clerk_domain()}/.well-known/jwks.json", lifespan=3600)
+        _clerk_jwks = jwt.PyJWKClient(
+            f"https://{_clerk_domain()}/.well-known/jwks.json", lifespan=3600)
     return _clerk_jwks
 
 
