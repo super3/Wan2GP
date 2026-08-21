@@ -91,7 +91,7 @@
 <body>
 <header><div class="hdr">
   <h1>Video Generation API</h1>
-  <p class="tag">Five or ten seconds of 480p or 720p video with synchronized audio, from a text prompt. One HTTP call.</p>
+  <p class="tag">Five or ten seconds of 480p, 720p or square video with synchronized audio, from a text prompt. One HTTP call.</p>
 </div></header>
 
 <main>
@@ -124,8 +124,15 @@ non_diegetic_music: None.</textarea>
       <label for="res">Resolution</label>
       <select id="res">
         <option value="480p" selected>480p &middot; 832&times;480</option>
-        <option value="720p">720p &middot; 1280&times;704, several minutes</option>
+        <option value="720p">720p &middot; 1280&times;704</option>
+        <option value="square">Square &middot; 960&times;960</option>
       </select>
+    </div>
+    <div class="field">
+      <label for="img">Start frame (optional)</label>
+      <input id="img" type="file" accept="image/*">
+      <p class="note">The video opens on this frame and the motion follows from it.
+      Match its aspect to the resolution above, or the model letterboxes it.</p>
     </div>
     <p class="note" id="esti"></p>
     <button type="button" id="go">Generate</button>
@@ -159,7 +166,8 @@ non_diegetic_music: None.</textarea>
     <tr><th>Field</th><th></th></tr>
     <tr><td><code>prompt</code></td><td>Required. The three-block format below.</td></tr>
     <tr><td><code>duration_s</code></td><td>Optional. <code>5</code> (default) or <code>10</code>. Anything else is a 422 — the model's frame lattice only admits certain lengths.</td></tr>
-    <tr><td><code>resolution</code></td><td>Optional. <code>480p</code> (default, 832&times;480) or <code>720p</code> (1280&times;704). 720p is always returned as a job id to poll — it cannot finish inside a synchronous request.</td></tr>
+    <tr><td><code>resolution</code></td><td>Optional. <code>480p</code> (default, 832&times;480), <code>720p</code> (1280&times;704) or <code>square</code> (960&times;960). Anything above 480p is returned as a job id to poll — it cannot finish inside a synchronous request. Square costs the same as 720p: 1.02&times; the pixels.</td></tr>
+    <tr><td><code>image</code></td><td>Optional base64 start frame (raw or a <code>data:</code> URI). The video opens on it and the motion follows from it.</td></tr>
     <tr><td><code>seed</code></td><td>Optional integer. Omit or <code>-1</code> for random.</td></tr>
     <tr><td><code>background</code></td><td>Optional. <code>true</code> returns a job id immediately instead of the file. Use it from a browser — a held connection dies when a phone locks its screen.</td></tr>
   </table>
@@ -265,10 +273,9 @@ setInterval(() => {
 function estimate() {
   const d = $("dur").value, r = $("res").value;
   const t = r === "480p" ? (d === "5" ? "about 25 seconds" : "about a minute")
-                         : (d === "5" ? "a couple of minutes" : "several minutes");
+                         : (d === "5" ? "about 50 seconds" : "about 1 min 45");
   $("esti").textContent = `Warm, this takes ${t}.`
-    + (r === "720p" ? " 720p is 2.3x the pixels of 480p and is always queued in the background."
-                    : "");
+    + (r === "480p" ? "" : " Returned as a job to poll — it cannot finish inside one HTTP request.");
 }
 $("dur").addEventListener("change", estimate);
 $("res").addEventListener("change", estimate);
@@ -281,6 +288,21 @@ $("go").addEventListener("click", async () => {
   const key = $("key").value.trim(), prompt = $("prompt").value.trim();
   if (!key)    return say("Enter your API key.", "err");
   if (!prompt) return say("Enter a prompt.", "err");
+
+  // Read the file before anything else: a failure here should stop the run
+  // rather than silently generate without the frame the user chose.
+  let startFrame = null;
+  const file = $("img").files && $("img").files[0];
+  if (file) {
+    try {
+      startFrame = await new Promise((res, rej) => {
+        const r = new FileReader();
+        r.onload = () => res(String(r.result).split(",", 2)[1]);
+        r.onerror = () => rej(new Error("could not read that image"));
+        r.readAsDataURL(file);
+      });
+    } catch (e) { return say(String(e), "err"); }
+  }
 
   $("go").disabled = true;
   $("vid").style.display = "none";
@@ -297,7 +319,8 @@ $("go").addEventListener("click", async () => {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: "Bearer " + key },
       body: JSON.stringify({ prompt, duration_s: Number($("dur").value),
-                             resolution: $("res").value, background: true }),
+                             resolution: $("res").value, background: true,
+                             ...(startFrame ? { image: startFrame } : {}) }),
     });
     if (!res.ok) {
       let detail = res.statusText;
