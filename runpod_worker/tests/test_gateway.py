@@ -305,8 +305,8 @@ def test_every_file_the_app_serves_is_tracked_by_git():
 
 
 def test_health_needs_no_key_so_the_page_can_poll_it(client):
-    """/v1/health is keyless: the legacy page polls it from page load, and
-    API callers use it to see whether the next request hits a warm worker."""
+    """/v1/health is keyless: API callers use it to see whether the next
+    request hits a warm worker or starts a cold one."""
     c, m = client
     with mock.patch.object(m, "_rp", return_value={"jobs": {}, "workers": {"ready": 1}}):
         r = c.get("/v1/health")          # no Authorization header
@@ -693,8 +693,10 @@ def test_studio_page_is_the_landing_page(client):
     assert "Minimax H3 Studio" in body
     assert "aspect_ratio: state.aspect" in body       # the page sends the new field
     assert "kept for 1 hour" in body
-    legacy = c.get("/legacy")
-    assert legacy.status_code == 200 and "Video Generation API" in legacy.text
+    # The Studio page is the only page: no legacy demo, no auto-generated docs.
+    assert c.get("/legacy").status_code == 404
+    assert c.get("/docs").status_code == 404
+    assert c.get("/openapi.json").status_code == 404
 
 # --- Clerk sign-in -----------------------------------------------------------
 # The Studio page authenticates humans with a Clerk session JWT; the gateway
