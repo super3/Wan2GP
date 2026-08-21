@@ -337,9 +337,15 @@ $("maptoggle").addEventListener("click", () => {
   $("mapwrap").hidden = !state.mapOpen;
   $("maptoggle").classList.toggle("open", state.mapOpen);
 });
-function badgeOf(id) {
-  if (id === state.nodeId && state.phase !== "begin")
-    return ["now playing", "#e8874a"];
+// A shared scene (end_roll has two parents) appears in the map once per
+// path; only the row matching the path the player actually took counts as
+// current, or both rows would light up at once.
+function isCurrentRow(id, path) {
+  return id === state.nodeId && state.phase !== "begin" &&
+         JSON.stringify(path) === JSON.stringify(state.path);
+}
+function badgeOf(id, path) {
+  if (isCurrentRow(id, path)) return ["now playing", "#e8874a"];
   const s = NODES[id].status;
   if (s === "rendering") return ["rendering…", "#d6a648"];
   if (s === "ready")     return ["saved", "#5fb884"];
@@ -352,7 +358,7 @@ function renderMap() {
   map.textContent = "";
   const walk = (id, prefix, isLast, pick, path) => {
     const n = NODES[id];
-    const [badge, color] = badgeOf(id);
+    const [badge, color] = badgeOf(id, path);
     const row = document.createElement("div");
     row.className = "maprow";
     row.innerHTML = '<span class="pre"></span><span class="pick"></span>' +
@@ -361,7 +367,7 @@ function renderMap() {
     row.querySelector(".pick").textContent = pick === null ? "◉ start" : pick;
     row.querySelector(".ttl").textContent = n.title + (n.choices.length ? "" : " ∎");
     row.querySelector(".ttl").style.color =
-      id === state.nodeId && state.phase !== "begin" ? "#e8874a"
+      isCurrentRow(id, path) ? "#e8874a"
       : n.status === "ready" ? "#f5f3f0" : "#6b665e";
     const b = row.querySelector(".badge");
     b.textContent = badge; b.style.color = color; b.style.borderColor = color;
