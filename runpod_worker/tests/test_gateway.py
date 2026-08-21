@@ -150,3 +150,21 @@ def test_backend_errors_are_not_leaked(client):
         r = c.get("/v1/health")
     assert r.status_code == 503
     assert "rpa_" not in r.text and "secretkey" not in r.text
+
+
+def test_docs_page_is_served_same_origin(client):
+    """Serving the demo from the API itself is what removes the CORS problem:
+    the page and the endpoints share an origin, so no grant is needed."""
+    c, _ = client
+    r = c.get("/")
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("text/html")
+    body = r.text
+    assert "/v1/videos" in body                 # documents the real route
+    assert 'fetch("/v1/videos"' in body         # and calls it relatively
+    assert "http://" not in body.replace("http://www.w3.org", "")   # no hardcoded host
+
+
+def test_docs_page_needs_no_key(client):
+    c, _ = client
+    assert c.get("/").status_code == 200        # the page loads; the calls need a key

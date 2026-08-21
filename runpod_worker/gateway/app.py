@@ -90,6 +90,18 @@ POLL_INTERVAL = float(os.environ.get("GATEWAY_POLL_INTERVAL", "2"))
 app = FastAPI(title="Video Generation API", version="1.0.0",
               description="10-second 832x480 video with synchronized audio, from a text prompt.")
 
+#: The docs page is served from this app deliberately: same origin as the API,
+#: so the live demo needs no CORS grant and no key in a query string.
+STATIC = Path(__file__).parent / "static"
+
+
+@app.get("/", include_in_schema=False)
+def docs_page():
+    index = STATIC / "index.html"
+    if not index.exists():
+        raise HTTPException(404, "docs page not installed")
+    return FileResponse(index, media_type="text/html")
+
 _lock = threading.Lock()
 _jobs: dict[str, dict[str, Any]] = {}          # our id -> {runpod_id, owner, ...}
 _usage: dict[tuple[str, str], int] = defaultdict(int)   # (key, YYYY-MM-DD) -> count
