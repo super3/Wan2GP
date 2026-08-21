@@ -705,6 +705,16 @@ def adventure_page():
     return FileResponse(page, media_type="text/html")
 
 
+@app.get("/adventure/poster.jpg", include_in_schema=False)
+def adventure_poster():
+    """The link-preview image (og:image) social scrapers fetch."""
+    poster = STATIC / "adventure-poster.jpg"
+    if not poster.exists():
+        raise HTTPException(404, "poster not installed")
+    return FileResponse(poster, media_type="image/jpeg",
+                        headers={"Cache-Control": "public, max-age=86400"})
+
+
 @app.get("/adventure/state")
 def adventure_state() -> dict:
     """The story tree (no prompts) with each scene's live render status --
