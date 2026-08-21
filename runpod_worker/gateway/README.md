@@ -63,10 +63,19 @@ with `Location` and `Retry-After: 30`. Poll `GET /v1/videos/{id}` until
 `completed`, then `GET /v1/videos/{id}/content`. Clients should handle 202;
 in steady use they will rarely see it.
 
-Set `GATEWAY_SYNC_TIMEOUT` (default 240 s) to how long you want the connection
-held. Note what sits in front of you: **Cloudflare cuts at 100 s**, AWS ALB and
-nginx default to 60 s. Raise those, or lower the gateway's timeout to match, or
-callers will see a proxy error instead of the clean 202.
+`GATEWAY_SYNC_TIMEOUT` (default **90 s**) is how long the connection is held.
+**It must sit below whatever proxy fronts the service**, or the proxy cuts first
+and the caller gets an opaque gateway error instead of the clean 202 — the 202
+never gets sent at all.
+
+Common ceilings are low: **Cloudflare cuts at 100 s**, AWS ALB and nginx default
+to 60 s. RunPod's own `*.proxy.runpod.net` is Cloudflare-fronted, so a gateway
+deployed on a RunPod pod is already behind that limit — measured with a 240 s
+value there, a slow generation returned **HTTP 524 at 125 s**. Behind nginx or
+an ALB at their defaults, drop this to ~50 s.
+
+The GPU job keeps running when the connection is cut, so nothing is lost — but
+the caller has no id to poll, which is precisely what the 202 exists to prevent.
 
 ## What a customer should expect
 
