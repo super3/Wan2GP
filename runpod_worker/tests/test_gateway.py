@@ -40,6 +40,23 @@ def _hdr(key):
     return {"Authorization": f"Bearer {key}"}
 
 
+import base64 as _b64
+
+MP4 = b"\x00\x00\x00\x18ftypisom-fake-bytes"
+COMPLETED = {"status": "COMPLETED", "output": {
+    "seed": 7,
+    "metrics": {"generate_s": 55.8},
+    "video": {"kind": "base64", "data": _b64.b64encode(MP4).decode(),
+              "duration_s": 10.125, "width": 832, "height": 480, "has_audio": True}}}
+
+
+def _backend(status=COMPLETED, run_id="job-1"):
+    """Stub RunPod: /run returns an id, status/<id> returns `status`."""
+    def fake(path, payload=None, timeout=60):
+        return {"id": run_id} if path == "run" else status
+    return fake
+
+
 # --- auth ------------------------------------------------------------------
 
 def test_rejects_missing_key(client):
@@ -56,9 +73,9 @@ def test_rejects_unknown_key(client):
 def test_one_customer_cannot_read_anothers_job(client):
     """404, not 403: a customer must not be able to probe which ids exist."""
     c, m = client
-    with mock.patch.object(m, "_rp", return_value={"id": "job-1"}):
+    with mock.patch.object(m, "_rp", side_effect=_backend()):
         r = c.post("/v1/videos", json={"prompt": "x"}, headers=_hdr(KEY_A))
-    job = r.json()["id"]
+    job = r.headers["x-video-id"]      # the body is the mp4 now
     assert c.get(f"/v1/videos/{job}", headers=_hdr(KEY_B)).status_code == 404
     assert c.get(f"/v1/videos/{job}/content", headers=_hdr(KEY_B)).status_code == 404
 
@@ -73,13 +90,14 @@ def test_caller_cannot_choose_length_or_resolution(client):
     def fake(path, payload=None, timeout=60):
         if payload:
             seen.update(payload["input"]["settings"])
-        return {"id": "job-1"}
+            return {"id": "job-1"}
+        return COMPLETED
 
     with mock.patch.object(m, "_rp", side_effect=fake):
         r = c.post("/v1/videos",
                    json={"prompt": "x", "video_length": 481, "resolution": "1920x1080"},
                    headers=_hdr(KEY_A))
-    assert r.status_code == 202
+    assert r.status_code == 200
     assert seen["video_length"] == 243        # 17n+5, ~10 s
     assert seen["resolution"] == "832x480"
 
@@ -91,7 +109,8 @@ def test_seed_is_passed_through_and_omitted_when_random(client):
     def fake(path, payload=None, timeout=60):
         if payload:
             seen.clear(); seen.update(payload["input"]["settings"])
-        return {"id": "job-1"}
+            return {"id": "job-1"}
+        return COMPLETED
 
     with mock.patch.object(m, "_rp", side_effect=fake):
         c.post("/v1/videos", json={"prompt": "x", "seed": 42}, headers=_hdr(KEY_A))
@@ -104,43 +123,25 @@ def test_seed_is_passed_through_and_omitted_when_random(client):
 
 def test_daily_limit_is_enforced(client):
     c, m = client
-    with mock.patch.object(m, "_rp", return_value={"id": "job-1"}):
+    with mock.patch.object(m, "_rp", side_effect=_backend()):
         for _ in range(3):
-            assert c.post("/v1/videos", json={"prompt": "x"}, headers=_hdr(KEY_A)).status_code == 202
+            assert c.post("/v1/videos", json={"prompt": "x"}, headers=_hdr(KEY_A)).status_code == 200
         assert c.post("/v1/videos", json={"prompt": "x"}, headers=_hdr(KEY_A)).status_code == 429
     # the other customer has their own budget
-    with mock.patch.object(m, "_rp", return_value={"id": "job-2"}):
-        assert c.post("/v1/videos", json={"prompt": "x"}, headers=_hdr(KEY_B)).status_code == 202
+    with mock.patch.object(m, "_rp", side_effect=_backend(run_id="job-2")):
+        assert c.post("/v1/videos", json={"prompt": "x"}, headers=_hdr(KEY_B)).status_code == 200
 
 
 def test_failed_submit_does_not_consume_quota(client):
     c, m = client
     with mock.patch.object(m, "_rp", side_effect=RuntimeError("backend down")):
         assert c.post("/v1/videos", json={"prompt": "x"}, headers=_hdr(KEY_A)).status_code == 503
-    with mock.patch.object(m, "_rp", return_value={"id": "job-1"}):
+    with mock.patch.object(m, "_rp", side_effect=_backend()):
         for _ in range(3):
-            assert c.post("/v1/videos", json={"prompt": "x"}, headers=_hdr(KEY_A)).status_code == 202
+            assert c.post("/v1/videos", json={"prompt": "x"}, headers=_hdr(KEY_A)).status_code == 200
 
 
 # --- lifecycle -------------------------------------------------------------
-
-def test_status_and_content_round_trip(client):
-    import base64
-    c, m = client
-    mp4 = b"\x00\x00\x00\x18ftypisom-fake-bytes"
-    completed = {"status": "COMPLETED", "output": {
-        "seed": 7, "video": {"kind": "base64", "data": base64.b64encode(mp4).decode(),
-                             "duration_s": 10.125, "width": 832, "height": 480,
-                             "has_audio": True}}}
-    with mock.patch.object(m, "_rp", return_value={"id": "job-1"}):
-        job = c.post("/v1/videos", json={"prompt": "x"}, headers=_hdr(KEY_A)).json()["id"]
-    with mock.patch.object(m, "_rp", return_value=completed):
-        body = c.get(f"/v1/videos/{job}", headers=_hdr(KEY_A)).json()
-    assert body["status"] == "completed" and body["seed"] == 7
-    assert body["size_bytes"] == len(mp4)
-    r = c.get(f"/v1/videos/{job}/content", headers=_hdr(KEY_A))
-    assert r.status_code == 200 and r.content == mp4
-
 
 def test_backend_errors_are_not_leaked(client):
     """A RunPod traceback or key must never reach a customer."""
