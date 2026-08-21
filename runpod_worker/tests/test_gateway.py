@@ -248,3 +248,22 @@ def test_every_file_the_app_serves_is_tracked_by_git():
             f"{rel} is served by the app but is NOT tracked by git -- it will be "
             f"missing in CI and in any fresh clone. Check .gitignore."
         )
+
+
+def test_health_needs_no_key_so_the_page_can_poll_it(client):
+    """The capacity strip polls from page load, before a key is entered."""
+    c, m = client
+    with mock.patch.object(m, "_rp", return_value={"jobs": {}, "workers": {"ready": 1}}):
+        r = c.get("/v1/health")          # no Authorization header
+    assert r.status_code == 200
+    assert r.json()["capacity"]["ready"] == 1
+
+
+def test_docs_page_polls_capacity(client):
+    c, _ = client
+    body = c.get("/").text
+    assert 'fetch("/v1/health")' in body
+    assert "setInterval(poll" in body
+    # the strip must not hijack the message box the generate flow writes to
+    strip = body[body.index("function renderStatus"):body.index("async function poll")]
+    assert "say(" not in strip
