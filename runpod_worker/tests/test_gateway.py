@@ -70,9 +70,49 @@ def _backend(status=COMPLETED, run_id="job-1"):
 
 # --- auth ------------------------------------------------------------------
 
-def test_rejects_missing_key(client):
-    c, _ = client
-    assert c.post("/v1/videos", json={"prompt": "x"}).status_code == 401
+def test_missing_key_is_the_visitor_tier_not_an_error(client):
+    """No credential at all is the Studio page's free taste: 5 s at 480p
+    works, anything past that is refused with a sign-in nudge."""
+    c, m = client
+    with mock.patch.object(m, "_rp", side_effect=_backend()):
+        ok = c.post("/v1/videos", json={"prompt": "x", "background": True})
+        gated_dur = c.post("/v1/videos", json={"prompt": "x", "duration_s": 10})
+        gated_res = c.post("/v1/videos", json={"prompt": "x", "resolution": "720p"})
+    assert ok.status_code == 202
+    assert gated_dur.status_code == 401 and gated_res.status_code == 401
+    assert "account" in gated_dur.json()["detail"]
+
+
+def test_visitor_quota_is_two_per_day(client):
+    c, m = client
+    with mock.patch.object(m, "_rp", side_effect=_backend()):
+        codes = [c.post("/v1/videos", json={"prompt": "x", "background": True}).status_code
+                 for _ in range(3)]
+    assert codes == [202, 202, 429]
+
+
+def test_visitor_can_poll_their_own_job_but_not_anothers(client):
+    """The Studio page polls without a credential; ownership rides on the
+    client address, and a key holder's job stays invisible to a visitor."""
+    c, m = client
+    with mock.patch.object(m, "_rp", side_effect=_backend(run_id="vis-1")):
+        r = c.post("/v1/videos", json={"prompt": "x", "background": True})
+        assert r.status_code == 202
+        assert c.get("/v1/videos/vis-1").status_code == 200
+    with mock.patch.object(m, "_rp", side_effect=_backend(run_id="key-1")):
+        c.post("/v1/videos", json={"prompt": "x", "background": True}, headers=_hdr(KEY_A))
+        assert c.get("/v1/videos/key-1").status_code == 404
+
+
+def test_forged_visitor_addresses_do_not_mint_quota(client):
+    """Only the LAST X-Forwarded-For entry (the one the platform edge
+    appended) identifies a visitor; a client-written first entry must not."""
+    c, m = client
+    with mock.patch.object(m, "_rp", side_effect=_backend()):
+        codes = [c.post("/v1/videos", json={"prompt": "x", "background": True},
+                        headers={"X-Forwarded-For": f"10.0.0.{i}, 203.0.113.7"}).status_code
+                 for i in range(3)]
+    assert codes == [202, 202, 429]
 
 
 def test_rejects_unknown_key(client):
@@ -274,15 +314,18 @@ def test_health_needs_no_key_so_the_page_can_poll_it(client):
     assert r.json()["capacity"]["ready"] == 1
 
 
-def test_studio_v2_signup_markers(client):
-    """Studio v2 swaps the header status strip for account buttons and adds
-    the preview/Pro messaging. The page must no longer poll /v1/health."""
+def test_studio_signup_and_gating_markers(client):
+    """The Studio page carries the freemium gate: Clerk sign-in, lock icons
+    behind a signed-in body class, the gate callout, and the quota line. The
+    page must no longer poll /v1/health."""
     c, _ = client
     body = c.get("/").text
     assert "Sign up free" in body
-    assert "Pro feature — free during the preview" in body
-    assert "no account needed for 5 s at 480p" in body
-    assert "keeps your clips past the 1-hour limit" in body
+    assert "data-clerk-publishable-key" in body
+    assert "clerk.browser.js" in body
+    assert "Longer lengths and 720p need a free account" in body
+    assert "free generations left" in body
+    assert "body.signedin .lock" in body
     assert 'fetch("/v1/health")' not in body
     assert "setInterval(poll" not in body
 
@@ -464,10 +507,13 @@ def test_page_accepts_a_key_in_the_url_but_does_not_keep_it_there(client):
 
 def test_api_never_accepts_a_key_as_a_query_parameter(client):
     """Convenience on the docs page is one thing; query-string auth on the API
-    would write the key into a server log line on every request."""
+    would write the key into a server log line on every request. A ?key= call
+    is treated as an anonymous visitor -- so a gated combination stays gated,
+    proving the query string never authenticated anyone."""
     c, m = client
     with mock.patch.object(m, "_rp", side_effect=_backend()):
-        r = c.post("/v1/videos?key=" + KEY_A, json={"prompt": "x"})
+        r = c.post("/v1/videos?key=" + KEY_A,
+                   json={"prompt": "x", "duration_s": 10})
     assert r.status_code == 401
 
 
@@ -649,3 +695,126 @@ def test_studio_page_is_the_landing_page(client):
     assert "kept for 1 hour" in body
     legacy = c.get("/legacy")
     assert legacy.status_code == 200 and "Video Generation API" in legacy.text
+
+# --- Clerk sign-in -----------------------------------------------------------
+# The Studio page authenticates humans with a Clerk session JWT; the gateway
+# verifies the signature against Clerk's JWKS before trusting any claim. These
+# tests sign tokens with a local RSA key and stub the JWKS client to hand that
+# key back, so the verification path runs for real with no network.
+
+jwt_lib = pytest.importorskip("jwt")
+cryptography = pytest.importorskip("cryptography")
+import time as _time  # noqa: E402
+from types import SimpleNamespace  # noqa: E402
+from cryptography.hazmat.primitives import serialization  # noqa: E402
+from cryptography.hazmat.primitives.asymmetric import rsa  # noqa: E402
+
+_RSA = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+_PUB_PEM = _RSA.public_key().public_bytes(
+    serialization.Encoding.PEM,
+    serialization.PublicFormat.SubjectPublicKeyInfo).decode()
+_ISS = "https://improved-buck-4897.clerk.accounts.dev"
+
+
+def _clerk_token(sub="user_123", iss=_ISS, expires_in=3600, key=None, **extra):
+    now = int(_time.time())
+    claims = {"sub": sub, "iss": iss, "iat": now, "exp": now + expires_in, **extra}
+    return jwt_lib.encode(claims, key or _RSA, algorithm="RS256")
+
+
+class _StubJWKS:
+    def get_signing_key_from_jwt(self, token):
+        return SimpleNamespace(key=_PUB_PEM)
+
+
+@pytest.fixture()
+def clerk(client):
+    c, m = client
+    with mock.patch.object(m, "_jwks_client", return_value=_StubJWKS()):
+        yield c, m
+
+
+def test_clerk_session_authenticates_and_provisions(clerk):
+    """First sight of a verified sub auto-creates its api_keys row, so quota
+    and job ownership work identically to sk_ keys."""
+    c, m = clerk
+    tok = _clerk_token(email="shawn@example.org")
+    with mock.patch.object(m, "_rp", side_effect=_backend(run_id="clerk-1")):
+        r = c.post("/v1/videos", json={"prompt": "x", "background": True}, headers=_hdr(tok))
+    assert r.status_code == 202
+    from runpod_worker.gateway import db as dbmod
+    import sqlalchemy as sa
+    with dbmod.engine().connect() as cx:
+        row = cx.execute(sa.select(dbmod.api_keys).where(
+            dbmod.api_keys.c.key_hash == dbmod.hash_key("clerk:user_123"))
+        ).mappings().first()
+    assert row is not None and row["label"] == "shawn@example.org"
+
+
+def test_clerk_session_unlocks_gated_options(clerk):
+    c, m = clerk
+    with mock.patch.object(m, "_rp", side_effect=_backend()):
+        r = c.post("/v1/videos",
+                   json={"prompt": "x", "duration_s": 10, "resolution": "720p",
+                         "background": True},
+                   headers=_hdr(_clerk_token()))
+    assert r.status_code == 202
+
+
+def test_clerk_expired_session_is_refused(clerk):
+    c, _ = clerk
+    r = c.post("/v1/videos", json={"prompt": "x"},
+               headers=_hdr(_clerk_token(expires_in=-120)))
+    assert r.status_code == 401
+
+
+def test_clerk_forged_signature_is_refused(clerk):
+    """A token signed by anyone but Clerk must not impersonate a user."""
+    c, _ = clerk
+    other = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    r = c.post("/v1/videos", json={"prompt": "x"},
+               headers=_hdr(_clerk_token(key=other)))
+    assert r.status_code == 401
+
+
+def test_clerk_wrong_issuer_is_refused(clerk):
+    c, _ = clerk
+    r = c.post("/v1/videos", json={"prompt": "x"},
+               headers=_hdr(_clerk_token(iss="https://evil.example.com")))
+    assert r.status_code == 401
+
+
+def test_garbage_jwt_is_refused(clerk):
+    c, _ = clerk
+    assert c.post("/v1/videos", json={"prompt": "x"},
+                  headers=_hdr("a.b.c")).status_code == 401
+
+
+def test_clerk_quota_is_per_account(clerk):
+    """The stored per-row limit set at first sight is what gets enforced."""
+    c, m = clerk
+    with mock.patch.object(m, "CLERK_DAILY_LIMIT", 1), \
+         mock.patch.object(m, "_rp", side_effect=_backend()):
+        first = c.post("/v1/videos", json={"prompt": "x", "background": True},
+                       headers=_hdr(_clerk_token(sub="user_q")))
+        second = c.post("/v1/videos", json={"prompt": "x", "background": True},
+                        headers=_hdr(_clerk_token(sub="user_q")))
+    assert first.status_code == 202 and second.status_code == 429
+
+
+def test_revoked_clerk_account_is_banned(clerk):
+    """Revoking the provisioned row is how an account gets banned."""
+    c, m = clerk
+    tok = _clerk_token(sub="user_bad")
+    with mock.patch.object(m, "_rp", side_effect=_backend()):
+        assert c.post("/v1/videos", json={"prompt": "x", "background": True},
+                      headers=_hdr(tok)).status_code == 202
+    from runpod_worker.gateway import db as dbmod
+    import datetime
+    with dbmod.engine().begin() as cx:
+        cx.execute(dbmod.api_keys.update()
+                   .where(dbmod.api_keys.c.key_hash == dbmod.hash_key("clerk:user_bad"))
+                   .values(revoked_at=datetime.datetime.utcnow()))
+    with mock.patch.object(m, "_rp", side_effect=_backend()):
+        assert c.post("/v1/videos", json={"prompt": "x", "background": True},
+                      headers=_hdr(tok)).status_code == 401

@@ -112,6 +112,32 @@ def seed_keys(mapping: dict[str, str]) -> None:
                     key_hash=kh, label=label, created_at=_now()))
 
 
+def ensure_key(identity: str, label: str,
+               daily_limit: int | None = None) -> dict[str, Any] | None:
+    """Auto-provision a non-secret identity ("clerk:user_abc", "ip:1.2.3.4")
+    as a key row on first sight, so quota and job ownership work identically
+    for session users, visitors, and sk_ API keys. Returns {key_hash,
+    daily_limit}, or None when the row is revoked -- revoking the row is how
+    an account (or address) gets banned. An existing row's daily_limit wins
+    over the argument, so a hand-edited override in the DB sticks."""
+    kh = hash_key(identity)
+    with engine().connect() as cx:
+        row = cx.execute(sa.select(api_keys.c.revoked_at, api_keys.c.daily_limit)
+                         .where(api_keys.c.key_hash == kh)).first()
+    if row is not None:
+        if row[0] is not None:
+            return None
+        return {"key_hash": kh, "daily_limit": row[1]}
+    try:
+        with engine().begin() as cx:
+            cx.execute(api_keys.insert().values(
+                key_hash=kh, label=label, daily_limit=daily_limit,
+                created_at=_now()))
+    except sa.exc.IntegrityError:
+        pass                    # two first requests raced; the row exists now
+    return {"key_hash": kh, "daily_limit": daily_limit}
+
+
 def lookup_key(token: str) -> dict[str, Any] | None:
     """The key's row, or None when unknown or revoked."""
     kh = hash_key(token)
