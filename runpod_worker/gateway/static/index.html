@@ -294,7 +294,7 @@ $("key").addEventListener("change", () => {
 // yet when this runs -- wait for it rather than racing it. If it never shows
 // up (ad blocker, offline), the page still works as a signed-out visitor.
 let clerkReady = false;
-(async function initClerk() {
+const clerkInit = (async function initClerk() {
   for (let i = 0; i < 100 && typeof window.Clerk === "undefined"; i++)
     await new Promise(r => setTimeout(r, 100));
   if (typeof window.Clerk === "undefined") return;
@@ -303,6 +303,41 @@ let clerkReady = false;
   renderAuth();
   Clerk.addListener(renderAuth);
 })();
+
+// ---- gallery persistence ---------------------------------------------------
+// Generated clips live on the server for an hour; the tab keeps only blob
+// URLs, which die on refresh. Persist the metadata and re-download whatever
+// is still within retention on load, with the credential that owns it.
+function readStore() {
+  try { return JSON.parse(localStorage.getItem("gw.gallery")) || []; } catch { return []; }
+}
+function writeStore(list) {
+  try { localStorage.setItem("gw.gallery", JSON.stringify(list.slice(0, 12))); } catch {}
+}
+function storeAdd(entry) { writeStore([entry, ...readStore().filter(e => e.id !== entry.id)]); }
+function storeDrop(id) { writeStore(readStore().filter(e => e.id !== id)); }
+async function restoreGallery() {
+  // A signed-in user's jobs need their Clerk token, so wait briefly for the
+  // Clerk script rather than restoring with the wrong credential.
+  await Promise.race([clerkInit, new Promise(r => setTimeout(r, 4000))]);
+  const fresh = readStore().filter(e => Date.now() - e.at < 55 * 60 * 1000);
+  writeStore(fresh);
+  const restored = [];
+  for (const e of fresh) {
+    try {
+      const r = await fetch("/v1/videos/" + e.id + "/content", { headers: await authHeaders() });
+      if (r.status === 404) { storeDrop(e.id); continue; }   // expired or not ours
+      if (!r.ok) continue;
+      restored.push({ ...e, url: URL.createObjectURL(await r.blob()) });
+    } catch {}
+  }
+  if (restored.length) {
+    const ex = state.gallery.filter(g => g.example);
+    const mine = state.gallery.filter(g => !g.example);
+    state.gallery = [...mine, ...restored, ...ex];
+    renderGallery();
+  }
+}
 function signedIn() { return clerkReady && !!Clerk.user; }
 function renderAuth() {
   const yes = signedIn();
@@ -402,8 +437,8 @@ $("aspects").addEventListener("click", e => { const b = e.target.closest("button
 // the cold-start penalty when no worker is ready. The static numbers below
 // only paint the first frame and cover a failed fetch. This is one cached
 // fetch on demand, not the old 10-second heartbeat.
-const FALLBACK = { "480p": { "5": 24, "10": 56, "15": 100 },
-                   "720p": { "5": 48, "10": 103, "15": 185 } };
+const FALLBACK = { "480p": { "5": 30, "10": 65, "15": 110 },
+                   "720p": { "5": 55, "10": 115, "15": 200 } };
 let healthCache = null, healthAt = 0;
 async function healthInfo() {
   if (healthCache && Date.now() - healthAt < 30000) return healthCache;
@@ -413,25 +448,31 @@ async function healthInfo() {
   } catch {}
   return healthCache;
 }
+// Rounds UP: a clip landing early reads as fast, one landing late reads as
+// broken, so the display never promises less than the computed number.
 function fmtDur(s) {
-  if (s < 60) return "~" + Math.max(5, Math.round(s / 5) * 5) + " s";
+  if (s < 60) return "~" + Math.max(5, Math.ceil(s / 5) * 5) + " s";
   const m = s / 60;
-  return "~" + (m < 3 ? (Math.round(m * 2) / 2).toString().replace(".5", "½") : Math.round(m)) + " min";
+  return "~" + (m < 3 ? (Math.ceil(m * 2) / 2).toString().replace(".5", "½") : Math.ceil(m)) + " min";
 }
 function computeEstimate(h) {
   const times = h && h.estimate && h.estimate.times[state.tier];
   let s = (times && times[state.dur]) || FALLBACK[state.tier][state.dur];
-  if (!h) return { s, cold: false };
-  const q = h.queue || {}, c = h.capacity || {};
-  const inflight = (q.waiting || 0) + (q.running || 0);
-  s += inflight * ((h.estimate && h.estimate.avg_job_s) || 45);
   let cold = false;
-  if (!(c.ready > 0)) {
-    // A starting worker is partway through the cold start already.
-    s += (h.estimate ? h.estimate.cold_start_s : 150) / (c.starting > 0 ? 2 : 1);
-    cold = true;
+  if (h) {
+    const q = h.queue || {}, c = h.capacity || {};
+    const inflight = (q.waiting || 0) + (q.running || 0);
+    s += inflight * ((h.estimate && h.estimate.avg_job_s) || 60);
+    if (!(c.ready > 0)) {
+      // A starting worker is partway through the cold start already.
+      s += (h.estimate ? h.estimate.cold_start_s : 150) / (c.starting > 0 ? 2 : 1);
+      cold = true;
+    }
+    cold = cold || inflight > 0;
   }
-  return { s, cold: cold || inflight > 0 };
+  // Safety margin: a "ready" worker that just booted still reloads the model
+  // on its first job, which the ready count cannot see.
+  return { s: Math.round(s * 1.2), cold };
 }
 let estSeq = 0;
 async function updateEstimate() {
@@ -468,10 +509,19 @@ function showStage(which) {   // "idle" | "busy" | "video"
   $("busybox").hidden = which !== "busy";
   $("vid").hidden = which !== "video";
 }
-let clockTimer = null;
+let clockTimer = null, busyEstS = 0, overrunNoted = false;
 function startClock(started) {
   clearInterval(clockTimer);
-  clockTimer = setInterval(() => { $("clock").textContent = ((Date.now() - started) / 1000).toFixed(1); }, 100);
+  overrunNoted = false;
+  clockTimer = setInterval(() => {
+    const elapsed = (Date.now() - started) / 1000;
+    $("clock").textContent = elapsed.toFixed(1);
+    // Own the miss instead of counting silently past the promise.
+    if (busyEstS && !overrunNoted && elapsed > busyEstS * 1.5) {
+      overrunNoted = true;
+      $("busymsg").textContent += " Taking longer than usual — still running.";
+    }
+  }, 100);
 }
 
 // ---- gallery ---------------------------------------------------------------
@@ -519,6 +569,7 @@ function renderGallery() {
     tile.querySelector(".del").addEventListener("click", e => {
       e.stopPropagation();
       URL.revokeObjectURL(g.url);
+      if (g.id) storeDrop(g.id);
       state.gallery.splice(i, 1); renderGallery();
     });
     grid.appendChild(tile);
@@ -602,6 +653,7 @@ $("go").addEventListener("click", async () => {
   $("donebox").hidden = true;
   showStage("busy");
   const est = computeEstimate(await healthInfo());
+  busyEstS = est.s;
   $("busymsg").textContent = "Generating " + state.dur + " s of video — " +
     fmtDur(est.s).replace("~", "about ") +
     (est.cold ? ", including worker start." : " on a warm worker.");
@@ -658,12 +710,14 @@ $("go").addEventListener("click", async () => {
     $("vid").src = url; showStage("video");
     $("finalt").textContent = t + " s"; $("meta").textContent = meta;
     $("donebox").hidden = false;
-    state.gallery.unshift({
-      title: titleOf(prompt), dur: state.dur, sub: t + " s · seed " + info.seed,
-      t, url, meta, prompt, seed: info.seed,
-      durV: state.dur, tierV: state.tier, aspectV: state.aspect,
-    });
+    const entry = {
+      id: info.id, title: titleOf(prompt), dur: state.dur,
+      sub: t + " s · seed " + info.seed, t, meta, prompt, seed: info.seed,
+      durV: state.dur, tierV: state.tier, aspectV: state.aspect, at: Date.now(),
+    };
+    state.gallery.unshift({ ...entry, url });
     state.gallery = state.gallery.slice(0, 12);
+    storeAdd(entry);                  // metadata only; the mp4 is re-fetched on load
     renderGallery();
     if (!bannerDismissed() && !signedIn()) $("banner").hidden = false;
   } catch (e) {
@@ -677,6 +731,7 @@ $("go").addEventListener("click", async () => {
 });
 updateEstimate();
 refreshQuota();
+restoreGallery();
 </script>
 </body>
 </html>

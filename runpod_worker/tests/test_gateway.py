@@ -895,25 +895,52 @@ def test_health_carries_the_estimate_block(client):
     with mock.patch.object(m, "_rp", return_value={"jobs": {}, "workers": {"ready": 1}}):
         body = c.get("/v1/health").json()
     est = body["estimate"]
-    assert est["times"]["480p"]["5"] == 24            # measured floor
-    assert est["times"]["720p"]["10"] == 103
+    assert est["times"]["480p"]["5"] == 30            # measured wall floor
+    assert est["times"]["720p"]["10"] == 115
     assert est["cold_start_s"] > 0 and est["avg_job_s"] > 0
 
 
-def test_estimate_learns_from_recorded_generations(client):
-    """Three real completions for a combo override the hand-measured floor;
-    combos without samples keep it."""
+def test_estimate_learns_from_recorded_wall_times(client):
+    """Three real completions for a combo override the hand-measured floor
+    with their MEDIAN wall time; combos without samples keep the floor, and
+    sub-5s glitch rows are ignored."""
     c, m = client
     from runpod_worker.gateway import db as dbmod
-    for i in range(3):
+    import sqlalchemy as sa
+    for i, wall in enumerate([40.0, 44.0, 200.0, 0.1]):   # one cold outlier, one glitch
         dbmod.record_job(f"est-{i}", "somehash", resolution="832x480",
                          duration_s=5, seed=None)
-        dbmod.mark_job(f"est-{i}", "completed", generate_s=30.0)
+        with dbmod.engine().begin() as cx:
+            cx.execute(dbmod.jobs.update().where(dbmod.jobs.c.id == f"est-{i}")
+                       .values(wall_s=wall, status="completed"))
     with mock.patch.object(m, "_rp", return_value={"jobs": {}, "workers": {"ready": 1}}):
         est = c.get("/v1/health").json()["estimate"]
-    assert est["times"]["480p"]["5"] == 30            # rolling average wins
-    assert est["times"]["720p"]["5"] == 48            # untouched without samples
-    assert est["avg_job_s"] == 30
+    assert est["times"]["480p"]["5"] == 44             # median, outlier ignored
+    assert est["times"]["720p"]["5"] == 55             # untouched without samples
+    assert est["avg_job_s"] == 44
+
+
+def test_completion_stamps_wall_time_once(client):
+    """mark_job records submit-to-completion wall seconds on the FIRST
+    completed observation; repeated status polls must not creep it up."""
+    c, m = client
+    from runpod_worker.gateway import db as dbmod
+    import datetime, sqlalchemy as sa
+    dbmod.record_job("wall-1", "somehash", resolution="832x480",
+                     duration_s=5, seed=None)
+    with dbmod.engine().begin() as cx:
+        cx.execute(dbmod.jobs.update().where(dbmod.jobs.c.id == "wall-1")
+                   .values(created_at=dbmod._now() - datetime.timedelta(seconds=40)))
+    dbmod.mark_job("wall-1", "completed", generate_s=22.0)
+    with dbmod.engine().connect() as cx:
+        first = cx.execute(sa.select(dbmod.jobs.c.wall_s)
+                           .where(dbmod.jobs.c.id == "wall-1")).scalar_one()
+    assert 39 <= first <= 45
+    dbmod.mark_job("wall-1", "completed")              # a later poll re-marks
+    with dbmod.engine().connect() as cx:
+        again = cx.execute(sa.select(dbmod.jobs.c.wall_s)
+                           .where(dbmod.jobs.c.id == "wall-1")).scalar_one()
+    assert again == first
 
 
 def test_multiline_prompts_stay_one_prompt(client):
