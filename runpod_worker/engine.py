@@ -931,6 +931,8 @@ def run(
         cancel_grace = float(getattr(C.CONFIG, "cancel_grace_s", 150))
         interval = float(getattr(C.CONFIG, "progress_interval_s", 5))
         last_emit = float("-inf")
+        last_preview_b64: str | None = None
+        last_preview_at = float("-inf")
 
         # DO NOT use job.events.iter(): SessionStream.iter (shared/api.py:263-271)
         # `continue`s on a queue timeout without yielding, so the loop body -- and
@@ -981,10 +983,22 @@ def run(
                                         payload["total_steps"], now)
                     if eta is not None:
                         payload["eta_s"] = eta
+                    if last_preview_b64 is not None:
+                        payload["preview_jpeg"] = last_preview_b64
                     last_progress = payload
                     if now - last_emit >= interval:
                         last_emit = now
                         _emit(callback, payload)
+
+                elif kind == "preview":
+                    # WanGP pushes raw denoising latents; encode at most one
+                    # per progress interval and let the NEXT progress frame
+                    # carry it, so preview traffic can never outpace progress.
+                    if now - last_preview_at >= interval:
+                        encoded = _encode_preview(data)
+                        if encoded is not None:
+                            last_preview_b64 = encoded
+                            last_preview_at = now
 
                 elif kind in ("status", "info"):
                     text = str(data)
@@ -1150,6 +1164,38 @@ def _safe_cancel_check(check: Callable[[], bool]) -> bool:
     except Exception as exc:  # noqa: BLE001
         LOG.warn("cancel_check_failed", error=f"{type(exc).__name__}: {exc}")
         return False
+
+
+def _encode_preview(payload: Any) -> str | None:
+    """A denoising preview as a small base64 JPEG, or None.
+
+    WanGP pushes raw latents; ``wgp.generate_preview`` converts them with the
+    model's cheap latent->RGB factors -- no VAE involved, so this costs
+    milliseconds. Kept small (120 px tall, JPEG q60, ~15-30 KB) because the
+    frame rides inside RunPod progress updates that the customer gateway
+    polls. Failures are never fatal: no preview beats no progress."""
+    try:
+        import base64
+        import io
+
+        import torch
+        import wgp as _wgp
+
+        if torch.cuda.is_available():
+            # The generation thread copied the latents to CPU non_blocking;
+            # sync before reading them, exactly as wgp's own UI handler does.
+            torch.cuda.current_stream().synchronize()
+        img = _wgp.generate_preview(C.CONFIG.model_type, payload)
+        if img is None:
+            return None
+        height = 120
+        img = img.resize((max(1, round(img.width * height / img.height)), height))
+        buf = io.BytesIO()
+        img.convert("RGB").save(buf, format="JPEG", quality=60)
+        return base64.b64encode(buf.getvalue()).decode()
+    except Exception as exc:  # noqa: BLE001 - preview must never fail a job
+        LOG.debug("preview_encode_failed", error=f"{type(exc).__name__}: {exc}")
+        return None
 
 
 def _estimate_eta(
