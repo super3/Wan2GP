@@ -97,12 +97,19 @@ def test_caller_cannot_choose_length_or_resolution(client):
             return {"id": "job-1"}
         return COMPLETED
 
+    # A raw pixel resolution is REFUSED rather than silently ignored: a caller
+    # who asks for 1080p should learn it is unavailable, not receive 480p.
     with mock.patch.object(m, "_rp", side_effect=fake):
         r = c.post("/v1/videos",
                    json={"prompt": "x", "video_length": 481, "resolution": "1920x1080"},
                    headers=_hdr(KEY_A))
+    assert r.status_code == 422
+
+    # And a raw video_length is ignored: only duration_s (5|10) is honoured.
+    with mock.patch.object(m, "_rp", side_effect=fake):
+        r = c.post("/v1/videos", json={"prompt": "x", "video_length": 481},
+                   headers=_hdr(KEY_A))
     assert r.status_code == 200
-    # a raw video_length in the body is ignored; only duration_s (5|10) is honoured
     assert seen["video_length"] == 124        # the 5 s default, not the requested 481
     assert seen["resolution"] == "832x480"
 
@@ -296,3 +303,47 @@ def test_page_uses_background_and_polls(client):
     body = c.get("/").text
     assert "background: true" in body
     assert "poll_url" in body
+
+
+# --- resolution ------------------------------------------------------------
+
+def test_resolution_defaults_to_480p(client):
+    c, m = client
+    seen = {}
+
+    def fake(path, payload=None, timeout=60):
+        if payload:
+            seen.update(payload["input"]["settings"]); return {"id": "job-1"}
+        return COMPLETED
+
+    with mock.patch.object(m, "_rp", side_effect=fake):
+        c.post("/v1/videos", json={"prompt": "x"}, headers=_hdr(KEY_A))
+    assert seen["resolution"] == "832x480"
+
+
+def test_720p_is_forced_to_background(client):
+    """720p takes minutes. Holding the connection until the proxy kills it loses
+    the job id, which is the one thing the caller needs -- so the combination is
+    not offered at all."""
+    c, m = client
+    seen = {}
+
+    def fake(path, payload=None, timeout=60):
+        if payload:
+            seen.update(payload["input"]["settings"]); return {"id": "job-1"}
+        return COMPLETED
+
+    with mock.patch.object(m, "_rp", side_effect=fake):
+        r = c.post("/v1/videos",
+                   json={"prompt": "x", "resolution": "720p", "background": False},
+                   headers=_hdr(KEY_A))
+    assert r.status_code == 202              # not 200, despite background:false
+    assert seen["resolution"] == "1280x720"
+
+
+@pytest.mark.parametrize("bad", ["1080p", "4k", "832x480", ""])
+def test_unknown_resolution_refused(client, bad):
+    c, m = client
+    with mock.patch.object(m, "_rp", side_effect=_backend()):
+        r = c.post("/v1/videos", json={"prompt": "x", "resolution": bad}, headers=_hdr(KEY_A))
+    assert r.status_code == 422

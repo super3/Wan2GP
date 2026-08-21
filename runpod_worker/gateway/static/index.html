@@ -91,7 +91,7 @@
 <body>
 <header><div class="hdr">
   <h1>Video Generation API</h1>
-  <p class="tag">Five or ten seconds of 832&times;480 video with synchronized audio, from a text prompt. One HTTP call.</p>
+  <p class="tag">Five or ten seconds of 480p or 720p video with synchronized audio, from a text prompt. One HTTP call.</p>
 </div></header>
 
 <main>
@@ -116,10 +116,18 @@ non_diegetic_music: None.</textarea>
     <div class="field">
       <label for="dur">Length</label>
       <select id="dur">
-        <option value="5" selected>5 seconds &middot; ~22 s to generate</option>
-        <option value="10">10 seconds &middot; ~56 s to generate</option>
+        <option value="5" selected>5 seconds</option>
+        <option value="10">10 seconds</option>
       </select>
     </div>
+    <div class="field">
+      <label for="res">Resolution</label>
+      <select id="res">
+        <option value="480p" selected>480p &middot; 832&times;480</option>
+        <option value="720p">720p &middot; 1280&times;720, several minutes</option>
+      </select>
+    </div>
+    <p class="note" id="esti"></p>
     <button type="button" id="go">Generate</button>
     <div id="out">
       <div id="msg"></div>
@@ -151,6 +159,7 @@ non_diegetic_music: None.</textarea>
     <tr><th>Field</th><th></th></tr>
     <tr><td><code>prompt</code></td><td>Required. The three-block format below.</td></tr>
     <tr><td><code>duration_s</code></td><td>Optional. <code>5</code> (default) or <code>10</code>. Anything else is a 422 — the model's frame lattice only admits certain lengths.</td></tr>
+    <tr><td><code>resolution</code></td><td>Optional. <code>480p</code> (default, 832&times;480) or <code>720p</code> (1280&times;720). 720p is always returned as a job id to poll — it cannot finish inside a synchronous request.</td></tr>
     <tr><td><code>seed</code></td><td>Optional integer. Omit or <code>-1</code> for random.</td></tr>
     <tr><td><code>background</code></td><td>Optional. <code>true</code> returns a job id immediately instead of the file. Use it from a browser — a held connection dies when a phone locks its screen.</td></tr>
   </table>
@@ -252,6 +261,19 @@ setInterval(() => {
   $("sago").textContent = s < 2 ? "just now" : `${s}s ago`;
 }, 1000);
 
+// Rough guidance, not a promise: 480p figures are measured, 720p is not.
+function estimate() {
+  const d = $("dur").value, r = $("res").value;
+  const t = r === "480p" ? (d === "5" ? "about 25 seconds" : "about a minute")
+                         : (d === "5" ? "a couple of minutes" : "several minutes");
+  $("esti").textContent = `Warm, this takes ${t}.`
+    + (r === "720p" ? " 720p is 2.3x the pixels of 480p and is always queued in the background."
+                    : "");
+}
+$("dur").addEventListener("change", estimate);
+$("res").addEventListener("change", estimate);
+estimate();
+
 $("key").value = sessionStorage.getItem("gw.key") || "";
 $("key").addEventListener("change", () => { try { sessionStorage.setItem("gw.key", $("key").value); } catch {} });
 
@@ -274,7 +296,8 @@ $("go").addEventListener("click", async () => {
     const res = await fetch("/v1/videos", {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: "Bearer " + key },
-      body: JSON.stringify({ prompt, duration_s: Number($("dur").value), background: true }),
+      body: JSON.stringify({ prompt, duration_s: Number($("dur").value),
+                             resolution: $("res").value, background: true }),
     });
     if (!res.ok) {
       let detail = res.statusText;
