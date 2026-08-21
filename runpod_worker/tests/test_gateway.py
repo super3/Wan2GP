@@ -221,7 +221,7 @@ def test_ten_seconds_is_selectable(client):
     assert seen["video_length"] == 243        # 10.125 s
 
 
-@pytest.mark.parametrize("bad", [7, 15, 0, -5, 20])
+@pytest.mark.parametrize("bad", [7, 12, 0, -5, 20])
 def test_other_durations_are_refused(client, bad):
     """Not free-form: an arbitrary duration is both off the frame lattice and a
     way to queue a job more expensive than the caller thinks."""
@@ -362,9 +362,7 @@ def test_720p_uses_a_resolution_the_model_actually_accepts():
     answers "nearest valid: 1280x704". A live job failed in 63 ms on exactly
     this before it was corrected."""
     from runpod_worker.gateway import app as module
-    assert module.RESOLUTIONS["720p"] == "1280x704"
-    for w, h in (tuple(map(int, v.split("x"))) for v in module.RESOLUTIONS.values()):
-        assert w % 16 == 0 and h % 16 == 0, f"{w}x{h} is off the VAE lattice"
+    assert module.DIMENSIONS[("720p", "horizontal")] == "1280x704"
 
 
 # --- square + image input --------------------------------------------------
@@ -386,12 +384,13 @@ def test_square_resolution(client):
 
 def test_every_offered_resolution_is_on_the_block_lattice():
     """block_size is 32 (schema.py:465). A resolution off the lattice fails the
-    job instantly -- 1280x720 did exactly that -- so every value the gateway
-    offers must be a multiple of 32 in BOTH dimensions."""
+    job instantly -- 1280x720 did exactly that -- so every cell of the
+    aspect x tier matrix must be a multiple of 32 in BOTH dimensions."""
     from runpod_worker.gateway import app as module
-    for name, value in module.RESOLUTIONS.items():
+    assert len(module.DIMENSIONS) == len(module.RESOLUTION_TIERS) * len(module.ASPECTS)
+    for cell, value in module.DIMENSIONS.items():
         w, h = (int(x) for x in value.split("x"))
-        assert w % 32 == 0 and h % 32 == 0, f"{name}={value} is off the 32px lattice"
+        assert w % 32 == 0 and h % 32 == 0, f"{cell}={value} is off the 32px lattice"
 
 
 def test_image_sets_both_the_letter_and_the_attachment(client):
@@ -541,7 +540,8 @@ def test_generate_seconds_lands_in_the_jobs_table(client):
         row = cx.execute(sa.select(dbmod.jobs).where(dbmod.jobs.c.id == job)).mappings().first()
     assert row["status"] == "completed"
     assert row["generate_s"] == 55.8
-    assert row["resolution"] == "480p" and row["duration_s"] == 5
+    # actual pixel dimensions, not the tier label -- billing wants what ran
+    assert row["resolution"] == "832x480" and row["duration_s"] == 5
 
 
 def test_raw_keys_never_touch_the_database(client):
@@ -554,3 +554,94 @@ def test_raw_keys_never_touch_the_database(client):
     blob = json.dumps(rows, default=str)
     assert KEY_A not in blob and KEY_B not in blob
     assert dbmod.hash_key(KEY_A) in blob
+
+
+# --- studio additions --------------------------------------------------------
+
+def test_fifteen_seconds_is_selectable_and_background_only(client):
+    """362 frames is on the 17n+5 lattice (the max single window) but takes
+    ~98 s at 480p -- past SYNC_TIMEOUT, so it must come back as a job id."""
+    c, m = client
+    seen = {}
+
+    def fake(path, payload=None, timeout=60):
+        if payload:
+            seen.update(payload["input"]["settings"]); return {"id": "job-1"}
+        return COMPLETED
+
+    with mock.patch.object(m, "_rp", side_effect=fake):
+        r = c.post("/v1/videos", json={"prompt": "x", "duration_s": 15}, headers=_hdr(KEY_A))
+    assert r.status_code == 202
+    assert seen["video_length"] == 362
+
+
+@pytest.mark.parametrize("tier,aspect,expected", [
+    ("480p", "portrait", "480x832"),
+    ("480p", "square", "640x640"),
+    ("720p", "portrait", "704x1280"),
+    ("720p", "square", "960x960"),
+])
+def test_aspect_ratio_matrix(client, tier, aspect, expected):
+    c, m = client
+    seen = {}
+
+    def fake(path, payload=None, timeout=60):
+        if payload:
+            seen.update(payload["input"]["settings"]); return {"id": "job-1"}
+        return COMPLETED
+
+    with mock.patch.object(m, "_rp", side_effect=fake):
+        c.post("/v1/videos", json={"prompt": "x", "resolution": tier,
+                                   "aspect_ratio": aspect, "background": True},
+               headers=_hdr(KEY_A))
+    assert seen["resolution"] == expected
+
+
+def test_legacy_square_alias_still_works(client):
+    """The first customer integration was given resolution="square"; it must
+    keep meaning 960x960 even though the new API spells it 720p + square."""
+    c, m = client
+    seen = {}
+
+    def fake(path, payload=None, timeout=60):
+        if payload:
+            seen.update(payload["input"]["settings"]); return {"id": "job-1"}
+        return COMPLETED
+
+    with mock.patch.object(m, "_rp", side_effect=fake):
+        r = c.post("/v1/videos", json={"prompt": "x", "resolution": "square"},
+                   headers=_hdr(KEY_A))
+    assert r.status_code == 202
+    assert seen["resolution"] == "960x960"
+
+
+def test_bad_aspect_refused(client):
+    c, m = client
+    with mock.patch.object(m, "_rp", side_effect=_backend()):
+        r = c.post("/v1/videos", json={"prompt": "x", "aspect_ratio": "vertical"},
+                   headers=_hdr(KEY_A))
+    assert r.status_code == 422
+
+
+def test_cache_purge_honours_retention(client, tmp_path, monkeypatch):
+    """The Studio page says 'kept for 1 hour'; the purge is what makes that
+    true. Billing rows must survive the bytes expiring."""
+    import os, time as _t
+    c, m = client
+    old = m.CACHE / "ancient.mp4"; old.write_bytes(b"x")
+    os.utime(old, (_t.time() - 7200, _t.time() - 7200))
+    fresh = m.CACHE / "fresh.mp4"; fresh.write_bytes(b"y")
+    with mock.patch.object(m, "_rp", side_effect=_backend(status={"status": "IN_QUEUE"})):
+        c.post("/v1/videos", json={"prompt": "x", "background": True}, headers=_hdr(KEY_A))
+    assert not old.exists(), "expired video should be purged on the next submit"
+    assert fresh.exists(), "fresh video must survive the purge"
+
+
+def test_studio_page_is_the_landing_page(client):
+    c, _ = client
+    body = c.get("/").text
+    assert "Minimax H3 Studio" in body
+    assert "aspect_ratio: state.aspect" in body       # the page sends the new field
+    assert "kept for 1 hour" in body
+    legacy = c.get("/legacy")
+    assert legacy.status_code == 200 and "Video Generation API" in legacy.text
