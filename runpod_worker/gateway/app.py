@@ -38,6 +38,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import re
 import time
 import urllib.request
 from datetime import date
@@ -226,11 +227,16 @@ def _jwks_client() -> jwt.PyJWKClient:
 
 class Ident(NamedTuple):
     """Who is calling, reduced to what the handlers need. key_hash is what
-    quota and job ownership key off -- the raw credential never sits in the
-    job table or the logs. kind gates what the caller may buy."""
+    job ownership keys off and quota_hash is what the daily count is charged
+    to -- the raw credential never sits in the job table or the logs. They
+    differ only for visitors: ownership rides on the page's device token
+    (stable across a wifi-to-cellular hop) while quota stays on the client
+    address (not resettable by clearing browser storage). kind gates what
+    the caller may buy."""
     key_hash: str
     kind: str            # "key" | "clerk" | "visitor"
     limit: int
+    quota_hash: str
 
 
 def _auth_clerk(token: str) -> Ident:
@@ -258,26 +264,22 @@ def _auth_clerk(token: str) -> Ident:
                         daily_limit=CLERK_DAILY_LIMIT)
     if row is None:
         raise HTTPException(401, "this account has been disabled")
-    return Ident(row["key_hash"], "clerk", row["daily_limit"] or CLERK_DAILY_LIMIT)
+    kh = row["key_hash"]
+    return Ident(kh, "clerk", row["daily_limit"] or CLERK_DAILY_LIMIT, kh)
 
 
-def auth(request: Request, authorization: str = Header(default="")) -> Ident:
-    """Three schemes share the endpoint: sk_ keys are API customers, anything
-    shaped like a JWT is a Clerk session from the Studio page, and NO
-    credential at all is the free visitor tier, quota'd by client address.
-    All three resolve to a row in api_keys, so quota and job ownership
-    downstream do not care which ran."""
-    token = authorization.removeprefix("Bearer ").strip()
-    if token:
-        if token.count(".") == 2 and not token.startswith("sk_"):
-            return _auth_clerk(token)
-        row = db.lookup_key(token)
-        if row is None:
-            raise HTTPException(401, "invalid or missing API key")
-        return Ident(db.hash_key(token), "key", row.get("daily_limit") or DAILY_LIMIT)
-    # The LAST X-Forwarded-For entry is the one Railway's edge appended; the
-    # first can be whatever the client wrote into the header themselves, and
-    # trusting it would let one machine mint fresh visitor quotas at will.
+_VISITOR_TOKEN = re.compile(r"^vt_[A-Za-z0-9-]{8,64}$")
+
+
+def _auth_visitor(request: Request, token: str) -> Ident:
+    """The free tier. Quota is charged to the client address: the LAST
+    X-Forwarded-For entry is the one Railway's edge appended, while the first
+    can be whatever the client wrote into the header themselves -- trusting
+    it would let one machine mint fresh visitor quotas at will. Ownership
+    keys off the page's random device token when it sends one, because a
+    phone's address changes mid-generation (wifi to cellular) and neighbours
+    behind one carrier-grade NAT must not be able to poll each other's jobs.
+    A bare curl with no token falls back to the address for both."""
     fwd = request.headers.get("x-forwarded-for", "")
     ip = (fwd.rsplit(",", 1)[-1].strip()
           or (request.client.host if request.client else "unknown"))
@@ -285,7 +287,37 @@ def auth(request: Request, authorization: str = Header(default="")) -> Ident:
                         daily_limit=ANON_DAILY_LIMIT)
     if row is None:
         raise HTTPException(401, "this address has been blocked")
-    return Ident(row["key_hash"], "visitor", row["daily_limit"] or ANON_DAILY_LIMIT)
+    quota_hash = row["key_hash"]
+    own_hash = quota_hash
+    if token:
+        own = db.ensure_key(token, label="visitor device")
+        if own is None:
+            raise HTTPException(401, "this device has been blocked")
+        own_hash = own["key_hash"]
+    return Ident(own_hash, "visitor",
+                 row["daily_limit"] or ANON_DAILY_LIMIT, quota_hash)
+
+
+def auth(request: Request, authorization: str = Header(default="")) -> Ident:
+    """Four bearer shapes share the endpoint: sk_ keys are API customers,
+    anything shaped like a JWT is a Clerk session from the Studio page, vt_
+    is the page's anonymous device token, and NO credential at all is a bare
+    visitor. All of them resolve to rows in api_keys, so quota and job
+    ownership downstream do not care which ran."""
+    token = authorization.removeprefix("Bearer ").strip()
+    if not token:
+        return _auth_visitor(request, "")
+    if token.count(".") == 2 and not token.startswith("sk_"):
+        return _auth_clerk(token)
+    if token.startswith("vt_"):
+        if not _VISITOR_TOKEN.match(token):
+            raise HTTPException(401, "invalid or missing API key")
+        return _auth_visitor(request, token)
+    row = db.lookup_key(token)
+    if row is None:
+        raise HTTPException(401, "invalid or missing API key")
+    kh = db.hash_key(token)
+    return Ident(kh, "key", row.get("daily_limit") or DAILY_LIMIT, kh)
 
 
 def _rp(path: str, payload: dict | None = None, timeout: int = 60) -> dict:
@@ -363,7 +395,7 @@ def create(body: VideoRequest, ident: Ident = Depends(auth)) -> dict:
             401, "longer lengths and 720p need a free account -- "
                  "sign in or pass an API key")
     today = date.today().isoformat()
-    if not db.try_consume_quota(key, today, ident.limit):
+    if not db.try_consume_quota(ident.quota_hash, today, ident.limit):
         raise HTTPException(429, f"daily limit of {ident.limit} videos reached")
 
     frames = DURATIONS[body.duration_s]
@@ -399,7 +431,7 @@ def create(body: VideoRequest, ident: Ident = Depends(auth)) -> dict:
             "runtime": {"timeout_s": 1200},
         }})
     except Exception:
-        db.refund_quota(key, today)          # a failed submit must not bill the quota
+        db.refund_quota(ident.quota_hash, today)   # a failed submit must not bill the quota
         raise HTTPException(503, "could not queue the job") from None
 
     job_id = created.get("id")
