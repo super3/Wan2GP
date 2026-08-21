@@ -708,8 +708,10 @@ def test_studio_page_is_the_landing_page(client):
     body = c.get("/").text
     assert "Minimax H3 Studio" in body
     assert "aspect_ratio: state.aspect" in body       # the page sends the new field
-    # Clips persist in the BROWSER (IndexedDB); the server copy is short-lived.
-    assert "Clips save to this browser" in body
+    # Clips persist in the BROWSER (IndexedDB); the server copy is
+    # short-lived, so the page must tell people to Save what they care about.
+    assert "Clips only live in this browser" in body
+    assert "download anything you want to keep" in body
     assert "indexedDB.open" in body
     # The Studio page is the only page: no legacy demo, no auto-generated docs.
     assert c.get("/legacy").status_code == 404
