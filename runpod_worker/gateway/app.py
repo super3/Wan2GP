@@ -59,7 +59,11 @@ RUNPOD_API = "https://api.runpod.ai/v2"
 #: it fits inside a 60 s proxy timeout, which the long one does not.
 DURATIONS = {5: 124, 10: 243}
 DEFAULT_DURATION = 5
-RESOLUTION = "832x480"
+#: shared/resolutions.py:46,55 -- both 16:9. The turbo LoRA is 768p-trained, so
+#: 720p is near its native size; 480p is what every measurement in the README
+#: was taken at. 720p is 2.31x the pixels and generates far slower.
+RESOLUTIONS = {"480p": "832x480", "720p": "1280x720"}
+DEFAULT_RESOLUTION = "480p"
 ACCEL_PROFILE = "Turbo Lightx2v FL2V 4 Steps v1.0 768p"
 MODEL_TYPE = "minimax_h3_fl2va_pruned"
 
@@ -149,6 +153,11 @@ class VideoRequest(BaseModel):
     #: Browsers -- phones especially -- abort a fetch when the screen locks or
     #: the tab is backgrounded, so a 30 s held connection is unreliable there
     #: even though it is perfectly fine for curl or a server-side caller.
+    #: 720p is 2.31x the pixels of 480p and takes minutes rather than seconds,
+    #: which is why it is background-only below -- no synchronous route can
+    #: outlast the proxy for it.
+    resolution: str = Field(default=DEFAULT_RESOLUTION,
+                            description="480p (default) or 720p")
     background: bool = Field(default=False,
                              description="return a job id immediately instead of the file")
     #: -1 (or omitted) picks a random seed; the resolved value is returned so a
@@ -173,6 +182,8 @@ def health() -> dict:
 def create(body: VideoRequest, key: str = Depends(auth)) -> dict:
     if body.duration_s not in DURATIONS:
         raise HTTPException(422, f"duration_s must be one of {sorted(DURATIONS)}")
+    if body.resolution not in RESOLUTIONS:
+        raise HTTPException(422, f"resolution must be one of {sorted(RESOLUTIONS)}")
     today = date.today().isoformat()
     with _lock:
         if _usage[(key, today)] >= DAILY_LIMIT:
@@ -180,9 +191,14 @@ def create(body: VideoRequest, key: str = Depends(auth)) -> dict:
         _usage[(key, today)] += 1
 
     frames = DURATIONS[body.duration_s]
+    # 720p cannot finish inside SYNC_TIMEOUT, and holding the connection until
+    # the proxy kills it loses the job id -- which is the one thing the caller
+    # needs. Force background rather than let them pick a combination that
+    # cannot work.
+    background = body.background or body.resolution == "720p"
     settings: dict[str, Any] = {
         "prompt": body.prompt,
-        "resolution": RESOLUTION,
+        "resolution": RESOLUTIONS[body.resolution],
         "video_length": frames,
         "sample_solver": "euler",
         "image_prompt_type": "", "video_prompt_type": "", "audio_prompt_type": "",
@@ -207,7 +223,7 @@ def create(body: VideoRequest, key: str = Depends(auth)) -> dict:
     with _lock:
         _jobs[job_id] = {"owner": key, "created": time.time(), "seed": body.seed}
 
-    if body.background:
+    if background:
         return JSONResponse(
             status_code=202,
             headers={"Retry-After": "10", "Location": f"/v1/videos/{job_id}"},
