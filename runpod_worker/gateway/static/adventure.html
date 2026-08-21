@@ -184,8 +184,10 @@ function pollWhileRendering() {
   clearInterval(pollTimer);
   pollTimer = setInterval(async () => {
     await refreshState();
+    // Stop only when done AND nobody is stuck waiting -- a scene can be
+    // requeued server-side after this tab saw it ready.
     const allDone = ORDER.every(id => NODES[id].status === "ready" || NODES[id].status === "failed");
-    if (allDone) clearInterval(pollTimer);
+    if (allDone && state.phase !== "waiting") clearInterval(pollTimer);
     // A scene we are waiting on may have just landed.
     if (state.phase === "waiting" && NODES[state.nodeId] &&
         NODES[state.nodeId].status === "ready")
@@ -250,6 +252,7 @@ function startScene(id, num, path) {
     $("waitmsg").textContent = NODES[id].status === "rendering"
       ? "rendering this scene…" : "this scene is queued to render…";
     showPhase("waiting");
+    pollWhileRendering();              // make sure someone is watching for it
     return;
   }
   vid.src = clipUrl(id);
@@ -271,6 +274,26 @@ vid.addEventListener("timeupdate", () => {
       NODES[state.nodeId] && NODES[state.nodeId].choices.length)
     showPhase("choosing");                 // the clip plays on underneath
 });
+// A clip request can 404 under a stale status -- the server may have
+// requeued a scene this tab still believes is ready (e.g. it is being
+// re-rendered). Without this handler that was a silent black stage.
+let vidRetriedFor = null;
+vid.addEventListener("error", async () => {
+  if (!state.nodeId || state.phase !== "playing") return;
+  const id = state.nodeId;
+  delete CLIPS[id];                    // never retry a cached broken blob
+  await refreshState();
+  if (NODES[id].status === "ready" && vidRetriedFor !== id) {
+    vidRetriedFor = id;                // one clean retry for a network blip
+    vid.src = "/adventure/scene/" + id + "?r=" + Date.now();
+    vid.play().catch(() => {});
+    return;
+  }
+  $("waitmsg").textContent = "re-rendering this scene…";
+  showPhase("waiting");
+  pollWhileRendering();                // resumes the scene when it lands
+});
+
 vid.addEventListener("ended", () => {
   if (pendingChoice) {                                   // chosen mid-clip:
     const pick = pendingChoice;                          // seamless hand-off
