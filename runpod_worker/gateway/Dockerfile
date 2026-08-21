@@ -14,8 +14,11 @@ COPY static ./static
 
 # RUNPOD_API_KEY and RUNPOD_ENDPOINT_ID stay server-side and are never returned
 # to a caller. GATEWAY_KEYS maps customer keys to labels.
+# No VOLUME instruction: Railway rejects it at Dockerfile validation ("docker
+# VOLUME at Line 18 is not supported, use Railway Volumes") and the app mkdirs
+# GATEWAY_CACHE at import anyway. For durable video cache on Railway, attach a
+# Railway Volume mounted at /data; for docker run, pass -v as usual.
 ENV GATEWAY_CACHE=/data/videos GATEWAY_DAILY_LIMIT=100
-VOLUME /data
 EXPOSE 8000
 
 # /healthz is process-liveness only. /v1/health reports the GPU backend and
