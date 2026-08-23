@@ -107,6 +107,12 @@ def main() -> int:
     #: Decode only the final chunk (models/minimax_h3/last_frame.py): the last
     #: frame is bit-identical, at 1/num_chunks of the decode work.
     parser.add_argument("--last-frame", action="store_true")
+    #: Accelerator profile fragment. Default is the production turbo LoRA;
+    #: pass "none" to run the UNDISTILLED model at its own defaults -- the
+    #: full-quality-tier timing question.
+    parser.add_argument("--accel-profile", dest="accel_profile", default=ACCEL_PROFILE)
+    #: num_inference_steps override; only meaningful with --accel-profile none.
+    parser.add_argument("--steps", type=int, default=0)
     args = parser.parse_args()
 
     world = int(os.environ.get("WORLD_SIZE", "1"))
@@ -262,11 +268,12 @@ def main() -> int:
 
     runs = []
     for seed in [int(s) for s in args.seeds.split(",") if s.strip()]:
+        accel = "" if args.accel_profile in ("none", "") else args.accel_profile
         job = {
             "id": f"bench-{tag}-{seed}-r{rank}",
             "input": {
                 "model_type": os.environ.get("WANGP_MODEL_TYPE", "minimax_h3_fl2va_pruned"),
-                "profile": ACCEL_PROFILE,
+                **({"profile": accel} if accel else {}),
                 "settings": dict(
                     {
                         "prompt": PROMPT,
@@ -274,6 +281,7 @@ def main() -> int:
                         "video_length": args.frames,
                         "seed": seed,
                     },
+                    **({"num_inference_steps": args.steps} if args.steps > 0 else {}),
                     **({"override_attention": override_attention} if override_attention else {}),
                 ),
                 "output": {"mode": "b64"},
@@ -320,6 +328,8 @@ def main() -> int:
                "compile": bool(args.compile), "config": args.config, "codec": args.codec,
                "vae_config": args.vae_config, "last_frame": bool(args.last_frame),
                "attention": args.attention,
+               "accel_profile": ("" if args.accel_profile in ("none", "") else args.accel_profile),
+               "steps_override": args.steps,
                "effective_attention": effective, "attention_ok": attention_ok,
                "installed_attention": installed, "supported_attention": supported,
                # The knobs as wgp ACTUALLY received them. Without this the
