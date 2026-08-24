@@ -7,7 +7,9 @@ import math
 import os
 import re
 import sys
+import threading
 import time
+import uuid
 import ffmpeg
 from datetime import datetime
 from dataclasses import dataclass, field
@@ -16,8 +18,9 @@ from typing import Any, Callable
 
 from PIL import Image, ImageColor
 
+from shared.llm_io import known_token_ids, llm_io_enabled, log_llm_io, media_descriptor, token_id_descriptor
 from shared.utils.audio_video import extract_audio_tracks
-from shared.utils.utils import get_video_frame, get_video_info
+from shared.utils.utils import get_video_info
 from shared.deepy.config import (
     DEEPY_ALLOW_READ_FILE_SYSTEM_DEFAULT,
     DEEPY_ALLOW_READ_FILE_SYSTEM_KEY,
@@ -389,12 +392,20 @@ class AssistantSessionState:
     chat_html: str = ""
     chat_transcript: list[dict[str, Any]] = field(default_factory=list)
     chat_transcript_counter: int = 0
+    chat_revision: int = 0
+    chat_session_id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    turn_lock: Any = field(default_factory=threading.RLock)
     interrupt_requested: bool = False
+    steering_pending: bool = False
+    steering_deadline: float = 0.0
+    assistant_thought_active: bool = False
+    assistant_action_active: bool = False
     drop_state_requested: bool = False
     worker_active: bool = False
     control_queue: Any | None = None
     queued_job_count: int = 0
     queued_cancel_count: int = 0
+    cancelled_queued_message_ids: set[str] = field(default_factory=set)
     chat_epoch: int = 0
     release_vram_callback: Callable[[], None] | None = None
     force_loading_status_once: bool = False
@@ -413,6 +424,7 @@ class AssistantSessionState:
     generated_seconds_total: float = 0.0
     runtime_max_model_len: int = 0
     chat_stats_signature: str = ""
+    remote_usage_stats: dict[str, Any] | None = None
     seen_video_gallery_paths: list[str] = field(default_factory=list)
     seen_audio_gallery_paths: list[str] = field(default_factory=list)
     generated_client_ids: list[str] = field(default_factory=list)
@@ -427,6 +439,7 @@ class AssistantSessionState:
     reset_base_context_window_tokens: int = 0
     reset_to_base_callback: Callable[[], bool] | None = None
     prime_toolbox: Any | None = None
+    remote_backends: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -451,6 +464,11 @@ def get_or_create_assistant_session(state) -> AssistantSessionState:
 
 
 def clear_assistant_session(session: AssistantSessionState) -> None:
+    for backend in session.remote_backends.values():
+        close_backend = getattr(backend, "close", None)
+        if callable(close_backend):
+            close_backend()
+    session.remote_backends.clear()
     if session.prime_toolbox is not None:
         close_prime_toolbox = getattr(session.prime_toolbox, "close", None)
         if callable(close_prime_toolbox):
@@ -464,8 +482,13 @@ def clear_assistant_session(session: AssistantSessionState) -> None:
     session.media_registry.clear()
     session.media_registry_counter = 0
     session.chat_html = ""
+    session.steering_pending = False
+    session.steering_deadline = 0.0
+    session.assistant_thought_active = False
+    session.assistant_action_active = False
     session.queued_job_count = 0
     session.queued_cancel_count = 0
+    session.cancelled_queued_message_ids.clear()
     session.release_vram_callback = None
     session.force_loading_status_once = False
     session.current_turn = None
@@ -483,6 +506,7 @@ def clear_assistant_session(session: AssistantSessionState) -> None:
     session.generated_seconds_total = 0.0
     session.runtime_max_model_len = 0
     session.chat_stats_signature = ""
+    session.remote_usage_stats = None
     session.seen_video_gallery_paths = []
     session.seen_audio_gallery_paths = []
     session.generated_client_ids = []
@@ -535,7 +559,7 @@ def reset_assistant_session_to_base(session: AssistantSessionState, rendered_sys
     return True
 
 
-def begin_assistant_turn(session: AssistantSessionState, user_message_id: str, user_text: str) -> None:
+def begin_assistant_turn(session: AssistantSessionState, user_message_id: str, user_text: str, assistant_badge: str = "") -> None:
     session.current_turn = {
         "user_message_id": str(user_message_id or "").strip(),
         "user_text": str(user_text or "").strip(),
@@ -547,7 +571,9 @@ def begin_assistant_turn(session: AssistantSessionState, user_message_id: str, u
         "rendered_system_prompt_signature": session.rendered_system_prompt_signature,
         "rendered_context_window_tokens": session.rendered_context_window_tokens,
         "assistant_message_id": "",
+        "assistant_badge": str(assistant_badge or "").strip(),
         "interrupt_recorded": False,
+        "interruption_kind": "interrupted",
         "chat_transcript": copy.deepcopy(session.chat_transcript),
         "chat_transcript_counter": int(session.chat_transcript_counter or 0),
     }
@@ -568,24 +594,13 @@ def checkpoint_assistant_turn(session: AssistantSessionState) -> bool:
     return True
 
 
-def _transcript_record_has_visible_content(record: dict[str, Any] | None) -> bool:
-    if not isinstance(record, dict):
-        return False
-    for block in list(record.get("blocks", []) or []):
-        if not isinstance(block, dict):
-            continue
-        block_type = str(block.get("type", "")).strip().lower()
-        if block_type == "tool":
-            return True
-        if len(str(block.get("text", "")).strip()) > 0:
-            return True
-    return any(isinstance(attachment, dict) for attachment in list(record.get("attachments", []) or []))
-
-
-def build_interruption_notice(user_text: str) -> str:
+def build_interruption_notice(user_text: str, interruption_kind: str = "interrupted") -> str:
     collapsed = re.sub(r"\s+", " ", str(user_text or "").strip())
     if len(collapsed) > 280:
         collapsed = collapsed[:277].rstrip() + "..."
+    if str(interruption_kind or "").strip().lower() == "steered":
+        notice = "The previous user request was interrupted by the user before completion. It was interrupted to receive new steering instructions. Treat the next user message as the updated instruction; preserve useful completed results but do not continue superseded work."
+        return notice if len(collapsed) == 0 else f"{notice} Previous request: {collapsed}"
     if len(collapsed) == 0:
         return "The previous user request was interrupted by the user before completion. Do not continue that cancelled turn unless the user explicitly asks to resume it."
     return f"The previous user request was interrupted by the user before completion. Do not continue that cancelled turn unless the user explicitly asks to resume it. Cancelled request: {collapsed}"
@@ -674,7 +689,7 @@ def _summarize_interrupted_committed_messages(messages: list[dict[str, Any]]) ->
                 tool_name = str(payload.get("tool", "") or payload.get("tool_id", "") or "").strip()
                 tool_name = mapped_tool_name or tool_name
                 status = str(payload.get("status", "") or "").strip()
-                identifiers = [f"{key}={payload[key]}" for key in ("job_id", "output_file", "media_id", "gallery_id") if payload.get(key) not in (None, "")]
+                identifiers = [f"{key}={payload[key]}" for key in ("job_id", "output_file", "media_id") if payload.get(key) not in (None, "")]
             if tool_name == "wangp_get_deepy_template_settings" and isinstance(payload.get("settings"), dict):
                 retained_template = {key: payload.get(key) for key in ("tool_id", "template", "general_properties_active") if payload.get(key) is not None}
                 retained_template["settings"] = payload["settings"]
@@ -865,7 +880,8 @@ def rollback_assistant_turn(session: AssistantSessionState, interrupted_badge: s
     checkpoint = session.current_turn
     if not isinstance(checkpoint, dict):
         return False
-    interruption_notice = build_interruption_notice(checkpoint.get("user_text", ""))
+    interruption_kind = str(checkpoint.get("interruption_kind", "interrupted") or "interrupted").strip().lower()
+    interruption_notice = build_interruption_notice(checkpoint.get("user_text", ""), interruption_kind)
     base_len = int(checkpoint.get("messages_len", len(session.messages)))
     target_len = max(base_len, int(checkpoint.get("committed_messages_len", base_len)))
     safe_render_state = {
@@ -904,19 +920,20 @@ def rollback_assistant_turn(session: AssistantSessionState, interrupted_badge: s
         session.rendered_context_window_tokens = int(checkpoint.get("rendered_context_window_tokens", 0) or 0)
         session.pending_replay_reason = "interrupted trailing tool group was incomplete; replay starts from the clean turn boundary"
     assistant_message_id = str(checkpoint.get("assistant_message_id", "") or "").strip()
-    has_visible_assistant_trace = False
+    has_assistant_card = False
     if len(assistant_message_id) > 0:
         assistant_record = assistant_chat._find_message(session, assistant_message_id)
-        if _transcript_record_has_visible_content(assistant_record):
-            has_visible_assistant_trace = True
-            assistant_chat.set_message_badge(session, assistant_message_id, interrupted_badge)
-        else:
-            assistant_chat.remove_message(session, assistant_message_id)
+        if assistant_record is not None:
+            has_assistant_card = True
+            if interruption_kind != "steered":
+                assistant_chat.set_message_end_badge(session, assistant_message_id, interrupted_badge)
     user_message_id = str(checkpoint.get("user_message_id", "") or "").strip()
-    if len(user_message_id) > 0:
-        assistant_chat.set_message_badge(session, user_message_id, interrupted_badge)
-    if not has_visible_assistant_trace and len(user_message_id) == 0:
-        assistant_chat.add_assistant_note(session, interruption_notice, badge=interrupted_badge, author="System")
+    if not has_assistant_card and interruption_kind != "steered":
+        if len(user_message_id) > 0:
+            assistant_chat.set_message_badge(session, user_message_id, interrupted_badge)
+        else:
+            note_id, _note_event = assistant_chat.add_assistant_note(session, interruption_notice, author="System")
+            assistant_chat.set_message_end_badge(session, note_id, interrupted_badge)
     session.interruption_notice = interruption_notice
     record_interruption_history(session, checkpoint.get("user_text", ""), interruption_notice, committed_messages=committed_messages)
     checkpoint["interrupt_recorded"] = True
@@ -927,8 +944,94 @@ def finish_assistant_turn(session: AssistantSessionState) -> None:
     session.current_turn = None
 
 
-def request_assistant_interrupt(session: AssistantSessionState) -> None:
+def request_assistant_interrupt(session: AssistantSessionState, interruption_kind: str = "interrupted") -> None:
+    interruption_kind = str(interruption_kind or "interrupted").strip().lower()
+    if isinstance(session.current_turn, dict):
+        session.current_turn["interruption_kind"] = interruption_kind
+    if interruption_kind != "steered":
+        session.steering_pending = False
+        session.steering_deadline = 0.0
     session.interrupt_requested = True
+
+
+STEERING_THOUGHT_GRACE_SECONDS = 5.0
+
+
+def clear_assistant_steering(session: AssistantSessionState) -> None:
+    session.steering_pending = False
+    session.steering_deadline = 0.0
+    session.assistant_thought_active = False
+    session.assistant_action_active = False
+
+
+def request_assistant_steering(session: AssistantSessionState, now: float | None = None) -> bool:
+    with session.turn_lock:
+        checkpoint = session.current_turn
+        if not isinstance(checkpoint, dict):
+            return False
+        checkpoint["interruption_kind"] = "steered"
+        session.steering_pending = True
+        if session.assistant_action_active:
+            session.steering_deadline = 0.0
+        elif session.assistant_thought_active:
+            session.steering_deadline = (time.monotonic() if now is None else float(now)) + STEERING_THOUGHT_GRACE_SECONDS
+        else:
+            request_assistant_interrupt(session, "steered")
+        return True
+
+
+def begin_assistant_thought(session: AssistantSessionState, now: float | None = None) -> None:
+    with session.turn_lock:
+        session.assistant_thought_active = True
+        if session.steering_pending and session.steering_deadline <= 0.0:
+            session.steering_deadline = (time.monotonic() if now is None else float(now)) + STEERING_THOUGHT_GRACE_SECONDS
+
+
+def finish_assistant_thought(session: AssistantSessionState) -> None:
+    with session.turn_lock:
+        session.assistant_thought_active = False
+
+
+def begin_assistant_action(session: AssistantSessionState) -> bool:
+    with session.turn_lock:
+        if session.interrupt_requested or session.steering_pending:
+            if session.steering_pending and not session.interrupt_requested:
+                request_assistant_interrupt(session, "steered")
+            return False
+        session.assistant_action_active = True
+        return True
+
+
+def finish_assistant_action(session: AssistantSessionState) -> bool:
+    with session.turn_lock:
+        session.assistant_action_active = False
+        if session.steering_pending:
+            request_assistant_interrupt(session, "steered")
+            return True
+        return False
+
+
+def interrupt_assistant_for_steering(session: AssistantSessionState) -> bool:
+    with session.turn_lock:
+        if session.interrupt_requested or not session.steering_pending or session.assistant_action_active:
+            return False
+        request_assistant_interrupt(session, "steered")
+        return True
+
+
+def assistant_steering_interrupt_due(session: AssistantSessionState, now: float | None = None) -> bool:
+    with session.turn_lock:
+        if session.interrupt_requested:
+            return True
+        if not session.steering_pending or session.assistant_action_active:
+            return False
+        current_time = time.monotonic() if now is None else float(now)
+        if session.steering_deadline <= 0.0:
+            session.steering_deadline = current_time + STEERING_THOUGHT_GRACE_SECONDS
+        if current_time < session.steering_deadline:
+            return False
+        request_assistant_interrupt(session, "steered")
+        return True
 
 
 def request_assistant_reset(session: AssistantSessionState) -> None:
@@ -937,6 +1040,7 @@ def request_assistant_reset(session: AssistantSessionState) -> None:
     session.chat_epoch += 1
     session.queued_job_count = 0
     session.queued_cancel_count = 0
+    session.cancelled_queued_message_ids.clear()
 
 
 def set_assistant_tool_ui_settings(session: AssistantSessionState, **kwargs) -> dict[str, Any]:
@@ -1022,8 +1126,17 @@ class DeepyZeroTools:
         self.get_output_filepath = get_output_filepath
         self.record_file_metadata = record_file_metadata
         self.get_server_config = get_server_config
-        self._vision_query_callback: Callable[[dict[str, Any], str], dict[str, Any]] | None = None
+        self._vision_query_callback: Callable[..., dict[str, Any]] | None = None
+        self._vision_is_remote = False
+        self._vision_max_images = deepy_vision.VISION_MAX_IMAGES
         self._tool_progress_callback: Callable[..., None] | None = None
+        from shared.utils.plugins import get_deepy_zero_plugin_tools
+
+        self._plugin_tools = tuple((definition.function, definition.assistant_metadata(), definition.plugin_id) for definition in get_deepy_zero_plugin_tools())
+        built_in_names = {metadata["name"] for attr_name in dir(self) if not attr_name.startswith("_") for metadata in [getattr(getattr(self, attr_name), "_assistant_tool", None)] if metadata is not None}
+        for _function, metadata, plugin_id in self._plugin_tools:
+            if metadata["name"] in built_in_names:
+                raise RuntimeError(f"Deepy Zero plugin '{plugin_id}' cannot replace built-in tool '{metadata['name']}'.")
 
     def _log(self, message: str) -> None:
         if ASSISTANT_DEBUG:
@@ -1058,9 +1171,11 @@ class DeepyZeroTools:
     def _set_status(self, text: str | None, kind: str = "working") -> None:
         self.send_cmd("chat_output", assistant_chat.build_status_event(text, kind=kind, visible=text is not None and len(str(text).strip()) > 0))
 
-    def bind_runtime_tools(self, vision_query_callback: Callable[[dict[str, Any], str], dict[str, Any]] | None = None, tool_progress_callback: Callable[..., None] | None = None) -> None:
+    def bind_runtime_tools(self, vision_query_callback: Callable[..., dict[str, Any]] | None = None, tool_progress_callback: Callable[..., None] | None = None, vision_is_remote: bool = False) -> None:
         self._vision_query_callback = vision_query_callback
         self._tool_progress_callback = tool_progress_callback
+        self._vision_is_remote = bool(vision_is_remote)
+        self._vision_max_images = deepy_vision.VISION_REMOTE_MAX_IMAGES if self._vision_is_remote else deepy_vision.VISION_MAX_IMAGES
 
     def _update_tool_progress(self, status: str | None = None, status_text: str | None = None, result: dict[str, Any] | None = None) -> None:
         if callable(self._tool_progress_callback):
@@ -1149,12 +1264,25 @@ class DeepyZeroTools:
             return template_name
         return f"{template_name}.json"
 
-    def get_tool_transcript_label(self, tool_name: str) -> str:
-        label = self.get_tool_display_name(tool_name)
-        if str(tool_name or "").strip() not in {"gen_image", "edit_image", "gen_video", "gen_song", "gen_speech_from_description", "gen_speech_from_sample", "gen_video_with_speech"}:
-            return label
+    def get_tool_transcript_label(self, tool_name: str, arguments: dict[str, Any] | None = None) -> str:
         template_label = Path(self.get_tool_template_filename(tool_name)).stem.strip()
-        return label if len(template_label) == 0 else f"{label} [{template_label}]"
+        return assistant_chat.build_tool_call_label(tool_name, self.resolve_tool_label_arguments(arguments), base_label=self.get_tool_display_name(tool_name), variant_label=template_label)
+
+    def resolve_tool_label_arguments(self, arguments: dict[str, Any] | None = None) -> dict[str, Any]:
+        self._sync_recent_media()
+
+        def replace_media_id(value: Any) -> Any:
+            if isinstance(value, dict):
+                return {key: replace_media_id(item) for key, item in value.items()}
+            if isinstance(value, list):
+                return [replace_media_id(item) for item in value]
+            if not isinstance(value, str) or self.session is None:
+                return value
+            record = media_registry.get_media_record(self.session, value)
+            media_path = str(record.get("path", "") if record is not None else self._resolve_gallery_media_path(value)).strip()
+            return os.path.basename(media_path) if media_path else value
+
+        return replace_media_id(dict(arguments or {}))
 
     def _parse_generation_resolution(self, resolution: Any) -> tuple[int | None, int | None]:
         width_text, separator, height_text = str(resolution or "").strip().lower().partition("x")
@@ -1936,7 +2064,7 @@ class DeepyZeroTools:
         if callable(self.get_output_filepath):
             resolved = str(self.get_output_filepath(file_path, is_image, audio_only) or "").strip()
             if len(resolved) > 0:
-                return resolved
+                return os.path.abspath(os.path.normpath(resolved))
         return os.path.abspath(os.path.normpath(file_path))
 
     def _record_direct_media(self, output_path: str, settings: dict[str, Any], *, is_image: bool, audio_only: bool, label: str | None = None, persist_metadata: bool = True) -> dict[str, Any] | None:
@@ -1944,6 +2072,14 @@ class DeepyZeroTools:
             raise RuntimeError(f"Output file was not created: {output_path}")
         if not callable(self.record_file_metadata):
             raise RuntimeError("WanGP direct media recording is not available.")
+        path_key, settings_key, selection_key = ("audio_file_list", "audio_file_settings_list", "audio_selected") if audio_only else ("file_list", "file_settings_list", "selected")
+        paths = list(self.gen.get(path_key, []))
+        saved_settings = list(self.gen.get(settings_key, []))
+        keep_count = int(self._server_config().get("clear_file_list", 0))
+        keep_from = max(len(paths) - keep_count, 0) if keep_count > 0 else len(paths)
+        self.gen[path_key] = paths[keep_from:]
+        self.gen[settings_key] = saved_settings[keep_from:]
+        self.gen[selection_key] = max(int(self.gen.get(selection_key, 0)) - keep_from, 0)
         self.record_file_metadata(output_path, settings if persist_metadata else None, is_image, audio_only, self.gen)
         self.send_cmd("refresh_gallery", {"path": output_path})
         return self._register_tool_media(output_path, settings, label=label)
@@ -1959,7 +2095,19 @@ class DeepyZeroTools:
     def _tool_enabled(self, metadata: dict[str, Any]) -> bool:
         return not metadata.get("requires_file_system", False) or self._file_system_read_enabled()
 
-    def _resolve_gallery_id_path(self, value: str) -> str:
+    def _iter_tools(self):
+        for attr_name in dir(self):
+            if attr_name.startswith("_"):
+                continue
+            method = getattr(self, attr_name)
+            metadata = getattr(method, "_assistant_tool", None)
+            if metadata is not None and self._tool_enabled(metadata):
+                yield method, metadata
+        for method, metadata, _plugin_id in self._plugin_tools:
+            if self._tool_enabled(metadata):
+                yield method, metadata
+
+    def _resolve_gallery_media_path(self, value: str) -> str:
         lookup = str(value or "").strip().lower()
         if not lookup.startswith(("visual:", "audio:")):
             return ""
@@ -1978,7 +2126,7 @@ class DeepyZeroTools:
         record = None if self.session is None else media_registry.get_media_record(self.session, lookup)
         if record is not None or self.session is None:
             return record
-        gallery_path = self._resolve_gallery_id_path(lookup)
+        gallery_path = self._resolve_gallery_media_path(lookup)
         if gallery_path:
             return media_registry.register_media(self.session, gallery_path, source="gallery")
         candidate = Path(lookup).expanduser()
@@ -2381,17 +2529,22 @@ class DeepyZeroTools:
 
     @assistant_tool(
         display_name="Get Loras",
-        description="List the available LoRA filenames for one of Deepy's generation tools.",
+        description="Recursively list available LoRA identifiers for one of Deepy's generation tools. Returned subfolder-relative identifiers can be passed directly to that generation tool.",
         parameters={
             "tool_id": {
                 "type": "string",
                 "description": "Generation tool id returned by the tool schema.",
                 "enum": list(deepy_tool_settings.GENERATION_TOOL_IDS),
             },
+            "name": {
+                "type": "string",
+                "description": "Optional case-insensitive * and ? glob over each subfolder-relative LoRA identifier.",
+                "required": False,
+            },
         },
         pause_runtime=False,
     )
-    def get_loras(self, tool_id: str) -> dict[str, Any]:
+    def get_loras(self, tool_id: str, name: str | None = None) -> dict[str, Any]:
         lookup_name = str(tool_id or "").strip()
         if lookup_name not in deepy_tool_settings.GENERATION_TOOL_IDS:
             return {
@@ -2404,7 +2557,7 @@ class DeepyZeroTools:
         generator_variant = self.get_tool_variant(lookup_name)
         template_file = self.get_tool_template_filename(lookup_name)
         try:
-            loras = deepy_tool_settings.list_tool_loras(lookup_name, generator_variant)
+            loras = deepy_tool_settings.list_tool_loras(lookup_name, generator_variant, name=name)
         except Exception as exc:
             return {
                 "status": "error",
@@ -2483,6 +2636,29 @@ class DeepyZeroTools:
         else:
             return None, {"status": "error", "media_id": source_media["media_id"], "process": process_id, "error": f"Unsupported post-processing type: {process_type}."}
 
+        parameter_defs = {str(parameter["name"]): parameter for parameter in process.get("parameters", ())}
+        spatial_parameter_names = set()
+        if process_type == postprocessing_catalog.PROCESS_TYPE_SPATIAL_UPSAMPLING:
+            spatial_parameters = {}
+            for name, value in parameters.items():
+                if name == "multiplier":
+                    continue
+                parameter_def = parameter_defs[name]
+                if parameter_def.get("media_type") == "image":
+                    media_ids = value if isinstance(value, list) else [value]
+                    paths = []
+                    for media_id in media_ids:
+                        media_record, error_result = self._resolve_image_media(media_id, name)
+                        if error_result is not None:
+                            error_result.update({"process": process_id})
+                            return None, error_result
+                        if media_record is not None:
+                            paths.append(str(media_record["path"]))
+                    value = paths if isinstance(value, list) else (paths[0] if paths else None)
+                spatial_parameters[name] = value
+                spatial_parameter_names.add(name)
+            task.update(spatial_parameters)
+
         media_parameters = {
             "audio_media_id": "audio_source",
             "voice_sample_media_id": "replace_voice_sample",
@@ -2496,8 +2672,7 @@ class DeepyZeroTools:
                 error_result.update({"process": process_id})
                 return None, error_result
             task[task_key] = str(media_record["path"])
-        standard_parameters = {"multiplier", "seed", "prompt", "negative_prompt", *media_parameters}
-        parameter_defs = {str(parameter["name"]): parameter for parameter in process.get("parameters", ())}
+        standard_parameters = {"multiplier", "seed", "prompt", "negative_prompt", *media_parameters, *spatial_parameter_names}
         for name, value in parameters.items():
             if name not in standard_parameters:
                 task[str(parameter_defs[name].get("setting", name))] = value
@@ -2535,25 +2710,26 @@ class DeepyZeroTools:
         if media_type not in {"image", "video", "audio"}:
             return {"status": "error", "media_id": str(source_media["media_id"]), "media_type": media_type, "error": "The gallery media file extension is not supported for post-processing."}
         available_processes = postprocessing_catalog.query_processes(media_type)
+        discovered_processes = postprocessing_catalog.call_processes(available_processes)
         process_id = str(process or "").strip()
         if not process_id:
             return {
                 "status": "discovery",
                 "media_id": str(source_media["media_id"]),
                 "media_type": media_type,
-                "processes": available_processes,
-                "count": len(available_processes),
+                "processes": discovered_processes,
+                "count": len(discovered_processes),
                 "error": "",
             }
         matches = [candidate for candidate in available_processes if candidate["id"] == process_id]
         if not matches:
-            return {"status": "error", "media_id": str(source_media["media_id"]), "media_type": media_type, "process": process_id, "processes": available_processes, "error": "The requested process is not available for this media."}
+            return {"status": "error", "media_id": str(source_media["media_id"]), "media_type": media_type, "process": process_id, "processes": discovered_processes, "error": "The requested process is not available for this media."}
         if len(matches) > 1:
             return {"status": "error", "media_id": str(source_media["media_id"]), "media_type": media_type, "process": process_id, "error": "The requested process id is ambiguous for this media."}
         process_def = matches[0]
         normalized_parameters, error = postprocessing_catalog.normalize_parameters(process_def, parameters)
         if error:
-            return {"status": "error", "media_id": str(source_media["media_id"]), "media_type": media_type, "process": process_id, "expected_parameters": process_def["parameters"], "error": error}
+            return {"status": "error", "media_id": str(source_media["media_id"]), "media_type": media_type, "process": process_id, "expected_parameters": postprocessing_catalog.call_parameters(process_def["parameters"]), "error": error}
         task, error_result = self._build_postprocessing_task(source_media, process_def, normalized_parameters)
         if error_result is not None:
             return error_result
@@ -3267,7 +3443,7 @@ class DeepyZeroTools:
 
     @assistant_tool(
         display_name="Extract Image",
-        description="Extract one image from a previously resolved video at a specific frame number or exact playback time and add it to WanGP galleries.",
+        description="Save one video frame as a Gallery image at a specific frame number or playback time. For visual analysis alone, use Inspect Media without extracting it.",
         parameters={
             "media_id": {
                 "type": "string",
@@ -3312,7 +3488,7 @@ class DeepyZeroTools:
         output_name = f"{source_name}_{output_suffix}.png"
         output_path = self._resolve_direct_output_path(output_name, True, False)
         try:
-            deepy_video_tools.extract_video_frame(source_path, output_path, frame_no=frame_no, time_seconds=time_seconds)
+            output_path = deepy_video_tools.extract_video_frame(source_path, output_path, frame_no=frame_no, time_seconds=time_seconds)
         except Exception as exc:
             result = {
                 "status": "error",
@@ -4409,66 +4585,267 @@ class DeepyZeroTools:
 
     @assistant_tool(
         display_name="Inspect Media",
-        description="Ask Deepy to inspect a previously resolved image or a frame from a previously resolved video and answer a visual question about it.",
+        description="Directly inspect or compare multiple images and/or explicitly selected video frames in one call; video frames do not need to be extracted first.",
         parameters={
             "media_id": {
                 "type": "string",
-                "description": "The media id returned by Resolve Media.",
+                "description": "One media id returned by Resolve Media. Use exactly one of media_id, media_ids, or media_inputs.",
+                "required": False,
+            },
+            "media_ids": {
+                "type": "array",
+                "items": {"type": "string"},
+                "minItems": 1,
+                "maxItems": 5,
+                "description": "Ordered media ids to inspect together. Videos use frame_no, or frame 0 when it is omitted. Use exactly one of media_id, media_ids, or media_inputs.",
+                "required": False,
+            },
+            "media_inputs": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "media_id": {"type": "string", "description": "A media id returned by Resolve Media."},
+                        "frame_no": {"type": "integer", "minimum": 0, "description": "Optional video frame number. If omitted for a video, frame 0 is used."},
+                        "time_seconds": {"type": "number", "minimum": 0, "description": "Optional exact video time in seconds. Do not combine it with frame_no."},
+                    },
+                    "required": ["media_id"],
+                },
+                "minItems": 1,
+                "maxItems": 5,
+                "description": "Ordered visual inputs. Repeat the same video media_id with different frame_no or time_seconds values to inspect multiple frames jointly. Images omit both selectors. Use exactly one of media_id, media_ids, or media_inputs.",
+                "required": False,
             },
             "question": {
                 "type": "string",
-                "description": "The visual question to answer about that media item.",
+                "description": "The visual question to answer about the supplied media.",
             },
             "frame_no": {
                 "type": "integer",
-                "description": "Optional frame number to inspect when media_id refers to a video. If omitted, the first frame is used.",
+                "description": "Optional frame number to inspect for every video supplied through media_id or media_ids. If omitted, frame 0 is used. Do not use it with media_inputs.",
                 "required": False,
             },
         },
-        pause_runtime=True,
+        pause_runtime=False,
         pause_reason="vision",
     )
-    def inspect_media(self, media_id: str, question: str, frame_no: int | None = None) -> dict[str, Any]:
+    def inspect_media(self, media_id: str | None = None, question: str = "", frame_no: int | None = None, media_ids: list[str] | None = None, media_inputs: list[dict[str, Any]] | None = None) -> dict[str, Any]:
         self._sync_recent_media()
+        single_media_id = str(media_id or "").strip()
+        question = str(question or "").strip()
+        if len(question) == 0:
+            return {"status": "error", "media_id": single_media_id, "media_ids": [], "media_inputs": [], "question": "", "answer": "", "error": "question is required."}
+        if media_ids is not None and not isinstance(media_ids, list):
+            return {"status": "error", "media_id": single_media_id, "media_ids": [], "media_inputs": [], "question": question, "answer": "", "error": "media_ids must be an array."}
+        if media_inputs is not None and not isinstance(media_inputs, list):
+            return {"status": "error", "media_id": single_media_id, "media_ids": [], "media_inputs": [], "question": question, "answer": "", "error": "media_inputs must be an array."}
+        source_count = int(bool(single_media_id)) + int(media_ids is not None) + int(media_inputs is not None)
+        if source_count > 1:
+            return {"status": "error", "media_id": single_media_id, "media_ids": list(media_ids or []), "media_inputs": list(media_inputs or []), "question": question, "answer": "", "error": "Use exactly one of media_id, media_ids, or media_inputs."}
         try:
             frame_no = None if frame_no is None or str(frame_no).strip() == "" else int(frame_no)
         except Exception:
-            return {"status": "error", "media_id": str(media_id or "").strip(), "question": str(question or "").strip(), "answer": "", "error": "frame_no must be an integer."}
-        self._update_tool_progress("running", "Inspecting", {"status": "running", "media_id": str(media_id or "").strip(), "question": str(question or "").strip(), "frame_no": frame_no})
+            return {"status": "error", "media_id": single_media_id, "media_ids": list(media_ids or []), "media_inputs": list(media_inputs or []), "question": question, "answer": "", "error": "frame_no must be an integer."}
+        if media_inputs is not None and frame_no is not None:
+            return {"status": "error", "media_id": single_media_id, "media_ids": [], "media_inputs": media_inputs, "question": question, "answer": "", "error": "Do not combine frame_no with media_inputs; put frame_no inside each video input."}
+        raw_inputs = list(media_inputs or []) if media_inputs is not None else [{"media_id": value, "frame_no": frame_no} for value in ([single_media_id] if single_media_id else list(media_ids or []))]
+        if not 1 <= len(raw_inputs) <= self._vision_max_images:
+            return {"status": "error", "media_id": single_media_id, "media_ids": [], "media_inputs": raw_inputs, "question": question, "answer": "", "error": f"Provide between 1 and {self._vision_max_images} visual inputs."}
+        requested_inputs = []
+        for index, raw_input in enumerate(raw_inputs):
+            if not isinstance(raw_input, dict):
+                return {"status": "error", "media_id": single_media_id, "media_ids": [], "media_inputs": raw_inputs, "question": question, "answer": "", "error": f"media_inputs[{index}] must be an object."}
+            unknown_keys = set(raw_input) - {"media_id", "frame_no", "time_seconds"}
+            if unknown_keys:
+                return {"status": "error", "media_id": single_media_id, "media_ids": [], "media_inputs": raw_inputs, "question": question, "answer": "", "error": f"Unsupported media_inputs[{index}] field: {sorted(unknown_keys)[0]}."}
+            requested_media_id = raw_input.get("media_id", "")
+            if not isinstance(requested_media_id, str) or len(requested_media_id.strip()) == 0:
+                return {"status": "error", "media_id": single_media_id, "media_ids": [], "media_inputs": raw_inputs, "question": question, "answer": "", "error": f"media_inputs[{index}].media_id must be a non-empty string."}
+            input_frame_no = raw_input.get("frame_no", None)
+            input_time_seconds = raw_input.get("time_seconds", None)
+            try:
+                input_frame_no = None if input_frame_no is None or str(input_frame_no).strip() == "" else int(input_frame_no)
+            except Exception:
+                return {"status": "error", "media_id": single_media_id, "media_ids": [], "media_inputs": raw_inputs, "question": question, "answer": "", "error": f"media_inputs[{index}].frame_no must be an integer."}
+            try:
+                input_time_seconds = None if input_time_seconds is None or str(input_time_seconds).strip() == "" else float(input_time_seconds)
+            except Exception:
+                return {"status": "error", "media_id": single_media_id, "media_ids": [], "media_inputs": raw_inputs, "question": question, "answer": "", "error": f"media_inputs[{index}].time_seconds must be a number."}
+            if input_frame_no is not None and input_time_seconds is not None:
+                return {"status": "error", "media_id": single_media_id, "media_ids": [], "media_inputs": raw_inputs, "question": question, "answer": "", "error": f"media_inputs[{index}] cannot combine frame_no and time_seconds."}
+            if input_frame_no is not None and input_frame_no < 0:
+                return {"status": "error", "media_id": single_media_id, "media_ids": [], "media_inputs": raw_inputs, "question": question, "answer": "", "error": f"media_inputs[{index}].frame_no must be non-negative."}
+            if input_time_seconds is not None and (not math.isfinite(input_time_seconds) or input_time_seconds < 0):
+                return {"status": "error", "media_id": single_media_id, "media_ids": [], "media_inputs": raw_inputs, "question": question, "answer": "", "error": f"media_inputs[{index}].time_seconds must be a finite non-negative number."}
+            requested_inputs.append({"media_id": requested_media_id.strip(), "frame_no": input_frame_no, "time_seconds": input_time_seconds})
+        requested_media_ids = [item["media_id"] for item in requested_inputs]
+        progress_inputs = [{key: value for key, value in item.items() if value is not None} for item in requested_inputs]
+        self._update_tool_progress("running", "Inspecting", {"status": "running", "media_id": single_media_id, "media_ids": requested_media_ids, "media_inputs": progress_inputs, "question": question, "frame_no": frame_no})
         if self.session is None:
-            return {"status": "error", "media_id": str(media_id or "").strip(), "question": str(question or "").strip(), "answer": "", "error": "Assistant session is not available."}
-        media_record = self._resolve_media_record_input(media_id)
-        if media_record is None:
-            return {"status": "error", "media_id": str(media_id or "").strip(), "question": str(question or "").strip(), "answer": "", "error": "Unknown media id."}
-        if media_record.get("media_type") not in {"image", "video"}:
-            return {
-                "status": "error",
-                "media_id": media_record.get("media_id", ""),
-                "media_type": media_record.get("media_type", ""),
-                "question": str(question or "").strip(),
-                "answer": "",
-                "error": "Visual inspection currently supports images and videos.",
-            }
+            return {"status": "error", "media_id": single_media_id, "media_ids": requested_media_ids, "media_inputs": progress_inputs, "question": question, "answer": "", "error": "Assistant session is not available."}
+        media_records = []
+        for index, requested_input in enumerate(requested_inputs):
+            requested_media_id = requested_input["media_id"]
+            media_record = self._resolve_media_record_input(requested_media_id)
+            if media_record is None:
+                return {"status": "error", "media_id": requested_media_id, "media_ids": requested_media_ids, "media_inputs": progress_inputs, "question": question, "answer": "", "error": f"Unknown media id: {requested_media_id}."}
+            if media_record.get("media_type") not in {"image", "video"}:
+                return {"status": "error", "media_id": media_record.get("media_id", ""), "media_ids": requested_media_ids, "media_inputs": progress_inputs, "media_type": media_record.get("media_type", ""), "question": question, "answer": "", "error": "Visual inspection currently supports images and videos."}
+            if media_inputs is not None and media_record.get("media_type") == "image" and (requested_input["frame_no"] is not None or requested_input["time_seconds"] is not None):
+                return {"status": "error", "media_id": media_record.get("media_id", ""), "media_ids": requested_media_ids, "media_inputs": progress_inputs, "media_type": "image", "question": question, "answer": "", "error": f"media_inputs[{index}] is an image and cannot specify frame_no or time_seconds."}
+            inspection_record = dict(media_record)
+            inspection_record["frame_no"] = (requested_input["frame_no"] if requested_input["frame_no"] is not None or requested_input["time_seconds"] is not None else 0) if media_record.get("media_type") == "video" else None
+            inspection_record["time_seconds"] = requested_input["time_seconds"] if media_record.get("media_type") == "video" else None
+            media_records.append(inspection_record)
         if self._vision_query_callback is None:
             return {
                 "status": "error",
-                "media_id": media_record.get("media_id", ""),
-                "media_type": media_record.get("media_type", ""),
-                "question": str(question or "").strip(),
+                "media_id": single_media_id,
+                "media_ids": requested_media_ids,
+                "media_inputs": progress_inputs,
+                "question": question,
                 "answer": "",
                 "error": "Deepy vision inspection is not available.",
             }
-        return self._vision_query_callback(media_record, question, frame_no)
+        return self._vision_query_callback(media_records[0] if len(media_records) == 1 else media_records, question, frame_no if media_inputs is None else None)
+
+    @assistant_tool(
+        display_name="Inspect Video",
+        description="Inspect a video across a time range using automatically selected, evenly spaced frames. Use this instead of manually extracting or listing frames.",
+        parameters={
+            "media_id": {
+                "type": "string",
+                "description": "One video media id returned by Resolve Media.",
+            },
+            "start_time_seconds": {
+                "type": "number",
+                "minimum": 0,
+                "description": "Start of the inspected time range in seconds.",
+            },
+            "end_time_seconds": {
+                "type": "number",
+                "exclusiveMinimum": 0,
+                "description": "End of the inspected time range in seconds. It must be after start_time_seconds.",
+            },
+            "question": {
+                "type": "string",
+                "description": "The visual question to answer about the video over this range.",
+            },
+            "mid_res_sampling": {
+                "type": "boolean",
+                "description": "Optional mid-resolution mode that uses one-quarter as many frames fitted within 512x512 instead of 256x256.",
+                "required": False,
+            },
+            "min_frames_between_samples": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Optional minimum number of source-video frames between samples. It can only reduce the sample count and never exceeds the tool maximum. Do not combine with min_seconds_between_samples.",
+                "required": False,
+            },
+            "min_seconds_between_samples": {
+                "type": "number",
+                "exclusiveMinimum": 0,
+                "description": "Optional minimum seconds between samples. It can only reduce the sample count and never exceeds the tool maximum. Do not combine with min_frames_between_samples.",
+                "required": False,
+            },
+        },
+        pause_runtime=False,
+        pause_reason="vision",
+    )
+    def inspect_video(self, media_id: str, start_time_seconds: float, end_time_seconds: float, question: str, mid_res_sampling: bool = False, min_frames_between_samples: int | None = None, min_seconds_between_samples: float | None = None) -> dict[str, Any]:
+        self._sync_recent_media()
+        requested_media_id = str(media_id or "").strip()
+        question = str(question or "").strip()
+        if not requested_media_id:
+            return {"status": "error", "media_id": "", "question": question, "answer": "", "error": "media_id is required."}
+        if not question:
+            return {"status": "error", "media_id": requested_media_id, "question": "", "answer": "", "error": "question is required."}
+        if not isinstance(mid_res_sampling, bool):
+            return {"status": "error", "media_id": requested_media_id, "question": question, "answer": "", "error": "mid_res_sampling must be a boolean."}
+        if min_frames_between_samples is not None and min_seconds_between_samples is not None:
+            return {"status": "error", "media_id": requested_media_id, "question": question, "answer": "", "error": "Use either min_frames_between_samples or min_seconds_between_samples, not both."}
+        if min_frames_between_samples is not None:
+            try:
+                parsed_min_frames = int(min_frames_between_samples)
+                if isinstance(min_frames_between_samples, bool) or float(min_frames_between_samples) != parsed_min_frames or parsed_min_frames < 1:
+                    raise ValueError
+                min_frames_between_samples = parsed_min_frames
+            except Exception:
+                return {"status": "error", "media_id": requested_media_id, "question": question, "answer": "", "error": "min_frames_between_samples must be an integer greater than zero."}
+        if min_seconds_between_samples is not None:
+            try:
+                min_seconds_between_samples = float(min_seconds_between_samples)
+            except Exception:
+                min_seconds_between_samples = float("nan")
+            if not math.isfinite(min_seconds_between_samples) or min_seconds_between_samples <= 0:
+                return {"status": "error", "media_id": requested_media_id, "question": question, "answer": "", "error": "min_seconds_between_samples must be a finite number greater than zero."}
+        try:
+            start_time_seconds = float(start_time_seconds)
+            end_time_seconds = float(end_time_seconds)
+        except Exception:
+            return {"status": "error", "media_id": requested_media_id, "question": question, "answer": "", "error": "start_time_seconds and end_time_seconds must be numbers."}
+        if not math.isfinite(start_time_seconds) or start_time_seconds < 0:
+            return {"status": "error", "media_id": requested_media_id, "question": question, "answer": "", "error": "start_time_seconds must be a finite non-negative number."}
+        if not math.isfinite(end_time_seconds) or end_time_seconds <= start_time_seconds:
+            return {"status": "error", "media_id": requested_media_id, "question": question, "answer": "", "error": "end_time_seconds must be finite and greater than start_time_seconds."}
+        if self.session is None:
+            return {"status": "error", "media_id": requested_media_id, "question": question, "answer": "", "error": "Assistant session is not available."}
+        media_record = self._resolve_media_record_input(requested_media_id)
+        if media_record is None:
+            return {"status": "error", "media_id": requested_media_id, "question": question, "answer": "", "error": f"Unknown media id: {requested_media_id}."}
+        if media_record.get("media_type") != "video":
+            return {"status": "error", "media_id": media_record.get("media_id", ""), "media_type": media_record.get("media_type", ""), "question": question, "answer": "", "error": "Inspect Video requires a video."}
+        if self._vision_query_callback is None:
+            return {"status": "error", "media_id": media_record.get("media_id", ""), "question": question, "answer": "", "error": "Deepy vision inspection is not available."}
+        media_path = str(media_record.get("path", "") or "").strip()
+        fps, _width, _height, frame_count = get_video_info(media_path)
+        precise_fps = deepy_video_tools.get_precise_video_fps(media_path)
+        effective_fps = float(precise_fps) if precise_fps is not None and precise_fps > 0 else float(fps)
+        if effective_fps <= 0 or int(frame_count) <= 0:
+            return {"status": "error", "media_id": media_record.get("media_id", ""), "question": question, "answer": "", "error": "Could not determine the video frame rate or frame count."}
+        duration_seconds = int(frame_count) / effective_fps
+        if start_time_seconds >= duration_seconds:
+            return {"status": "error", "media_id": media_record.get("media_id", ""), "question": question, "answer": "", "error": f"start_time_seconds must be before the video duration ({duration_seconds:.3f} seconds)."}
+        sampled_end_seconds = min(end_time_seconds, duration_seconds)
+        start_frame = deepy_video_tools.resolve_video_frame_no(media_path, time_seconds=start_time_seconds)
+        end_frame = deepy_video_tools.resolve_video_frame_no(media_path, time_seconds=sampled_end_seconds)
+        target_count = deepy_vision.video_inspection_sample_count(remote=self._vision_is_remote, mid_res_sampling=mid_res_sampling)
+        frame_span = end_frame - start_frame
+        min_frame_gap = min_frames_between_samples or (max(1, math.ceil(min_seconds_between_samples * effective_fps - 1e-9)) if min_seconds_between_samples is not None else 1)
+        rate_limited_count = max(1, math.ceil((sampled_end_seconds - start_time_seconds) * deepy_vision.VISION_VIDEO_MAX_SAMPLES_PER_SECOND - 1e-9))
+        sample_count = min(target_count, rate_limited_count, frame_span // min_frame_gap + 1)
+        frame_indices = [start_frame] if sample_count == 1 else [round(start_frame + (end_frame - start_frame) * index / (sample_count - 1)) for index in range(sample_count)]
+        max_image_edge = deepy_vision.VISION_VIDEO_MID_RES_MAX_IMAGE_EDGE if mid_res_sampling else deepy_vision.VISION_VIDEO_MAX_IMAGE_EDGE
+        inspection_records = []
+        for frame_index in frame_indices:
+            inspection_record = dict(media_record)
+            inspection_record["frame_no"] = int(frame_index)
+            inspection_record["time_seconds"] = float(frame_index) / effective_fps
+            inspection_records.append(inspection_record)
+        progress = {
+            "status": "running", "media_id": media_record.get("media_id", ""), "question": question,
+            "start_time_seconds": start_time_seconds, "end_time_seconds": sampled_end_seconds, "sample_count": sample_count,
+            "max_image_edge": max_image_edge, "mid_res_sampling": mid_res_sampling,
+            "min_frames_between_samples": min_frames_between_samples, "min_seconds_between_samples": min_seconds_between_samples,
+        }
+        self._update_tool_progress("running", f"Inspecting {sample_count} video frames", progress)
+        result = self._vision_query_callback(inspection_records, question, None, max_image_edge)
+        if isinstance(result, dict):
+            result.pop("media", None)
+            result.pop("media_ids", None)
+            result.update({
+                "media_id": media_record.get("media_id", ""), "start_frame_no": start_frame, "end_frame_no": end_frame,
+                "start_time_seconds": start_time_seconds, "end_time_seconds": sampled_end_seconds,
+                "requested_end_time_seconds": end_time_seconds, "sample_count": sample_count,
+                "max_image_edge": max_image_edge, "mid_res_sampling": mid_res_sampling,
+                "min_frames_between_samples": min_frames_between_samples, "min_seconds_between_samples": min_seconds_between_samples,
+            })
+        return result
 
     def get_tool_schemas(self) -> list[dict[str, Any]]:
         schemas = []
-        for attr_name in dir(self):
-            if attr_name.startswith("_"):
-                continue
-            method = getattr(self, attr_name)
-            metadata = getattr(method, "_assistant_tool", None)
-            if metadata is None or not self._tool_enabled(metadata):
-                continue
+        for method, metadata in self._iter_tools():
             properties = {}
             required = []
             annotations = getattr(method, "__annotations__", {})
@@ -4476,14 +4853,28 @@ class DeepyZeroTools:
                 properties[param_name] = _build_tool_parameter_schema(annotations, param_name, param_meta)
                 if self._file_system_read_enabled() and properties[param_name].get("type") == "string" and "media id" in properties[param_name].get("description", "").casefold():
                     properties[param_name]["description"] += " An existing media file path with an extension is also accepted."
+                if self._file_system_read_enabled() and param_name == "media_inputs":
+                    properties[param_name]["items"]["properties"]["media_id"]["description"] += " An existing media file path with an extension is also accepted."
                 if bool(param_meta.get("required", True)):
                     required.append(param_name)
+            description = metadata["description"]
+            if metadata["name"] == "inspect_media":
+                properties["media_ids"]["maxItems"] = self._vision_max_images
+                properties["media_inputs"]["maxItems"] = self._vision_max_images
+                properties["media_ids"]["description"] = f"One to {self._vision_max_images} ordered media ids to inspect together. Videos use frame_no, or frame 0 when it is omitted. Use exactly one of media_id, media_ids, or media_inputs."
+                properties["media_inputs"]["description"] = f"One to {self._vision_max_images} ordered visual inputs. Repeat a video media_id with different frame_no or time_seconds values to inspect selected frames jointly. Images omit both selectors."
+                description = f"Directly inspect or compare up to {self._vision_max_images} images and/or explicitly selected video frames in one call."
+            elif metadata["name"] == "inspect_video":
+                high_count = deepy_vision.video_inspection_sample_count(remote=self._vision_is_remote, mid_res_sampling=False)
+                mid_count = deepy_vision.video_inspection_sample_count(remote=self._vision_is_remote, mid_res_sampling=True)
+                properties["mid_res_sampling"]["description"] = f"When true, sample up to {mid_count} frames fitted within 512x512 instead of the default up to {high_count} frames fitted within 256x256."
+                description = f"Inspect a video time range with up to {high_count} automatically selected frames fitted within 256x256, capped at two samples per second, or up to {mid_count} frames fitted within 512x512 when mid_res_sampling is true."
             schemas.append(
                 {
                     "type": "function",
                     "function": {
                         "name": metadata["name"],
-                        "description": metadata["description"],
+                        "description": description,
                         "parameters": {
                             "type": "object",
                             "properties": properties,
@@ -4496,24 +4887,16 @@ class DeepyZeroTools:
 
     def get_tool_display_name(self, tool_name: str) -> str:
         lookup_name = str(tool_name or "").strip()
-        for attr_name in dir(self):
-            if attr_name.startswith("_"):
-                continue
-            method = getattr(self, attr_name)
-            metadata = getattr(method, "_assistant_tool", None)
-            if metadata is None or not self._tool_enabled(metadata) or metadata["name"] != lookup_name:
+        for _method, metadata in self._iter_tools():
+            if metadata["name"] != lookup_name:
                 continue
             return str(metadata.get("display_name", lookup_name)).strip() or lookup_name
         return lookup_name.replace("_", " ").replace("-", " ").strip().title() or "Tool"
 
-    def get_tool_policy(self, tool_name: str) -> dict[str, Any]:
+    def get_tool_policy(self, tool_name: str, arguments: dict[str, Any] | None = None) -> dict[str, Any]:
         lookup_name = str(tool_name or "").strip()
-        for attr_name in dir(self):
-            if attr_name.startswith("_"):
-                continue
-            method = getattr(self, attr_name)
-            metadata = getattr(method, "_assistant_tool", None)
-            if metadata is None or not self._tool_enabled(metadata) or metadata["name"] != lookup_name:
+        for _method, metadata in self._iter_tools():
+            if metadata["name"] != lookup_name:
                 continue
             return {
                 "pause_runtime": bool(metadata.get("pause_runtime", True)),
@@ -4524,12 +4907,8 @@ class DeepyZeroTools:
     def validate_tool_call(self, tool_name: str, arguments: dict[str, Any]) -> str:
         lookup_name = str(tool_name or "").strip()
         call_args = dict(arguments or {})
-        for attr_name in dir(self):
-            if attr_name.startswith("_"):
-                continue
-            method = getattr(self, attr_name)
-            metadata = getattr(method, "_assistant_tool", None)
-            if metadata is None or not self._tool_enabled(metadata) or metadata["name"] != lookup_name:
+        for _method, metadata in self._iter_tools():
+            if metadata["name"] != lookup_name:
                 continue
             for param_name, param_meta in metadata["parameters"].items():
                 if not bool(param_meta.get("required", True)):
@@ -4594,13 +4973,7 @@ class DeepyZeroTools:
         return []
 
     def call(self, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-        for attr_name in dir(self):
-            if attr_name.startswith("_"):
-                continue
-            method = getattr(self, attr_name)
-            metadata = getattr(method, "_assistant_tool", None)
-            if metadata is None or not self._tool_enabled(metadata):
-                continue
+        for method, metadata in self._iter_tools():
             if metadata["name"] != tool_name:
                 continue
             return method(**dict(arguments or {}))
@@ -4643,7 +5016,7 @@ class AssistantEngine:
         self._runtime_debug_signature = ""
         bind_runtime_tools = getattr(self.tool_box, "bind_runtime_tools", None)
         if callable(bind_runtime_tools):
-            bind_runtime_tools(vision_query_callback=self._run_visual_query, tool_progress_callback=self._handle_tool_progress)
+            bind_runtime_tools(vision_query_callback=self._run_visual_query, tool_progress_callback=self._handle_tool_progress, vision_is_remote=False)
 
     def _log(self, message: str) -> None:
         if self.debug_enabled:
@@ -5323,6 +5696,9 @@ class AssistantEngine:
                 self._active_turn_id = existing_turn_id
             else:
                 self._active_turn_id = assistant_chat.create_assistant_turn(self.session)
+                assistant_badge = str(checkpoint.get("assistant_badge", "") or "").strip() if isinstance(checkpoint, dict) else ""
+                if assistant_badge:
+                    assistant_chat.set_message_badge(self.session, self._active_turn_id, assistant_badge)
                 mark_assistant_turn_message(self.session, self._active_turn_id)
         return self._active_turn_id
 
@@ -5354,7 +5730,6 @@ class AssistantEngine:
         return normalized_raw != normalized_thinking
 
     def _start_stream_pass(self) -> None:
-        turn_id = self._ensure_active_turn()
         preserve_existing = bool(self._resume_stream_after_context_trim)
         self._resume_stream_after_context_trim = False
         thinking_stream_enabled = self.runtime is not None and qwen35_text._prompt_enhancer_thinking_enabled(self.runtime.model, thinking_enabled=self.thinking_enabled)
@@ -5385,6 +5760,18 @@ class AssistantEngine:
             return thinking_text, qwen35_text._clean_answer_text(_strip_partial_tool_markup(answer_text))
         if self._stream_thinking_open and close_idx < 0:
             return qwen35_text._normalize_generated_text(text.replace("<think>", "\n")), ""
+        close_matches = list(re.finditer(r"</think>", text, flags=re.IGNORECASE))
+        if self._stream_thinking_open and close_matches and len(text[: close_matches[0].start()].strip()) == 0:
+            if len(close_matches) == 1 and not is_final:
+                self._stream_thinking_unknown = True
+                return "", ""
+            self._stream_thinking_unknown = False
+            self._stream_thinking_open = False
+            if len(close_matches) >= 2:
+                thinking_text = qwen35_text._normalize_generated_text(text[close_matches[0].end() : close_matches[-1].start()].replace("<think>", "\n"))
+                answer_text = text[close_matches[-1].end() :]
+                return thinking_text, qwen35_text._clean_answer_text(_strip_partial_tool_markup(answer_text))
+            return "", qwen35_text._clean_answer_text(_strip_partial_tool_markup(text[close_matches[0].end() :]))
         if close_idx >= 0:
             self._stream_thinking_unknown = False
             self._stream_thinking_open = False
@@ -5406,7 +5793,6 @@ class AssistantEngine:
         return len(trailing_text) == 0 or trailing_text.lower().startswith("<tool_call>")
 
     def _stream_generation_update(self, *, raw_text: str, token_count: int, stop_reason: str | None, is_final: bool) -> None:
-        turn_id = self._ensure_active_turn()
         self._segment_generated_tokens = max(int(self._segment_generated_tokens or 0), max(0, int(token_count or 0)))
         if self._suppress_intermediate_stream_after_context_trim and not is_final:
             self._emit_stats()
@@ -5427,6 +5813,13 @@ class AssistantEngine:
             thinking_text = self._stream_reasoning_text
         if not is_final and len(answer_text) < len(self._stream_answer_text):
             answer_text = self._stream_answer_text
+        needs_output = (reclaimed_answer_as_reasoning and len(self._stream_answer_text) > 0) or (thinking_text != self._stream_reasoning_text and len(thinking_text) > 0) or (answer_text != self._stream_answer_text and len(answer_text) > 0)
+        if not needs_output:
+            if self.thinking_enabled and re.search(r"</think>", str(raw_text or ""), flags=re.IGNORECASE):
+                interrupt_assistant_for_steering(self.session)
+            self._emit_stats()
+            return
+        turn_id = self._ensure_active_turn()
         if reclaimed_answer_as_reasoning and len(self._stream_answer_text) > 0:
             self._stream_answer_text = ""
             self._emit_chat_event(assistant_chat.clear_assistant_content(self.session, turn_id))
@@ -5437,6 +5830,8 @@ class AssistantEngine:
         if answer_text != self._stream_answer_text and len(answer_text) > 0:
             self._stream_answer_text = answer_text
             self._emit_chat_event(assistant_chat.set_assistant_content(self.session, turn_id, self._stream_answer_text))
+        if self.thinking_enabled and re.search(r"</think>", str(raw_text or ""), flags=re.IGNORECASE):
+            interrupt_assistant_for_steering(self.session)
         self._emit_stats()
 
     def _handle_tool_progress(self, status: str | None = None, status_text: str | None = None, result: dict[str, Any] | None = None) -> None:
@@ -5477,27 +5872,53 @@ class AssistantEngine:
             raise RuntimeError("Deepy vision runtime is not available.")
         return caption_model, caption_processor
 
-    def _run_visual_query(self, media_record: dict[str, Any], question: str, frame_no: int | None = None) -> dict[str, Any]:
+    def _run_visual_query(self, media_record: dict[str, Any] | list[dict[str, Any]], question: str, frame_no: int | None = None, max_image_edge: int | None = None) -> dict[str, Any]:
         if not self._gpu_acquired:
             self.runtime_hooks.clear_gpu_resident()
             self.session.release_vram_callback = None
             self.runtime_hooks.acquire_gpu()
             self._gpu_acquired = True
-        media_path = str(media_record.get("path", "")).strip()
-        if len(media_path) == 0 or not os.path.isfile(media_path):
-            raise FileNotFoundError(f"Media file not found: {media_path}")
+        media_records = list(media_record) if isinstance(media_record, list) else [media_record]
+        images = [None] * len(media_records)
+        inspected_media = []
+        video_inputs: dict[str, list[tuple[int, int]]] = {}
+        for input_index, current_record in enumerate(media_records):
+            media_path = str(current_record.get("path", "")).strip()
+            if len(media_path) == 0 or not os.path.isfile(media_path):
+                raise FileNotFoundError(f"Media file not found: {media_path}")
+            media_type = str(current_record.get("media_type", "")).strip().lower()
+            resolved_frame_no = None
+            time_seconds = current_record.get("time_seconds", None)
+            if media_type == "video":
+                requested_frame_no = current_record.get("frame_no", frame_no)
+                resolved_frame_no = deepy_video_tools.resolve_video_frame_no(media_path, frame_no=requested_frame_no, time_seconds=time_seconds) if requested_frame_no is not None or time_seconds is not None else 0
+                video_inputs.setdefault(media_path, []).append((input_index, resolved_frame_no))
+            else:
+                with Image.open(media_path) as image_handle:
+                    image = image_handle.convert("RGB")
+                    images[input_index] = deepy_vision.resize_inspection_image(image, max_image_edge) if max_image_edge is not None else image
+            inspected_media.append({"input_index": input_index + 1, "media_id": current_record.get("media_id", ""), "media_type": media_type, "label": current_record.get("label", ""), "frame_no": resolved_frame_no, "time_seconds": time_seconds})
+        for media_path, indexed_frames in video_inputs.items():
+            decoded_images = deepy_vision.decode_inspection_video_frames(media_path, [item[1] for item in indexed_frames], max_edge=max_image_edge)
+            for (input_index, _resolved_frame_no), decoded_image in zip(indexed_frames, decoded_images):
+                images[input_index] = decoded_image
+        visual_labels = []
+        for index, item in enumerate(inspected_media):
+            source_label = str(item.get("label", "") or os.path.basename(str(media_records[index].get("path", "")))).strip()
+            if item["media_type"] == "video":
+                time_label = "" if item["time_seconds"] is None else f" at {float(item['time_seconds']):.3f} seconds"
+                visual_labels.append(f"Visual {index + 1}: video {source_label}, frame {item['frame_no']}{time_label}.")
+            else:
+                visual_labels.append(f"Visual {index + 1}: image {source_label}.")
         caption_model, caption_processor = self._ensure_vision_loaded()
-        media_type = str(media_record.get("media_type", "")).strip().lower()
-        if media_type == "video":
-            image = get_video_frame(media_path, 0 if frame_no is None else int(frame_no), return_last_if_missing=True, return_PIL=True).convert("RGB")
-        else:
-            with Image.open(media_path) as image_handle:
-                image = image_handle.convert("RGB")
         prompt_token_ids, prompt_embeds, prompt_position_ids, position_offset = deepy_vision.build_image_question_prompt(
             caption_model,
             caption_processor,
-            image,
+            images,
             question,
+            image_labels=visual_labels,
+            max_images=deepy_vision.VISION_MAX_IMAGES if max_image_edge is None else len(images),
+            max_pixels_per_image=None if max_image_edge is None else max_image_edge * max_image_edge,
         )
         if self.debug_enabled:
             prompt_embeds_shape = None if prompt_embeds is None else tuple(int(x) for x in prompt_embeds.shape)
@@ -5506,35 +5927,50 @@ class AssistantEngine:
             prompt_position_dtype = None if prompt_position_ids is None else str(prompt_position_ids.dtype).replace("torch.", "")
             self._log(
                 "Inspect visual query "
-                f"media_id={media_record.get('media_id', '')} media_type={media_type} image_size={image.size} "
+                f"media_ids={[item['media_id'] for item in inspected_media]} media_types={[item['media_type'] for item in inspected_media]} image_sizes={[image.size for image in images]} "
                 f"question={question!r} prompt_tokens={len(prompt_token_ids)} "
                 f"prompt_embeds_shape={prompt_embeds_shape} prompt_embeds_dtype={prompt_embeds_dtype} "
                 f"prompt_position_ids_shape={prompt_position_shape} prompt_position_ids_dtype={prompt_position_dtype} "
                 f"position_offset={int(position_offset or 0)}"
             )
         runtime = self._acquire_runtime()
+        if llm_io_enabled():
+            log_llm_io("OUT", "local-deepy", "visual-query", {
+                "question": str(question or "").strip(),
+                "visual_labels": visual_labels,
+                "media": [{**item, "source": media_descriptor(media_records[index]["path"])} for index, item in enumerate(inspected_media)],
+                "input_token_ids": [int(token_id) for token_id in prompt_token_ids],
+                "known_token_ids": known_token_ids(runtime.tokenizer),
+                "prompt_embeddings": prompt_embeds,
+                "prompt_position_ids": prompt_position_ids,
+                "position_offset": int(position_offset or 0),
+                "generation": {"max_new_tokens": deepy_vision.VISION_ANSWER_MAX_NEW_TOKENS, "seed": 0, "do_sample": False},
+            })
         answer = runtime.generate_embedded_answer(
             prompt_token_ids,
             prompt_embeds,
             prompt_position_ids,
             position_offset,
-            max_new_tokens=192,
+            max_new_tokens=deepy_vision.VISION_ANSWER_MAX_NEW_TOKENS,
             seed=0,
             do_sample=False,
             temperature=None,
             top_p=None,
             top_k=None,
         )
-        return {
+        log_llm_io("IN", "local-deepy", "visual-query", {"text": answer})
+        result = {
             "status": "done",
-            "media_id": media_record.get("media_id", ""),
-            "media_type": media_type,
-            "label": media_record.get("label", ""),
-            "frame_no": None if media_type != "video" else (0 if frame_no is None else int(frame_no)),
+            "media_ids": [item["media_id"] for item in inspected_media],
+            "media": inspected_media,
+            "visual_count": len(inspected_media),
             "question": str(question or "").strip(),
             "answer": answer,
             "error": "",
         }
+        if len(inspected_media) == 1:
+            result.update(inspected_media[0])
+        return result
 
     def _force_release_vram(self) -> None:
         self.runtime_hooks.clear_gpu_resident()
@@ -5824,6 +6260,15 @@ class AssistantEngine:
         except Exception:
             self.runtime.restore_snapshot(rollback_snapshot)
             raise
+        if llm_io_enabled():
+            log_llm_io("OUT", "local-deepy", "history-compaction", {
+                "source_messages": prior_messages,
+                "instruction": ASSISTANT_COMPACTION_PROMPT,
+                "source_token_ids": source_tokens,
+                "instruction_token_ids": appended_tokens,
+                "known_token_ids": known_token_ids(self.runtime.tokenizer),
+                "generation": {"max_new_tokens": _SUMMARY_COMPACTION_MAX_NEW_TOKENS, "seed": 0, "do_sample": False, "thinking_enabled": False},
+            })
         self._log(f"Compaction reused {len(source_tokens):,} cached tokens and appended {len(appended_tokens):,} tokens for the summary instruction.")
         return rollback_snapshot, compaction_context_tokens
 
@@ -5857,6 +6302,15 @@ class AssistantEngine:
         except Exception:
             self.runtime.restore_snapshot(rollback_snapshot)
             raise
+        if llm_io_enabled():
+            log_llm_io("OUT", "local-deepy", "active-turn-compaction", {
+                "source_messages": self.session.messages,
+                "instruction": active_prompt,
+                "source_token_ids": source_tokens,
+                "instruction_token_ids": appended_tokens,
+                "known_token_ids": known_token_ids(self.runtime.tokenizer),
+                "generation": {"max_new_tokens": _SUMMARY_COMPACTION_MAX_NEW_TOKENS, "seed": 0, "do_sample": False, "thinking_enabled": False},
+            })
         self._log(f"Active-turn compaction reused {len(source_tokens):,} cached tokens and appended {len(appended_tokens):,} tokens for the summary instruction.")
         return rollback_snapshot, compaction_context_tokens
 
@@ -6053,16 +6507,13 @@ class AssistantEngine:
         checkpoint["history_summarized"] = True
         checkpoint["history_summary_count"] = int(checkpoint.get("history_summary_count", 0) or 0) + 1
         summary_text = str(summary or "").strip()
-        self._log("Earlier chat history was summarized to preserve Deepy's context window.")
+        self._log("Earlier history summarized.")
         if self.debug_enabled:
             print("[Deepy] Compaction summary begin")
             print(summary_text)
             print("[Deepy] Compaction summary end")
         summary_event = assistant_chat.add_context_summary(self.session, self._ensure_active_turn(), summary_text)[1]
         self._emit_chat_event(summary_event)
-        message_id = str(checkpoint.get("user_message_id", "") or "").strip()
-        if message_id:
-            self._emit_chat_event(assistant_chat.set_message_badge(self.session, message_id, "History summarized"))
         self._emit_chat_event(assistant_chat.build_sync_event(self.session, status=self._current_status_payload, stats=self._chat_stats_payload()))
 
     def _mark_summary_fallback_trace(self, error: Exception) -> None:
@@ -6124,6 +6575,12 @@ class AssistantEngine:
                 thinking_enabled=False,
                 stop_requested=lambda: bool(self.session.interrupt_requested),
             )
+            log_llm_io("IN", "local-deepy", "history-compaction", {
+                "text": result.raw_text,
+                "stop_reason": result.stop_reason,
+                "generated_tokens": result.token_count,
+                "stop_token": token_id_descriptor(self.runtime.tokenizer, result.stop_token_id),
+            })
             self._record_generation_metrics(result.token_count, max(0.0, time.perf_counter() - generation_started_at))
             if self.debug_enabled:
                 raw_preview = str(result.raw_text or "").replace("\r", "\\r").replace("\n", "\\n")
@@ -6227,6 +6684,12 @@ class AssistantEngine:
                 thinking_enabled=False,
                 stop_requested=lambda: bool(self.session.interrupt_requested),
             )
+            log_llm_io("IN", "local-deepy", "active-turn-compaction", {
+                "text": result.raw_text,
+                "stop_reason": result.stop_reason,
+                "generated_tokens": result.token_count,
+                "stop_token": token_id_descriptor(self.runtime.tokenizer, result.stop_token_id),
+            })
             self._record_generation_metrics(result.token_count, max(0.0, time.perf_counter() - generation_started_at))
             if self.debug_enabled:
                 raw_preview = str(result.raw_text or "").replace("\r", "\\r").replace("\n", "\\n")
@@ -6580,14 +7043,12 @@ class AssistantEngine:
 
     def _execute_tool(self, tool_call: dict[str, Any]) -> dict[str, Any]:
         tool_name = str(tool_call.get("name", "")).strip()
-        tool_label = self.tool_box.get_tool_display_name(tool_name)
-        tool_transcript_label = self.tool_box.get_tool_transcript_label(tool_name)
-        tool_template = self.tool_box.get_tool_template_filename(tool_name)
-        tool_policy = self.tool_box.get_tool_policy(tool_name)
         arguments = dict(tool_call.get("arguments", {}) or {})
+        tool_label = self.tool_box.get_tool_transcript_label(tool_name, arguments)
+        tool_policy = self.tool_box.get_tool_policy(tool_name, arguments)
         self._log(f"Tool call: {tool_name} {arguments}")
         message_id = self._ensure_active_turn()
-        tool_id, tool_event = assistant_chat.add_tool_call(self.session, message_id, tool_name, arguments, tool_label=tool_transcript_label)
+        tool_id, tool_event = assistant_chat.add_tool_call(self.session, message_id, tool_name, arguments, tool_label=tool_label)
         self._emit_chat_event(tool_event)
         validation_error = self.tool_box.validate_tool_call(tool_name, arguments)
         if len(validation_error) > 0:
@@ -6597,13 +7058,15 @@ class AssistantEngine:
             self._emit_chat_event(assistant_chat.complete_tool_call(self.session, message_id, tool_id, result))
             self._emit_chat_event(assistant_chat.build_sync_event(self.session, status=self._current_status_payload, stats=self._chat_stats_payload()))
             return result
-        if len(tool_template) > 0:
-            self._set_status(f"Using {tool_label} ({Path(tool_template).stem})...", kind="tool")
-        else:
-            self._set_status(f"Using {tool_label}...", kind="tool")
-        if tool_policy.get("pause_runtime", True):
-            self._pause_runtime(pause_reason=tool_policy.get("pause_reason", "tool"))
+        if not begin_assistant_action(self.session):
+            interruption_kind = str(self.session.current_turn.get("interruption_kind", "interrupted") or "interrupted").strip().lower() if isinstance(self.session.current_turn, dict) else "interrupted"
+            result = {"status": "steered" if interruption_kind == "steered" else "interrupted", "tool": tool_name, "cancelled": True, "error": "Tool call was not started because steering reached the preceding thought boundary." if interruption_kind == "steered" else "Tool call was not started because the user stopped the turn."}
+            self._emit_chat_event(assistant_chat.complete_tool_call(self.session, message_id, tool_id, result))
+            return result
         try:
+            self._set_status(f"{tool_label}...", kind="tool")
+            if tool_policy.get("pause_runtime", True):
+                self._pause_runtime(pause_reason=tool_policy.get("pause_reason", "tool"))
             self._active_tool_context = (message_id, tool_id)
             result = self.tool_box.call(tool_name, arguments)
         except Exception as exc:
@@ -6611,6 +7074,9 @@ class AssistantEngine:
             self._log(f"Tool error: {exc}")
         finally:
             self._active_tool_context = None
+            steering_after_action = finish_assistant_action(self.session)
+        if steering_after_action:
+            self._set_status("Steering accepted. Applying the new instructions at the action boundary...", kind="queued")
         self._log(f"Tool result: {_json_dumps(result)}")
         self._emit_chat_event(assistant_chat.complete_tool_call(self.session, message_id, tool_id, result))
         # Queue-backed tools can finish and immediately trigger another model pass; emit a full
@@ -7187,9 +7653,30 @@ class AssistantEngine:
                     self._set_status("Thinking...", kind="thinking")
                 self._start_stream_pass()
                 result = None
+                begin_assistant_thought(self.session)
                 try:
                     continue_existing_completion = bool(self._continue_generation_segment_once)
                     self._continue_generation_segment_once = False
+                    if llm_io_enabled():
+                        active_sequence = self.runtime._get_active_sequence()
+                        context_token_ids = list(self.session.rendered_token_ids) if active_sequence is None else [int(token_id) for token_id in active_sequence.token_ids]
+                        log_llm_io("OUT", "local-deepy", "generation", {
+                            "system_prompt": self._build_system_prompt(log_injections=True),
+                            "messages": self.session.messages,
+                            "tools": self.tool_box.get_tool_schemas(),
+                            "input_token_ids": context_token_ids,
+                            "known_token_ids": known_token_ids(self.runtime.tokenizer),
+                            "generation": {
+                                "max_new_tokens": max_new_tokens,
+                                "seed": current_seed,
+                                "do_sample": do_sample,
+                                "temperature": temperature,
+                                "top_p": top_p,
+                                "top_k": top_k,
+                                "thinking_enabled": self.thinking_enabled,
+                                "continue_existing_completion": continue_existing_completion,
+                            },
+                        }, pass_number=model_passes + 1)
                     result = self.runtime.generate_segment(
                         max_new_tokens=max_new_tokens,
                         seed=current_seed,
@@ -7198,13 +7685,23 @@ class AssistantEngine:
                         top_p=top_p,
                         top_k=top_k,
                         thinking_enabled=self.thinking_enabled,
-                        stop_requested=lambda: bool(self.session.interrupt_requested),
+                        stop_requested=lambda: bool(self.session.interrupt_requested) or assistant_steering_interrupt_due(self.session),
                         stream_callback=self._stream_generation_update,
                         stream_interval_seconds=_ASSISTANT_STREAM_INTERVAL_SECONDS,
                         continue_existing_completion=continue_existing_completion,
                     )
                 finally:
+                    finish_assistant_thought(self.session)
                     self._finish_stream_pass(None if result is None else result.token_count)
+                active_sequence = self.runtime._get_active_sequence()
+                completion_token_ids = [] if active_sequence is None else [int(token_id) for token_id in active_sequence.completion_token_ids]
+                log_llm_io("IN", "local-deepy", "generation", {
+                    "text": result.raw_text,
+                    "output_token_ids": completion_token_ids,
+                    "stop_reason": result.stop_reason,
+                    "generated_tokens": result.token_count,
+                    "stop_token": token_id_descriptor(self.runtime.tokenizer, result.stop_token_id),
+                }, pass_number=model_passes + 1)
                 model_passes += 1
                 if self.session.interrupt_requested or result.stop_reason == "interrupted":
                     break
@@ -7273,6 +7770,9 @@ class AssistantEngine:
                     turn_completed = True
                     break
                 if tool_calls:
+                    if self.session.steering_pending:
+                        interrupt_assistant_for_steering(self.session)
+                        break
                     stored_tool_calls = self._append_assistant_message(raw_text, tool_calls=tool_calls)
                     checkpoint_assistant_turn(self.session)
                     self._clear_segment_continuation_state()
@@ -7285,10 +7785,15 @@ class AssistantEngine:
                         self._append_tool_message(tool_result, stored_tool_call.get("id"))
                         completed_tool_calls += 1
                         checkpoint_assistant_turn(self.session)
+                        if self.session.steering_pending:
+                            break
                     if self.session.interrupt_requested:
+                        interruption_kind = str(self.session.current_turn.get("interruption_kind", "interrupted") or "interrupted").strip().lower() if isinstance(self.session.current_turn, dict) else "interrupted"
+                        skipped_status = "steered" if interruption_kind == "steered" else "interrupted"
+                        skipped_error = "Tool call was not started because steering was inserted at the previous action boundary." if interruption_kind == "steered" else "Tool call was not started because the user stopped the turn."
                         for tool_call, stored_tool_call in zip(tool_calls[completed_tool_calls:], stored_tool_calls[completed_tool_calls:]):
                             self._append_tool_message(
-                                {"status": "interrupted", "tool": str(tool_call.get("name", "") or ""), "cancelled": True, "error": "Tool call was not started because the user stopped the turn."},
+                                {"status": skipped_status, "tool": str(tool_call.get("name", "") or ""), "cancelled": True, "error": skipped_error},
                                 stored_tool_call.get("id"),
                             )
                         checkpoint_assistant_turn(self.session)
@@ -7312,22 +7817,29 @@ class AssistantEngine:
                 turn_completed = True
                 break
         finally:
-            self._hide_status()
+            checkpoint = self.session.current_turn
+            steering_requested = bool((self.session.interrupt_requested or self.session.steering_pending) and isinstance(checkpoint, dict) and str(checkpoint.get("interruption_kind", "") or "").strip().lower() == "steered")
+            if steering_requested:
+                self._set_status("Steering accepted. Deepy is applying the new instructions...", kind="queued")
+            else:
+                self._hide_status()
             preserve_interrupted_snapshot = False
-            if self.session.interrupt_requested:
-                rollback_assistant_turn(self.session, rendered_system_prompt_signature=self._current_reset_base_signature())
-                if not self.session.drop_state_requested:
-                    preserve_interrupted_snapshot = True
-                    self._log("Interrupted-turn delta deferred until the next turn so the last action snapshot stays intact.")
-                else:
-                    self._skip_pause_snapshot = False
-                if self.debug_enabled and len(str(self.session.interruption_notice or "").strip()) > 0:
-                    self._log(f"Interruption recorded: {self.session.interruption_notice}")
+            with self.session.turn_lock:
+                if self.session.interrupt_requested:
+                    rollback_assistant_turn(self.session, rendered_system_prompt_signature=self._current_reset_base_signature())
+                    if not self.session.drop_state_requested:
+                        preserve_interrupted_snapshot = True
+                        self._log("Interrupted-turn delta deferred until the next turn so the last action snapshot stays intact.")
+                    else:
+                        self._skip_pause_snapshot = False
+                    if self.debug_enabled and len(str(self.session.interruption_notice or "").strip()) > 0:
+                        self._log(f"Interruption recorded: {self.session.interruption_notice}")
+                finish_assistant_turn(self.session)
+                clear_assistant_steering(self.session)
             try:
                 self._pause_runtime(pause_reason="idle", preserve_session_snapshot=preserve_interrupted_snapshot)
             except Exception as exc:
                 self._log(f"Pause-after-turn failed: {exc}")
-            finish_assistant_turn(self.session)
             self.session.runtime_status_note = ""
             self._prefill_started_at = None
             self._live_prefill_tokens = 0
