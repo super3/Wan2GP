@@ -329,6 +329,9 @@ inferred.
   value table (warm, profile 3 unless noted): H100 p1 22.9 s / PRO 6000 p1
   24.2 s / H100 p3 39.5 s / MIG 2g.48gb p3 46.7 s / A40 p3 67.0 s.
 - **Multi-GPU sequence parallelism works and is worth 1.31x, no more.**
+  The implementation lives on the `feature/usp-multi-gpu` branch
+  (`models/minimax_h3/usp.py`, its gloo correctness suite and the drift test);
+  it is parked there until user volume justifies multi-GPU serving.
   `models/minimax_h3/usp.py` adds Ulysses sequence parallelism (an all-to-all
   around each block's attention so every rank holds the full sequence for
   `heads / world_size` heads) via plain `torch.distributed` -- no xfuser, no

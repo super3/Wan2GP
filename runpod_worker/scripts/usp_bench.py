@@ -180,6 +180,8 @@ def main() -> int:
         print("bench: last-frame decode active", flush=True)
 
     if world > 1:
+        # models/minimax_h3/usp.py lives on the feature/usp-multi-gpu branch;
+        # single-GPU benching (world == 1) never touches it.
         from models.minimax_h3 import usp
         usp.activate()
         if args.attention == "sol":
