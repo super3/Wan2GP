@@ -57,7 +57,7 @@ torchaudio==2.11.0        # verified 2026-08-19
 # --- the rest of the exactly-pinned WanGP stack, in requirements.txt order ---
 # Inert unless something in the runpod closure tries to move them, which is
 # exactly when you want them to be here.
-mmgp==3.7.12              # requirements.txt:2   -- the offloading engine; the
+mmgp==3.7.14              # requirements.txt:2   -- the offloading engine; the
                           #   entire reason to build on WanGP rather than
                           #   diffusers. A bump here changes VRAM behaviour.
 diffusers==0.36.0         # requirements.txt:4
