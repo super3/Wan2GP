@@ -113,6 +113,11 @@ def main() -> int:
     parser.add_argument("--accel-profile", dest="accel_profile", default=ACCEL_PROFILE)
     #: num_inference_steps override; only meaningful with --accel-profile none.
     parser.add_argument("--steps", type=int, default=0)
+    #: Output resolution (WxH, multiples of 32). Default is the production clip.
+    parser.add_argument("--resolution", default=RESOLUTION)
+    #: Extra settings merged into the job verbatim, as JSON -- the escape hatch
+    #: for knobs without a dedicated flag (e.g. '{"guidance_phases": 2}').
+    parser.add_argument("--extra-settings", dest="extra_settings", default="")
     args = parser.parse_args()
 
     world = int(os.environ.get("WORLD_SIZE", "1"))
@@ -279,11 +284,12 @@ def main() -> int:
                 "settings": dict(
                     {
                         "prompt": PROMPT,
-                        "resolution": RESOLUTION,
+                        "resolution": args.resolution,
                         "video_length": args.frames,
                         "seed": seed,
                     },
                     **({"num_inference_steps": args.steps} if args.steps > 0 else {}),
+                    **(json.loads(args.extra_settings) if args.extra_settings else {}),
                     **({"override_attention": override_attention} if override_attention else {}),
                 ),
                 "output": {"mode": "b64"},
@@ -327,6 +333,7 @@ def main() -> int:
     effective = runs[-1].get("effective_attention") if runs else None
     attention_ok = effective == args.attention
     summary = {"event": "usp_bench_summary", "tag": tag, "frames": args.frames,
+               "resolution": args.resolution, "extra_settings": args.extra_settings,
                "compile": bool(args.compile), "config": args.config, "codec": args.codec,
                "vae_config": args.vae_config, "last_frame": bool(args.last_frame),
                "attention": args.attention,
