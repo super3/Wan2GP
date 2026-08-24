@@ -125,32 +125,44 @@ def main() -> int:
                    "phase_marks_s": metrics.get("phase_marks_s")}
             del response
             if rec is not None:
-                # Keep only the final full decode: if anything else in the job
-                # (a preview path, a retry) ran _decode earlier, drop it.
-                starts = [i for i, c in enumerate(rec.chunks) if c["frame_start"] == 0]
-                if starts and starts[-1] > 0:
-                    rec.chunks = rec.chunks[starts[-1]:]
-                    rec.frames = rec.frames[starts[-1]:] if rec.frames else rec.frames
-                chunk_rel = rec.chunk_ready_rel(started)
-                audio_s = rec.audio_s
-                seg_dir = f"{out_root}/{tag}"
-                segments = streaming.mux_all_segments(rec, seg_dir, fps=FPS, total_frames=frames)
-                durations = [s["duration_s"] for s in segments]
-                ready = [c + audio_s + s["mux_s"] for c, s in zip(chunk_rel, segments)]
-                oracle = streaming.no_buffer_start(ready, durations)
-                est = streaming.linear_estimate_start(ready, durations, observe=2, pad=1.15)
-                leg.update({
-                    "audio_decode_s": round(audio_s, 3),
-                    "chunk_ready_rel_s": [round(c, 3) for c in chunk_rel],
-                    "segments": [{k: v for k, v in s.items() if k != "path"} for s in segments],
-                    "segment_ready_s": [round(r, 3) for r in ready],
-                    "ttff_oracle_s": round(oracle, 3),
-                    "ttff_est_s": round(est["start_s"], 3),
-                    "est_rate_s_per_chunk": round(est["rate_est_s"], 3),
-                    "would_rebuffer": est["would_rebuffer"],
-                    "worst_margin_s": round(est["worst_margin_s"], 3),
-                })
-                streaming.deactivate()
+                try:
+                    # Keep only the final full decode: if anything else in the
+                    # job (a preview path, a retry) ran _decode earlier, drop it.
+                    starts = [i for i, c in enumerate(rec.chunks) if c["frame_start"] == 0]
+                    if starts and starts[-1] > 0:
+                        rec.chunks = rec.chunks[starts[-1]:]
+                        rec.frames = rec.frames[starts[-1]:] if rec.frames else rec.frames
+                    chunk_rel = rec.chunk_ready_rel(started)
+                    audio_s = rec.audio_s
+                    seg_dir = f"{out_root}/{tag}"
+                    segments = streaming.mux_all_segments(rec, seg_dir, fps=FPS, total_frames=frames)
+                    durations = [s["duration_s"] for s in segments]
+                    ready = [c + audio_s + s["mux_s"] for c, s in zip(chunk_rel, segments)]
+                    oracle = streaming.no_buffer_start(ready, durations)
+                    est = streaming.linear_estimate_start(ready, durations, observe=2, pad=1.15)
+                    leg.update({
+                        "audio_decode_s": round(audio_s, 3),
+                        "chunk_ready_rel_s": [round(c, 3) for c in chunk_rel],
+                        "segments": [{k: v for k, v in s.items() if k != "path"} for s in segments],
+                        "segment_ready_s": [round(r, 3) for r in ready],
+                        "ttff_oracle_s": round(oracle, 3),
+                        "ttff_est_s": round(est["start_s"], 3),
+                        "est_rate_s_per_chunk": round(est["rate_est_s"], 3),
+                        "would_rebuffer": est["would_rebuffer"],
+                        "worst_margin_s": round(est["worst_margin_s"], 3),
+                    })
+                except Exception as exc:  # noqa: BLE001 - keep remaining legs alive
+                    import traceback
+
+                    traceback.print_exc()
+                    leg["stream_error"] = repr(exc)[:300]
+                    # chunk timings survive even when segment muxing cannot
+                    # write: they are the raw measurement the table needs.
+                    leg.setdefault("chunk_ready_rel_s",
+                                   [round(c, 3) for c in rec.chunk_ready_rel(started)])
+                    leg.setdefault("audio_decode_s", round(rec.audio_s, 3))
+                finally:
+                    streaming.deactivate()
             legs.append(leg)
             print("STREAM_LEG " + json.dumps(leg), flush=True)
 
