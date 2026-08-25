@@ -195,3 +195,72 @@ def test_linear_estimator_start_never_precedes_first_segment():
     ready = [4.0, 4.1, 4.2]
     verdict = streaming.linear_estimate_start(ready, durations)
     assert verdict["start_s"] >= 4.0
+
+
+def test_audio_first_prefetch_helper():
+    calls = []
+
+    class DummyAudioVAE:
+        def decode(self, latents):
+            calls.append(latents)
+            return latents
+
+    class DummyPipe:
+        pass
+
+    pipe = DummyPipe()
+    pipe.audio_vae = DummyAudioVAE()
+    rec = streaming.StreamRecorder()
+    latents = torch.zeros(2)
+    assert streaming._maybe_prefetch_audio({"self": pipe, "audio": latents}, rec)
+    assert calls == [latents]
+    # a warm cache reports success without decoding again
+    rec.audio_cache = (id(latents), latents)
+    assert streaming._maybe_prefetch_audio({"self": pipe, "audio": latents}, rec)
+    assert len(calls) == 1
+    # unexpected call sites fall back cleanly
+    fresh = streaming.StreamRecorder()
+    assert not streaming._maybe_prefetch_audio({"self": pipe}, fresh)
+    assert not streaming._maybe_prefetch_audio({}, fresh)
+    assert not streaming._maybe_prefetch_audio({"self": object(), "audio": latents}, fresh)
+
+
+def test_live_segmenter_muxes_with_audio(tmp_path):
+    seg = streaming.LiveSegmenter(tmp_path, fps=24, sample_rate=32000)
+    n_frames, chunks = 17, 3
+    t = torch.linspace(0, 500, int(32000 * chunks * n_frames / 24))
+    seg.set_audio((torch.sin(t) * 0.3).repeat(2, 1))
+    for i in range(chunks):
+        meta = {"chunk": i, "frame_start": i * n_frames, "frame_end": (i + 1) * n_frames,
+                "t": float(i)}
+        frames = torch.full((n_frames, 48, 64, 3), i * 40, dtype=torch.uint8)
+        seg.submit(meta, frames)
+    results = seg.close()
+    assert len(results) == chunks
+    for r in results:
+        assert "error" not in r, r
+        assert r["has_audio"]
+        assert r["t_done"] > 0
+        n, _ = _ffprobe_frames(r["path"])
+        assert n == n_frames
+    times = [r["t_done"] for r in results]
+    assert times == sorted(times)
+
+
+def test_instrumented_decode_feeds_live_segmenter(tmp_path):
+    vae = _tiny_vae()
+    z = torch.randn(1, 4, 12, 8, 8)
+    rec = streaming.activate(store_frames=False, live_dir=str(tmp_path))
+    try:
+        rec.reset()
+        with torch.no_grad():
+            decoded = AutoencoderKLMiniMaxH3._decode(vae, z)
+        results = rec.live.close()
+    finally:
+        streaming.deactivate()
+    assert len(results) == len(rec.chunks)
+    total = sum(r["frame_end"] - r["frame_start"] for r in results)
+    assert total == decoded.shape[2]
+    for r in results:
+        assert "error" not in r, r
+        assert not r["has_audio"]  # no audio was set in this run
