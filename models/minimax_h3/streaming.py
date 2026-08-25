@@ -27,8 +27,11 @@ it, commit to a start time) that the bench validates against actual arrivals.
 
 from __future__ import annotations
 
+import queue
 import subprocess
+import sys
 import tempfile
+import threading
 import time
 import wave
 from pathlib import Path
@@ -41,8 +44,15 @@ from .components import video_autoencoder as _va
 class StreamRecorder:
     """Collects chunk/audio events from one instrumented generation."""
 
-    def __init__(self, store_frames: bool = True):
+    def __init__(self, store_frames: bool = True, live_dir: str | None = None,
+                 audio_first: bool = False, fps: int = 24, sample_rate: int = 32000):
         self.store_frames = store_frames
+        self.live_dir = live_dir
+        self.audio_first = audio_first
+        self.fps = fps
+        self.sample_rate = sample_rate
+        self.generation_index = 0
+        self.live: "LiveSegmenter | None" = None
         self.reset()
 
     def reset(self) -> None:
@@ -55,10 +65,23 @@ class StreamRecorder:
         self.audio_start_t: float | None = None
         self.audio_end_t: float | None = None
         self.audio_out: torch.Tensor | None = None
+        #: (id(latents), decoded) so an audio-first prefetch is never paid twice
+        self.audio_cache: tuple[int, object] | None = None
+        #: True when the audio-first hook actually decoded audio before video
+        self.audio_first_effective = False
 
     # -- hooks ------------------------------------------------------------
     def on_decode_start(self) -> None:
         self.decode_start_t = time.monotonic()
+        if self.live_dir:
+            if self.live is not None:
+                self.live.close()
+            self.generation_index += 1
+            self.live = LiveSegmenter(
+                Path(self.live_dir) / f"gen_{self.generation_index:03d}",
+                fps=self.fps, sample_rate=self.sample_rate)
+            if self.audio_out is not None:
+                self.live.set_audio(self.audio_out)
 
     def on_chunk(self, vae, decoded: torch.Tensor, frame_start: int, frame_end: int, chunk_index: int) -> None:
         if frame_end <= frame_start:
@@ -76,9 +99,12 @@ class StreamRecorder:
         # .cpu() synchronizes this stream's work: the timestamp includes the
         # decode of this chunk AND the host copy a streaming mux would need.
         now = time.monotonic()
-        self.chunks.append({"chunk": chunk_index, "frame_start": frame_start, "frame_end": frame_end, "t": now})
+        meta = {"chunk": chunk_index, "frame_start": frame_start, "frame_end": frame_end, "t": now}
+        self.chunks.append(meta)
         if self.store_frames:
             self.frames.append(u8)
+        if self.live is not None:
+            self.live.submit(meta, u8)
 
     def on_decode_end(self) -> None:
         self.decode_end_t = time.monotonic()
@@ -94,11 +120,38 @@ class StreamRecorder:
         return [c["t"] - t0 for c in self.chunks]
 
 
-_STATE: dict = {"active": False, "recorder": None, "orig_decode": None, "orig_audio_decode": None}
+_STATE: dict = {"active": False, "recorder": None, "orig_decode": None,
+                "orig_audio_decode": None, "orig_video_decode": None}
 
 
 def recorder() -> StreamRecorder | None:
     return _STATE["recorder"]
+
+
+def _maybe_prefetch_audio(caller_locals: dict, rec: StreamRecorder) -> bool:
+    """Audio-first hook: decode audio before the video decode starts.
+
+    The pipeline decodes video before audio (`decoded_video = self.vae.decode(
+    video)` then `self.audio_vae.decode(audio)`), which would leave live
+    segments silent until the whole clip is decoded. At the moment the video
+    decode is entered, the caller's frame already holds both the pipeline
+    (`self`) and the audio latents (`audio`), so decode them now; the audio
+    wrapper caches the result by latents identity and the pipeline's own later
+    call returns it without paying twice. Every check fails closed: any
+    mismatch with the expected call site just keeps the original ordering.
+    """
+    try:
+        pipe = caller_locals.get("self")
+        audio = caller_locals.get("audio")
+        audio_vae = getattr(pipe, "audio_vae", None)
+        if audio_vae is None or not torch.is_tensor(audio):
+            return False
+        if rec.audio_cache is not None:
+            return True
+        audio_vae.decode(audio)
+        return True
+    except Exception:  # noqa: BLE001 - the hook must never break generation
+        return False
 
 
 def _instrumented_decode(self, z: torch.Tensor) -> torch.Tensor:
@@ -169,14 +222,26 @@ def _instrumented_decode(self, z: torch.Tensor) -> torch.Tensor:
     return decoded
 
 
-def activate(store_frames: bool = True) -> StreamRecorder:
-    """Install the instrumented decode paths; returns the shared recorder."""
-    if _STATE["active"]:
-        _STATE["recorder"].store_frames = store_frames
-        return _STATE["recorder"]
-    from . import audio_vae as _audio_mod
+def activate(store_frames: bool = True, live_dir: str | None = None,
+             audio_first: bool = False) -> StreamRecorder:
+    """Install the instrumented decode paths; returns the shared recorder.
 
-    rec = StreamRecorder(store_frames=store_frames)
+    `live_dir` turns on the live segmenter: every finalized chunk is muxed to
+    a standalone fMP4 segment in a background thread as it lands, under
+    `live_dir/gen_NNN/`. `audio_first` additionally decodes the audio before
+    the video decode starts (see `_maybe_prefetch_audio`), so live segments
+    carry their audio slice from the first chunk onward.
+    """
+    if _STATE["active"]:
+        rec = _STATE["recorder"]
+        rec.store_frames = store_frames
+        rec.live_dir = live_dir
+        rec.audio_first = audio_first
+        return rec
+    from . import audio_vae as _audio_mod
+    from . import video_vae as _video_mod
+
+    rec = StreamRecorder(store_frames=store_frames, live_dir=live_dir, audio_first=audio_first)
     _STATE["recorder"] = rec
     _STATE["orig_decode"] = _va.AutoencoderKLMiniMaxH3._decode
     _va.AutoencoderKLMiniMaxH3._decode = _instrumented_decode
@@ -184,14 +249,29 @@ def activate(store_frames: bool = True) -> StreamRecorder:
     orig_audio_decode = _audio_mod.MiniMaxH3AudioVAE.decode
 
     def timed_audio_decode(self, latents):
+        if rec.audio_cache is not None and rec.audio_cache[0] == id(latents):
+            return rec.audio_cache[1]
         rec.audio_start_t = time.monotonic()
         out = orig_audio_decode(self, latents)
         rec.audio_end_t = time.monotonic()
+        rec.audio_cache = (id(latents), out)
         rec.audio_out = out.detach().float().cpu() if torch.is_tensor(out) else None
+        if rec.live is not None and rec.audio_out is not None:
+            rec.live.set_audio(rec.audio_out)
         return out
 
     _STATE["orig_audio_decode"] = orig_audio_decode
     _audio_mod.MiniMaxH3AudioVAE.decode = timed_audio_decode
+
+    orig_video_decode = _video_mod.MiniMaxH3VideoVAE.decode
+
+    def audio_first_video_decode(self, latents):
+        if rec.audio_first:
+            rec.audio_first_effective = _maybe_prefetch_audio(sys._getframe(1).f_locals, rec)
+        return orig_video_decode(self, latents)
+
+    _STATE["orig_video_decode"] = orig_video_decode
+    _video_mod.MiniMaxH3VideoVAE.decode = audio_first_video_decode
     _STATE["active"] = True
     return rec
 
@@ -200,13 +280,91 @@ def deactivate() -> None:
     if not _STATE["active"]:
         return
     from . import audio_vae as _audio_mod
+    from . import video_vae as _video_mod
 
+    rec = _STATE["recorder"]
+    if rec is not None and rec.live is not None:
+        rec.live.close()
     _va.AutoencoderKLMiniMaxH3._decode = _STATE["orig_decode"]
     _audio_mod.MiniMaxH3AudioVAE.decode = _STATE["orig_audio_decode"]
-    _STATE.update({"active": False, "recorder": None, "orig_decode": None, "orig_audio_decode": None})
+    _video_mod.MiniMaxH3VideoVAE.decode = _STATE["orig_video_decode"]
+    _STATE.update({"active": False, "recorder": None, "orig_decode": None,
+                   "orig_audio_decode": None, "orig_video_decode": None})
 
 
 # -- segment muxing -------------------------------------------------------
+
+class LiveSegmenter:
+    """Muxes finalized chunks into fMP4 segments as they land, off the GPU path.
+
+    One instance per generation. `submit` is called from the decode hook with
+    each chunk's metadata and uint8 CPU frames; a background thread encodes
+    the segment (with its audio slice when `set_audio` has been called, which
+    the audio-first hook guarantees happens before the first chunk) and stamps
+    the wall-clock time the finished file hit disk. `close` drains the queue
+    and returns the per-segment records.
+    """
+
+    def __init__(self, out_dir: str | Path, fps: int = 24, sample_rate: int = 32000):
+        self.out_dir = Path(out_dir)
+        self.out_dir.mkdir(parents=True, exist_ok=True)
+        self.fps = fps
+        self.sample_rate = sample_rate
+        self.audio: torch.Tensor | None = None
+        self.results: list[dict] = []
+        self._queue: queue.Queue = queue.Queue()
+        self._closed = False
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def set_audio(self, audio: torch.Tensor) -> None:
+        if audio is not None and audio.dim() == 3:
+            audio = audio[0]
+        self.audio = audio
+
+    def submit(self, meta: dict, frames_u8: torch.Tensor) -> None:
+        if not self._closed:
+            self._queue.put((dict(meta), frames_u8))
+
+    def _run(self) -> None:
+        index = 0
+        while True:
+            item = self._queue.get()
+            if item is None:
+                return
+            meta, frames = item
+            seg_path = self.out_dir / f"segment_{index:03d}.mp4"
+            record = {"segment": index, "frame_start": meta["frame_start"],
+                      "frame_end": meta["frame_end"],
+                      "duration_s": (meta["frame_end"] - meta["frame_start"]) / self.fps,
+                      "chunk_t": meta["t"], "has_audio": False}
+            try:
+                wav = None
+                if self.audio is not None:
+                    s0 = int(round(meta["frame_start"] / self.fps * self.sample_rate))
+                    s1 = min(int(round(meta["frame_end"] / self.fps * self.sample_rate)),
+                             self.audio.shape[-1])
+                    if s1 > s0:
+                        wav = str(seg_path.with_suffix(".wav"))
+                        write_wav(wav, self.audio[:, s0:s1], self.sample_rate)
+                        record["has_audio"] = True
+                record["mux_s"] = round(mux_segment(frames, wav, seg_path, fps=self.fps), 4)
+                if wav:
+                    Path(wav).unlink(missing_ok=True)
+                record["path"] = str(seg_path)
+            except Exception as exc:  # noqa: BLE001 - a bad segment must not kill the run
+                record["error"] = repr(exc)[:300]
+            record["t_done"] = time.monotonic()
+            self.results.append(record)
+            index += 1
+
+    def close(self) -> list[dict]:
+        if not self._closed:
+            self._closed = True
+            self._queue.put(None)
+        self._thread.join(timeout=120)
+        return self.results
+
 
 def write_wav(path: str | Path, samples, sample_rate: int) -> None:
     """Write float32 stereo samples shaped (2, n) or (n, 2) as 16-bit WAV."""
