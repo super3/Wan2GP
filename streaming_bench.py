@@ -40,11 +40,22 @@ PROMPT = (
     "non_diegetic_music: One soft sustained cello note."
 )
 ACCEL_PROFILE = "Turbo Lightx2v FL2V 4 Steps v1.0 768p"
-RESOLUTION = "832x480"
 FPS = 24
-#: legal frame lattice is 107 + 17k
-LEGS = ((124, "5s"), (243, "10s"), (362, "15s"))
 SEED = 12345
+
+
+def _legs() -> list[tuple[str, int, str]]:
+    """(resolution, frames, tag) legs from $STREAM_LEGS ("WxH:frames,..").
+
+    The frame lattice is 107 + 17k (124 = 5.2 s at 24 fps). The default is the
+    resolution sweep at the 5 s production clip length.
+    """
+    spec = os.environ.get("STREAM_LEGS", "832x480:124,1280x720:124,1920x1088:124")
+    legs = []
+    for part in spec.split(","):
+        resolution, frames = part.strip().split(":")
+        legs.append((resolution, int(frames), f"{resolution}-{frames}f"))
+    return legs
 
 
 def _ship(payload: dict) -> None:
@@ -63,13 +74,13 @@ def _ship(payload: dict) -> None:
         print(f"bench: shipping failed: {exc!r}", file=sys.stderr)
 
 
-def _job(frames: int, tag: str) -> dict:
+def _job(resolution: str, frames: int, tag: str) -> dict:
     return {
         "id": f"streambench-{tag}-{SEED}",
         "input": {
             "model_type": os.environ.get("WANGP_MODEL_TYPE", "minimax_h3_fl2va_pruned"),
             "profile": ACCEL_PROFILE,
-            "settings": {"prompt": PROMPT, "resolution": RESOLUTION,
+            "settings": {"prompt": PROMPT, "resolution": resolution,
                          "video_length": frames, "seed": SEED},
             "output": {"mode": "b64"},
             "runtime": {"timeout_s": 2400},
@@ -100,7 +111,7 @@ def main() -> int:
 
     # Dedicated cold run (model load + first-touch) so every table leg is warm.
     warm_started = time.monotonic()
-    warm = H.run_job(_job(124, "warmup"))
+    warm = H.run_job(_job("832x480", 124, "warmup"))
     print("STREAM_WARMUP " + json.dumps({
         "wall_s": round(time.monotonic() - warm_started, 2),
         "status": warm.get("status"),
@@ -109,55 +120,58 @@ def main() -> int:
 
     out_root = os.environ.get("STREAM_BENCH_OUT", "/tmp/stream_bench")
     legs = []
-    for frames, tag in LEGS:
+    for resolution, frames, tag in _legs():
         for mode in ("baseline", "streaming"):
             rec = None
             if mode == "streaming":
-                rec = streaming.activate(store_frames=True)
+                rec = streaming.activate(store_frames=False,
+                                         live_dir=f"{out_root}/{tag}", audio_first=True)
                 rec.reset()
             started = time.monotonic()
-            response = H.run_job(_job(frames, f"{tag}-{mode}"))
+            response = H.run_job(_job(resolution, frames, f"{tag}-{mode}"))
             wall_s = round(time.monotonic() - started, 2)
             metrics = dict(response.get("metrics") or {})
-            leg = {"tag": tag, "mode": mode, "frames": frames, "wall_s": wall_s,
+            leg = {"tag": tag, "mode": mode, "resolution": resolution, "frames": frames,
+                   "wall_s": wall_s,
                    "status": response.get("status"), "error": response.get("error_message"),
                    "generate_s": metrics.get("generate_s"),
                    "phase_marks_s": metrics.get("phase_marks_s")}
             del response
             if rec is not None:
                 try:
-                    # Keep only the final full decode: if anything else in the
-                    # job (a preview path, a retry) ran _decode earlier, drop it.
-                    starts = [i for i, c in enumerate(rec.chunks) if c["frame_start"] == 0]
-                    if starts and starts[-1] > 0:
-                        rec.chunks = rec.chunks[starts[-1]:]
-                        rec.frames = rec.frames[starts[-1]:] if rec.frames else rec.frames
                     chunk_rel = rec.chunk_ready_rel(started)
                     audio_s = rec.audio_s
-                    seg_dir = f"{out_root}/{tag}"
-                    segments = streaming.mux_all_segments(rec, seg_dir, fps=FPS, total_frames=frames)
-                    durations = [s["duration_s"] for s in segments]
-                    ready = [c + audio_s + s["mux_s"] for c, s in zip(chunk_rel, segments)]
-                    oracle = streaming.no_buffer_start(ready, durations)
-                    est = streaming.linear_estimate_start(ready, durations, observe=2, pad=1.15)
+                    segments = rec.live.close() if rec.live is not None else []
+                    # Live timings: t_done is the wall time the finished
+                    # segment file (audio included, when audio-first held)
+                    # landed on disk, with mux overlapping the next chunk's
+                    # decode. In the fallback ordering segments are silent, so
+                    # model the audio-first shift additively instead.
+                    shift = 0.0 if rec.audio_first_effective else audio_s
+                    ready = [s["t_done"] - started + shift for s in segments if s.get("t_done")]
+                    durations = [s["duration_s"] for s in segments if s.get("t_done")]
                     leg.update({
+                        "audio_first_effective": rec.audio_first_effective,
                         "audio_decode_s": round(audio_s, 3),
                         "chunk_ready_rel_s": [round(c, 3) for c in chunk_rel],
                         "segments": [{k: v for k, v in s.items() if k != "path"} for s in segments],
                         "segment_ready_s": [round(r, 3) for r in ready],
-                        "ttff_oracle_s": round(oracle, 3),
-                        "ttff_est_s": round(est["start_s"], 3),
-                        "est_rate_s_per_chunk": round(est["rate_est_s"], 3),
-                        "would_rebuffer": est["would_rebuffer"],
-                        "worst_margin_s": round(est["worst_margin_s"], 3),
                     })
+                    if ready and len(ready) == len(durations):
+                        oracle = streaming.no_buffer_start(ready, durations)
+                        est = streaming.linear_estimate_start(ready, durations, observe=2, pad=1.15)
+                        leg.update({
+                            "ttff_oracle_s": round(oracle, 3),
+                            "ttff_est_s": round(est["start_s"], 3),
+                            "est_rate_s_per_chunk": round(est["rate_est_s"], 3),
+                            "would_rebuffer": est["would_rebuffer"],
+                            "worst_margin_s": round(est["worst_margin_s"], 3),
+                        })
                 except Exception as exc:  # noqa: BLE001 - keep remaining legs alive
                     import traceback
 
                     traceback.print_exc()
                     leg["stream_error"] = repr(exc)[:300]
-                    # chunk timings survive even when segment muxing cannot
-                    # write: they are the raw measurement the table needs.
                     leg.setdefault("chunk_ready_rel_s",
                                    [round(c, 3) for c in rec.chunk_ready_rel(started)])
                     leg.setdefault("audio_decode_s", round(rec.audio_s, 3))
@@ -166,24 +180,25 @@ def main() -> int:
             legs.append(leg)
             print("STREAM_LEG " + json.dumps(leg), flush=True)
 
-    # final table: per duration, baseline e2e vs streaming e2e vs perceived
+    # final table: per leg, baseline e2e vs streaming e2e vs perceived
     table = []
     by = {}
     for leg in legs:
         by.setdefault(leg["tag"], {})[leg["mode"]] = leg
-    for _frames, tag in LEGS:
+    for resolution, frames, tag in _legs():
         base, stream = by[tag].get("baseline") or {}, by[tag].get("streaming") or {}
-        row = {"clip": tag, "frames": _frames,
+        row = {"clip": tag, "resolution": resolution, "frames": frames,
                "e2e_baseline_s": base.get("wall_s"),
                "e2e_streaming_s": stream.get("wall_s"),
                "ttff_est_s": stream.get("ttff_est_s"),
                "ttff_oracle_s": stream.get("ttff_oracle_s"),
                "would_rebuffer": stream.get("would_rebuffer"),
+               "audio_first": stream.get("audio_first_effective"),
                "audio_decode_s": stream.get("audio_decode_s")}
         if row["e2e_baseline_s"] and row["ttff_est_s"]:
             row["perceived_speedup"] = round(row["e2e_baseline_s"] / row["ttff_est_s"], 2)
         table.append(row)
-    summary = {"event": "stream_bench_summary", "resolution": RESOLUTION, "seed": SEED,
+    summary = {"event": "stream_bench_summary", "seed": SEED,
                "attention": os.environ["WANGP_ATTENTION"], "profile": os.environ["WANGP_PROFILE"],
                "table": table, "legs": legs}
     print("STREAM_TABLE " + json.dumps(table), flush=True)
