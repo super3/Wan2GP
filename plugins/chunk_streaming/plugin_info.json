@@ -1,0 +1,10 @@
+{
+  "name": "Chunk Streaming",
+  "author": "super3",
+  "version": "0.1.0",
+  "description": "Streams finished MiniMax H3 decode chunks as standalone fMP4 segments while the tail of the clip is still decoding, cutting perceived time to first frame. Decodes audio before video so every segment is playable the moment it lands.",
+  "type": ["app"],
+  "date": "2026-08-25",
+  "wan2gp_version": "12.6",
+  "url": "https://github.com/super3/Wan2GP"
+}
