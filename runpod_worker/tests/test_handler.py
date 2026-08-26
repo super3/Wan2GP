@@ -303,12 +303,12 @@ def test_settings_reaching_the_engine_are_normalized(h):
 
 
 def test_accelerator_profile_from_the_repo_is_applied(h):
-    body = h.submit(base_input(profile="Turbo Lightx2v FL2V 4 Steps v1.0 768p"))
+    body = h.submit(base_input(profile="Turbo Lightx2v FL2V 4 Steps v1.1 768p"))
     assert body["status"] == "completed"
     sent = h.run_calls[0]
     assert sent["num_inference_steps"] == 4
     assert sent["activated_loras"]
-    assert body["model"]["profile"] == "Turbo Lightx2v FL2V 4 Steps v1.0 768p"
+    assert body["model"]["profile"] == "Turbo Lightx2v FL2V 4 Steps v1.1 768p"
 
 
 def test_test_input_json_runs_end_to_end(h):

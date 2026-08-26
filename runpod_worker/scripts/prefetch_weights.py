@@ -9,7 +9,7 @@ image tag is ever pointed at a Serverless endpoint. See "Model weights strategy
     export WANGP_VOLUME_ROOT=/workspace
     python3 -m runpod_worker.scripts.prefetch_weights \
         --root /opt/wangp --config /opt/wangp/config/wgp_config.json \
-        minimax_h3_fl2va_pruned --profile "Turbo Lightx2v FL2V 4 Steps v1.0 768p"
+        minimax_h3_fl2va_pruned --profile "Turbo Lightx2v FL2V 4 Steps v1.1 768p"
 
 A GPU is mandatory even though nothing is generated: ``import wgp`` calls
 ``torch.cuda.get_device_capability`` at module scope (``wgp.py:2508``) and again
@@ -143,7 +143,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=[],
         metavar="NAME",
         help="stage the LoRAs of this accelerator profile "
-        "(e.g. 'Turbo Lightx2v FL2V 4 Steps v1.0 768p'). Repeatable.",
+        "(e.g. 'Turbo Lightx2v FL2V 4 Steps v1.1 768p'). Repeatable.",
     )
     parser.add_argument(
         "--all-profiles",

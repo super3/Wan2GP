@@ -86,7 +86,7 @@ RESOLUTION_TIERS = ("480p", "720p")
 ASPECTS = ("horizontal", "portrait", "square")
 DEFAULT_RESOLUTION = "480p"
 DEFAULT_ASPECT = "horizontal"
-ACCEL_PROFILE = "Turbo Lightx2v FL2V 4 Steps v1.0 768p"
+ACCEL_PROFILE = "Turbo Lightx2v FL2V 4 Steps v1.1 768p"
 MODEL_TYPE = "minimax_h3_fl2va_pruned"
 
 CACHE = Path(os.environ.get("GATEWAY_CACHE", "/tmp/gateway-videos"))

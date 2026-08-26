@@ -136,7 +136,7 @@ def cmd_run(args) -> int:
             settings["seed"] = int(shot["seed"])
         payload = {"input": {
             "model_type": "minimax_h3_fl2va_pruned",
-            "profile": "Turbo Lightx2v FL2V 4 Steps v1.0 768p",
+            "profile": "Turbo Lightx2v FL2V 4 Steps v1.1 768p",
             "settings": settings, "media": media,
             "output": {"mode": "auto"},
             "runtime": {"timeout_s": 1800},

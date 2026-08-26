@@ -56,7 +56,7 @@ OVERRIDE_ONLY_MODES = ("sol",)
 #: assert below keeps the two in sync.
 BENCH_CLI_ATTENTION_MODES = ("auto", "sdpa", "sage", "sage2", "flash", "xformers")
 
-ACCEL_PROFILE = "Turbo Lightx2v FL2V 4 Steps v1.0 768p"
+ACCEL_PROFILE = "Turbo Lightx2v FL2V 4 Steps v1.1 768p"
 RESOLUTION = "832x480"
 VIDEO_LENGTH = 124
 

@@ -156,7 +156,7 @@ python3 -m runpod_worker.scripts.prefetch_weights \
 #    entry in activated_loras to os.path.join(lora_dir, basename(url)), so a file staged
 #    under that basename resolves with zero network at request time.
 python3 -m runpod_worker.scripts.prefetch_weights \
-    --profile "Turbo Lightx2v FL2V 4 Steps v1.0 768p" minimax_h3_fl2va_pruned
+    --profile "Turbo Lightx2v FL2V 4 Steps v1.1 768p" minimax_h3_fl2va_pruned
 #    (or by hand:)
 mkdir -p "$WANGP_VOLUME_ROOT/loras/minimax_h3"
 wget -P "$WANGP_VOLUME_ROOT/loras/minimax_h3" \
@@ -164,7 +164,7 @@ wget -P "$WANGP_VOLUME_ROOT/loras/minimax_h3" \
 
 # 3) Gate. This is the exact enumeration the worker's fitness check runs at boot.
 python3 -m runpod_worker.scripts.verify_weights \
-    --profile "Turbo Lightx2v FL2V 4 Steps v1.0 768p" minimax_h3_fl2va_pruned
+    --profile "Turbo Lightx2v FL2V 4 Steps v1.1 768p" minimax_h3_fl2va_pruned
 echo "exit=$?"      # 0 = ready to deploy. 1 = do not point an endpoint at this volume.
 
 du -sh "$WANGP_VOLUME_ROOT/ckpts"     # expect ≈55–60 GB for the pruned int8 build
@@ -602,7 +602,7 @@ marked **(baked)**. Nothing below is required for the worker to start.
   "input": {
     "model_type": "minimax_h3_fl2va_pruned",  // optional; must equal WANGP_MODEL_TYPE
     "prompt": "…",                             // convenience alias for settings.prompt
-    "profile": "Turbo Lightx2v FL2V 4 Steps v1.0 768p",   // optional accelerator profile
+    "profile": "Turbo Lightx2v FL2V 4 Steps v1.1 768p",   // optional accelerator profile
     "settings": { /* any subset of the model's settings universe */ },
     "media":    { /* attachment key -> {"b64"|"volume"|"url"}; list for image_refs */ },
     "output":   { "mode": "auto", "presigned_url": null, "content_type": "video/mp4" },
@@ -719,7 +719,7 @@ point of failure instead of being silently downgraded.
 cat > job.json <<'JSON'
 {"input": {
   "model_type": "minimax_h3_fl2va_pruned",
-  "profile": "Turbo Lightx2v FL2V 4 Steps v1.0 768p",
+  "profile": "Turbo Lightx2v FL2V 4 Steps v1.1 768p",
   "settings": {
     "prompt": "integrated_multimodal_description: [Shot 1] A five-second cinematic single take inside a rain-lashed glass observatory at midnight. A radio astronomer leans toward a brass receiver and says clearly (S1) <d>[English] If you can hear me, follow this signal.</d>\noverall_soundscape: Rain on the dome, a low electrical hum, three clean receiver tones, and her synchronized voice.\nnon_diegetic_music: One quiet bowed-glass chord rising and fading.",
     "resolution": "832x480",
@@ -809,7 +809,7 @@ truthy and `stopPod: True` when `refresh_worker` is.
    "status": "completed",
    "model_type": "minimax_h3_fl2va_pruned",
    "model": {"model_type": "minimax_h3_fl2va_pruned", "name": "MiniMax H3 FL2VA Pruned 20B",
-             "profile": "Turbo Lightx2v FL2V 4 Steps v1.0 768p", "config": ""},
+             "profile": "Turbo Lightx2v FL2V 4 Steps v1.1 768p", "config": ""},
    "seed": 918273645,
    "video": {
      "transport": "rp_bucket", "kind": "url",
@@ -828,7 +828,7 @@ truthy and `stopPod: True` when `refresh_worker` is.
                 "video_length": 124, "num_inference_steps": 4, "resolution": "832x480",
                 "flow_shift": 6, "sample_solver": "euler",
                 "sliding_window_size": 362, "sliding_window_overlap": 18},
-   "warnings": ["accelerator profile 'Turbo Lightx2v FL2V 4 Steps v1.0 768p' applied before input.settings"],
+   "warnings": ["accelerator profile 'Turbo Lightx2v FL2V 4 Steps v1.1 768p' applied before input.settings"],
    "metrics": {"validate_ms": 12, "inputs_ms": 61, "input_bytes": 0, "input_files": 0,
                "generate_s": 128.4, "upload_s": 2.14, "transport": "rp_bucket",
                "total_s": 131.9,

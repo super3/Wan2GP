@@ -34,7 +34,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 WGP_PY = REPO_ROOT / "wgp.py"
 HANDLER_PY = REPO_ROOT / "models" / "minimax_h3" / "minimax_h3_handler.py"
 SETTINGS_JSON = REPO_ROOT / "models" / "_settings.json"
-PROFILE_NAME = "Turbo Lightx2v FL2V 4 Steps v1.0 768p"
+PROFILE_NAME = "Turbo Lightx2v FL2V 4 Steps v1.1 768p"
 
 FL2VA = "minimax_h3_fl2va"
 FL2VA_PRUNED = "minimax_h3_fl2va_pruned"

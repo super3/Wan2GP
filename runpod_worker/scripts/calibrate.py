@@ -22,7 +22,7 @@ weights. This is the Tier-2/Tier-3 measurement.
 
     python3 -m runpod_worker.scripts.calibrate \\
         --matrix steps=4,20 frames=124,362 resolution=832x480 --repeat 3 \\
-        --profile "Turbo Lightx2v FL2V 4 Steps v1.0 768p" --gpu L40S
+        --profile "Turbo Lightx2v FL2V 4 Steps v1.1 768p" --gpu L40S
 
 **Remote (``--endpoint``).** Drives a deployed endpoint over ``/run`` + ``/status``
 and reads RunPod's own ``delayTime`` / ``executionTime`` plus the handler's
