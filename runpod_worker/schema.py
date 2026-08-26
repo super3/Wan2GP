@@ -30,6 +30,7 @@ from __future__ import annotations
 import copy
 import json
 import math
+import glob
 import os
 import random
 import re
@@ -2071,15 +2072,35 @@ def _validate_loras(
                          "shipped accelerator profile (input.profile)"],
             )
         if "://" in lowered:
-            # A profile URL, i.e. repo-controlled. Still worth saying out loud:
-            # if the file is not staged, check_loras_exist downloads it inside
-            # the billed generation (wgp.py:3697-3706).
+            # A profile URL, i.e. repo-controlled. check_loras_exist downloads
+            # it inside the billed generation (wgp.py:3697-3706) ONLY when the
+            # basename is not already staged under the loras root, so probe the
+            # disk and stay quiet when prefetch has done its job. An unknown
+            # root keeps the old behavior: warn.
             if warnings is not None:
-                warnings.append(
-                    f"LoRA '{os.path.basename(head)}' is named by URL; it must be "
-                    f"staged in the loras directory or WanGP will download it "
-                    f"during the generation"
-                )
+                base = os.path.basename(head)
+                staged = False
+                root = getattr(cfg, "lora_root", None)
+                try:
+                    root = root() if callable(root) else root
+                    if not root:
+                        from runpod_worker import config as _config  # noqa: PLC0415
+
+                        root = _config.lora_root()
+                except Exception:  # noqa: BLE001 - probing must never fail validation
+                    root = None
+                if root and base:
+                    try:
+                        staged = bool(glob.glob(
+                            os.path.join(str(root), "**", base), recursive=True))
+                    except Exception:  # noqa: BLE001
+                        staged = False
+                if not staged:
+                    warnings.append(
+                        f"LoRA '{base}' is named by URL; it must be "
+                        f"staged in the loras directory or WanGP will download it "
+                        f"during the generation"
+                    )
         if ".." in head.replace("\\", "/").split("/"):
             raise WorkerError(BAD_REQUEST, "LoRA paths may not contain '..'")
         name = os.path.basename(head)

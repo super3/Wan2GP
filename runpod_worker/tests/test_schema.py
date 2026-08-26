@@ -13,6 +13,7 @@ model_type"), trimmed to the fields that carry validation meaning.
 
 from __future__ import annotations
 
+import os
 import ast
 import json
 import re
@@ -1119,6 +1120,21 @@ def test_a_baked_profile_lora_is_exempt_from_the_allow_list(env):
     env.setenv("WANGP_ALLOWED_LORAS", "something_else.safetensors")
     req = parse(example_a(), FL2VA_PRUNED, cfg=C.WorkerConfig())
     assert req.settings["activated_loras"]
+
+
+def test_url_lora_warning_only_fires_when_unstaged(env, tmp_path):
+    """The named-by-URL warning is a download-during-billed-generation alarm.
+    When prefetch has already staged the basename under the loras root, the
+    alarm is noise that trains operators to ignore warnings; probe the disk."""
+    env.setenv("WANGP_LORA_ROOT", str(tmp_path))
+    req = parse(example_a(), FL2VA_PRUNED, cfg=C.WorkerConfig())
+    assert any("named by URL" in w for w in req.warnings)
+    lora_url = next(iter(req.settings["activated_loras"]))
+    staged = tmp_path / "minimax_h3" / os.path.basename(str(lora_url).split("|", 1)[0])
+    staged.parent.mkdir(parents=True, exist_ok=True)
+    staged.write_bytes(b"stub")
+    req = parse(example_a(), FL2VA_PRUNED, cfg=C.WorkerConfig())
+    assert not any("named by URL" in w for w in req.warnings)
 
 
 # ==========================================================================
