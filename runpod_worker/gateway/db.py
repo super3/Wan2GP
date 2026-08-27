@@ -83,6 +83,16 @@ adventure_scenes = sa.Table(
     sa.Column("updated_at", sa.DateTime, nullable=False),
 )
 
+#: Waitlist signups from the adventure pages. Email is the primary key, so a
+#: repeat signup is a quiet no-op instead of a duplicate row, and the table
+#: cannot grow past one row per address.
+waitlist = sa.Table(
+    "waitlist", _metadata,
+    sa.Column("email", sa.String(254), primary_key=True),
+    sa.Column("source", sa.String(40), nullable=False),
+    sa.Column("created_at", sa.DateTime, nullable=False),
+)
+
 _engine: sa.Engine | None = None
 
 
@@ -417,6 +427,23 @@ def job_owned_by(job_id: str, key_hash: str) -> bool:
         row = cx.execute(sa.select(jobs.c.id).where(
             jobs.c.id == job_id, jobs.c.key_hash == key_hash)).first()
     return row is not None
+
+
+def waitlist_add(email: str, source: str) -> bool:
+    """Record one signup. True if the address is new, False if it was already
+    on the list -- both are success to the caller."""
+    try:
+        with engine().begin() as cx:
+            cx.execute(waitlist.insert().values(
+                email=email, source=source[:40], created_at=_now()))
+        return True
+    except sa.exc.IntegrityError:
+        return False
+
+
+def waitlist_count() -> int:
+    with engine().connect() as cx:
+        return int(cx.execute(sa.select(sa.func.count()).select_from(waitlist)).scalar_one())
 
 
 def mark_job(job_id: str, status: str, generate_s: float | None = None) -> None:

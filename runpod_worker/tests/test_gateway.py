@@ -1342,3 +1342,43 @@ def test_adventures_home_is_served(client):
     assert r.status_code == 200
     assert "BISCUIT" in r.text
     assert "/adventure" in r.text
+
+
+def test_waitlist_signup_stores_normalized_and_dedupes(client):
+    c, _ = client
+    from runpod_worker.gateway import db
+
+    r = c.post("/adventure/waitlist",
+               json={"email": "  Fan@Example.COM ", "source": "adventures-header"})
+    assert r.status_code == 204
+    assert db.waitlist_count() == 1
+    # Same address again (any case, any surface) stays one row.
+    r = c.post("/adventure/waitlist",
+               json={"email": "fan@example.com", "source": "adventure-end"})
+    assert r.status_code == 204
+    assert db.waitlist_count() == 1
+    import sqlalchemy as sa
+    with db.engine().connect() as cx:
+        row = cx.execute(sa.select(db.waitlist.c.email, db.waitlist.c.source)).one()
+    assert row.email == "fan@example.com"
+    assert row.source == "adventures-header"     # first signup wins
+
+
+def test_waitlist_rejects_non_addresses(client):
+    c, _ = client
+    from runpod_worker.gateway import db
+
+    for bad in ("nope", "a@b", "two words@example.com", "@example.com", ""):
+        r = c.post("/adventure/waitlist", json={"email": bad})
+        assert r.status_code == 422, bad
+    assert db.waitlist_count() == 0
+
+
+def test_waitlist_form_is_on_both_adventure_pages(client):
+    c, _ = client
+    for path in ("/adventures", "/adventure"):
+        body = c.get(path).text
+        assert "Get early access" in body, path
+        assert "/adventure/waitlist" in body, path
+    assert "Get notified" in c.get("/adventures").text
+    assert "Keep me posted" in c.get("/adventure").text

@@ -30,10 +30,20 @@
   @keyframes omFade { from { opacity:0 } to { opacity:1 } }
   @keyframes omRise { from { opacity:0; transform:translateY(10px) } to { opacity:1; transform:none } }
   header { background:#0f0e0d; border-bottom:1px solid #221f1c; }
-  .hwrap { max-width:1200px; margin:0 auto; padding:15px 28px;
-           display:flex; align-items:center; justify-content:space-between; gap:16px; }
+  .hwrap { max-width:1200px; margin:0 auto; padding:15px 28px; display:flex;
+           align-items:center; justify-content:space-between; gap:16px; flex-wrap:wrap; }
   .wordmark { font-size:17px; font-weight:800; letter-spacing:.24em; color:#f5f3f0; }
   a.wordmark:hover { color:#e8874a; text-decoration:none; }
+  .wl { display:flex; align-items:center; gap:8px; }
+  .wl input { font:inherit; font-size:12.5px; color:#f5f3f0; background:#1b1917;
+              border:1px solid #33302b; border-radius:7px; padding:7px 11px;
+              width:170px; outline:none; }
+  .wl input:focus { border-color:#e8874a; }
+  .wl button { font:inherit; font-size:12.5px; font-weight:650; color:#141312;
+               background:#e8874a; border:1px solid #e8874a; border-radius:7px;
+               padding:7px 14px; cursor:pointer; white-space:nowrap; }
+  .wl button:hover { background:#f0a06e; }
+  .wldone { font-size:12.5px; color:#5fb884; }
   .hwrap .by { font-family:"JetBrains Mono",monospace; font-size:11px; color:#6b665e; }
   .hwrap a.by:hover { color:#e8874a; text-decoration:none; }
   main { max-width:1200px; margin:0 auto; padding:26px 28px 70px; }
@@ -68,12 +78,23 @@
   .choice .key { flex:none; width:24px; height:24px; border-radius:6px;
                  background:rgba(20,19,18,.12); font-family:"JetBrains Mono",monospace;
                  font-size:12px; display:inline-flex; align-items:center; justify-content:center; }
-  .endrow { display:flex; align-items:center; gap:16px; flex-wrap:wrap; animation:omFade .4s ease-out; }
+  .endrow { animation:omRise .4s ease-out; }
   .endrow .the-end { font-family:"JetBrains Mono",monospace; font-size:12px;
                      letter-spacing:.3em; color:#e8874a; }
-  .again { font-size:13.5px; font-weight:650; color:#141312; background:#e8874a;
-           border:1px solid #e8874a; border-radius:8px; padding:9px 20px; }
-  .again:hover { background:#f0a06e; border-color:#f0a06e; }
+  .endhead { font-size:18px; font-weight:650; color:#f5f3f0; margin:12px 0 0; max-width:44ch; }
+  .endform { display:flex; gap:9px; flex-wrap:wrap; margin-top:11px; max-width:460px; }
+  .endform input { flex:1 1 200px; font:inherit; font-size:13.5px; color:#f5f3f0;
+                   background:rgba(20,19,18,.75); border:1px solid #33302b;
+                   border-radius:8px; padding:11px 13px; outline:none; }
+  .endform input:focus { border-color:#e8874a; }
+  .keepme { font-size:13.5px; font-weight:650; color:#141312; background:#e8874a;
+            border:1px solid #e8874a; border-radius:8px; padding:11px 20px; }
+  .keepme:hover { background:#f0a06e; }
+  .enddone { font-size:15px; color:#5fb884; margin:12px 0 0; }
+  .endactions { display:flex; align-items:center; gap:14px; margin-top:16px; }
+  .again { font-size:13px; font-weight:500; color:#f5f3f0; background:none;
+           border:1px solid #33302b; border-radius:8px; padding:8px 18px; }
+  .again:hover { border-color:#e8874a; color:#e8874a; }
   .endrow .note { font-size:12px; color:#a09a90; }
   .skip { position:absolute; right:14px; bottom:18px; font-size:12px; font-weight:500;
           color:#a09a90; background:rgba(0,0,0,.45); border:1px solid #33302b;
@@ -145,6 +166,15 @@
     .choice { font-size:13px; padding:10px 12px; }
     .begin { font-size:14px; padding:11px 20px; }
     .waitbox .sub { font-size:11px; padding:0 16px; text-align:center; }
+    .stage.ended .sdesc { display:none; }
+    .endhead { font-size:14px; margin-top:8px; }
+    .endform { margin-top:8px; }
+    .endform input { font-size:12px; padding:8px 10px; }
+    .keepme { font-size:12px; padding:8px 12px; }
+    .endactions { margin-top:10px; }
+    .enddone { font-size:13px; margin-top:8px; }
+    .wl input { width:130px; font-size:11.5px; }
+    .wl button { font-size:11.5px; padding:7px 10px; }
     .beginbox .inner { padding:12px 14px 16px; gap:6px; }
     .cardtag { display:none; }
     .cardtitle { font-size:26px; }
@@ -158,7 +188,13 @@
 <body>
 <header><div class="hwrap">
   <a class="wordmark" href="/adventures" title="All adventures">ADVENTURES</a>
-  <a class="by" href="https://h3studio.up.railway.app/">powered by Minimax H3</a>
+  <div class="wl">
+    <span class="wl" id="wlform">
+      <input id="wlmail" type="email" placeholder="you@example.com" autocomplete="email">
+      <button id="wljoin" type="button">Get early access</button>
+    </span>
+    <span class="wldone" id="wldone" hidden>You're on the list ✓</span>
+  </div>
 </div></header>
 
 <main>
@@ -176,8 +212,18 @@
       </div>
       <div class="endrow" id="endrow" hidden>
         <span class="the-end">THE END</span>
-        <button type="button" class="again" id="again">Play again</button>
-        <span class="note">your branches stay saved below</span>
+        <div id="endsignup">
+          <div class="endhead">New stories every week — and soon, write your own.</div>
+          <div class="endform">
+            <input id="wlmail2" type="email" placeholder="you@example.com" autocomplete="email">
+            <button id="wljoin2" type="button" class="keepme">Keep me posted</button>
+          </div>
+        </div>
+        <div class="enddone" id="enddone" hidden>You're on the list ✓ — new stories are on the way</div>
+        <div class="endactions">
+          <button type="button" class="again" id="again">Play again</button>
+          <span class="note">your branches stay saved below</span>
+        </div>
       </div>
     </div>
     <div class="beginbox" id="beginbox">
@@ -281,6 +327,8 @@ let pendingChoice = null, choiceFadeTimer = null;
 function showPhase(phase) {
   state.phase = phase;
   $("stage").classList.toggle("prelude", phase === "begin" || phase === "waiting");
+  $("stage").classList.toggle("ended", phase === "ended");
+  if (phase === "ended") wlPaint();
   $("beginbox").hidden = phase !== "begin";
   $("waitbox").hidden = phase !== "waiting";
   $("choices").hidden = phase !== "choosing";
@@ -443,6 +491,40 @@ function renderMap() {
   };
   walk(ORDER[0], "", true, null, []);
 }
+
+// ---- waitlist --------------------------------------------------------------
+const WL_RE = /^[^@\s]+@[^@\s]+\.[^@\s]{2,}$/;
+function wlJoined() {
+  try { return localStorage.getItem("h3adv.joined") === "1"; } catch { return false; }
+}
+function wlPaint() {
+  const j = wlJoined();
+  $("wlform").hidden = j;    $("wldone").hidden = !j;
+  $("endsignup").hidden = j; $("enddone").hidden = !j;
+}
+async function wlJoin(email, source) {
+  // The POST is what actually collects the address; the local flag only
+  // remembers this browser already signed up.
+  try {
+    await fetch("/adventure/waitlist", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email, source }),
+    });
+  } catch {}
+  try { localStorage.setItem("h3adv.joined", "1"); } catch {}
+  wlPaint();
+}
+function wlWire(inputId, buttonId, source) {
+  $(buttonId).addEventListener("click", () => {
+    const v = $(inputId).value.trim();
+    if (!WL_RE.test(v)) { $(inputId).focus(); return; }
+    wlJoin(v, source);
+  });
+  $(inputId).addEventListener("keydown", e => { if (e.key === "Enter") $(buttonId).click(); });
+}
+wlWire("wlmail", "wljoin", "adventure-header");
+wlWire("wlmail2", "wljoin2", "adventure-end");
+wlPaint();
 
 // ---- boot ------------------------------------------------------------------
 (async function boot() {

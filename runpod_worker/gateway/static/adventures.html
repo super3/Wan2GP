@@ -18,10 +18,19 @@
   a { color:#e8874a; text-decoration:none; }
   a:hover { color:#f0a06e; }
   header { background:#0f0e0d; border-bottom:1px solid #221f1c; }
-  .hwrap { max-width:1200px; margin:0 auto; padding:15px 28px;
-           display:flex; align-items:center; justify-content:space-between; gap:16px; }
+  .hwrap { max-width:1200px; margin:0 auto; padding:15px 28px; display:flex;
+           align-items:center; justify-content:space-between; gap:16px; flex-wrap:wrap; }
   .wordmark { font-size:17px; font-weight:800; letter-spacing:.24em; color:#f5f3f0; }
-  .powered { font-family:"JetBrains Mono",monospace; font-size:11px; color:#6b665e; }
+  .wl { display:flex; align-items:center; gap:8px; }
+  .wl input { font:inherit; font-size:12.5px; color:#f5f3f0; background:#1b1917;
+              border:1px solid #33302b; border-radius:7px; padding:7px 11px;
+              width:190px; outline:none; }
+  .wl input:focus { border-color:#e8874a; }
+  .wl button { font:inherit; font-size:12.5px; font-weight:650; color:#141312;
+               background:#e8874a; border:1px solid #e8874a; border-radius:7px;
+               padding:7px 14px; cursor:pointer; white-space:nowrap; }
+  .wl button:hover { background:#f0a06e; }
+  .wldone { font-size:12.5px; color:#5fb884; }
   main { max-width:1200px; margin:0 auto; padding:26px 28px 80px; }
 
   .hero { display:block; position:relative; border-radius:14px; overflow:hidden;
@@ -66,13 +75,24 @@
                   justify-content:center; flex-direction:column; gap:6px; }
   .write .a { font-size:13px; font-weight:650; color:#a09a90; }
   .write .b { font-size:12px; color:#6b665e; }
+  .notify { margin-top:4px; font:inherit; font-size:12px; font-weight:650; color:#e8874a;
+            background:none; border:1px solid rgba(232,135,74,.45); border-radius:20px;
+            padding:5px 14px; cursor:pointer; }
+  .notify:hover { background:rgba(232,135,74,.12); }
+  .write .done { font-size:12px; color:#5fb884; margin-top:4px; }
   footer p { margin:44px 0 0; text-align:center; font-size:12.5px; color:#6b665e; }
 </style>
 </head>
 <body>
 <header><div class="hwrap">
   <span class="wordmark">ADVENTURES</span>
-  <span class="powered">powered by Minimax H3</span>
+  <div class="wl">
+    <span class="wl" id="wlform">
+      <input id="wlmail" type="email" placeholder="you@example.com" autocomplete="email">
+      <button id="wljoin" type="button">Get early access</button>
+    </span>
+    <span class="wldone" id="wldone" hidden>You're on the list ✓</span>
+  </div>
 </div></header>
 <main>
 
@@ -144,11 +164,44 @@
       <div class="cover">
         <span class="a">Your adventure</span>
         <span class="b">coming soon — write your own</span>
+        <button type="button" class="notify" id="notify">Get notified</button>
+        <span class="done" id="notifydone" hidden>You're on the list ✓</span>
       </div>
     </div>
   </div>
 
   <footer><p>Every scene is created the moment you choose it.</p></footer>
 </main>
+<script>
+const $ = id => document.getElementById(id);
+function wlJoined() {
+  try { return localStorage.getItem("h3adv.joined") === "1"; } catch { return false; }
+}
+function wlPaint() {
+  const j = wlJoined();
+  $("wlform").hidden = j;  $("wldone").hidden = !j;
+  $("notify").hidden = j;  $("notifydone").hidden = !j;
+}
+async function wlJoin(email, source) {
+  if (!/^[^@\s]+@[^@\s]+\.[^@\s]{2,}$/.test(email)) { $("wlmail").focus(); return; }
+  // The POST is what actually collects the address; the local flag only
+  // remembers this browser already signed up.
+  try {
+    await fetch("/adventure/waitlist", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email, source }),
+    });
+  } catch {}
+  try { localStorage.setItem("h3adv.joined", "1"); } catch {}
+  wlPaint();
+}
+$("wljoin").addEventListener("click", () => wlJoin($("wlmail").value.trim(), "adventures-header"));
+$("wlmail").addEventListener("keydown", e => { if (e.key === "Enter") $("wljoin").click(); });
+$("notify").addEventListener("click", () => {
+  window.scrollTo({ top: 0, behavior: "smooth" });
+  $("wlmail").focus({ preventScroll: true });
+});
+wlPaint();
+</script>
 </body>
 </html>

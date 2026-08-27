@@ -834,6 +834,34 @@ def adventure_state() -> dict:
             "scene_s": story.SCENE_DURATION_S, "nodes": nodes}
 
 
+class WaitlistRequest(BaseModel):
+    email: str = Field(..., max_length=254)
+    #: Which surface collected it ("adventures-header", "adventure-end", ...)
+    #: -- future stories will want to know which pitch converted.
+    source: str = Field("adventures", max_length=40)
+
+
+#: Best-effort spam brake for an unauthenticated endpoint: per address, per
+#: process, resets on restart. The email primary key already bounds real
+#: damage; this just keeps one script from hammering the table.
+_waitlist_seen: dict[str, int] = {}
+_WAITLIST_IP_CAP = 20
+
+
+@app.post("/adventure/waitlist", status_code=204)
+def adventure_waitlist(body: WaitlistRequest, request: Request) -> None:
+    email = body.email.strip().lower()
+    if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]{2,}", email):
+        raise HTTPException(422, "that does not look like an email address")
+    fwd = request.headers.get("x-forwarded-for", "")
+    ip = (fwd.rsplit(",", 1)[-1].strip()
+          or (request.client.host if request.client else "unknown"))
+    if _waitlist_seen.get(ip, 0) >= _WAITLIST_IP_CAP:
+        return                            # quietly full: same 204 the page expects
+    _waitlist_seen[ip] = _waitlist_seen.get(ip, 0) + 1
+    db.waitlist_add(email, body.source)
+
+
 @app.get("/adventure/scene/{scene_id}")
 def adventure_scene(scene_id: str):
     if scene_id not in story.NODES:
