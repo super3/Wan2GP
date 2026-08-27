@@ -303,16 +303,25 @@ def adventure_requeue_stale(story: str, older_than_s: int = 900) -> None:
 
 
 def adventure_next(story: str, max_attempts: int = 3) -> dict[str, Any] | None:
-    """The next scene to render: strictly by encounter order. Failed scenes
-    come back around until max_attempts so one flake cannot hole the story,
-    then stay failed for a human to look at."""
+    """The next scene to render: strictly by encounter order, and gated the
+    same way as adventure_claim -- a child continues its parent's clip, so it
+    is not "next" until that clip exists. Failed scenes come back around
+    until max_attempts so one flake cannot hole the story, then stay failed
+    (blocking their subtree) until a deploy resets them."""
+    parent = adventure_scenes.alias("parent")
+    parent_done = sa.or_(
+        adventure_scenes.c.parent_id.is_(None),
+        sa.exists(sa.select(parent.c.id).where(
+            parent.c.id == adventure_scenes.c.parent_id,
+            parent.c.status == "ready")))
     with engine().connect() as cx:
         row = cx.execute(
             sa.select(adventure_scenes.c.id, adventure_scenes.c.prompt,
                       adventure_scenes.c.attempts)
             .where(adventure_scenes.c.story == story,
                    adventure_scenes.c.status.in_(("queued", "failed")),
-                   adventure_scenes.c.attempts < max_attempts)
+                   adventure_scenes.c.attempts < max_attempts,
+                   parent_done)
             .order_by(adventure_scenes.c.position).limit(1)).first()
     return {"id": row[0], "prompt": row[1], "attempts": row[2]} if row else None
 

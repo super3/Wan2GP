@@ -1125,7 +1125,9 @@ def test_adventure_loop_retries_failures_then_moves_on(client):
     assert statuses["n0"]["status"] == "failed"
     assert all(v["status"] == "queued"
                for k, v in statuses.items() if k != "n0")
-    assert all(v["attempts"] == 3 for v in statuses.values())
+    assert statuses["n0"]["attempts"] == 3
+    assert all(v["attempts"] == 0
+               for k, v in statuses.items() if k != "n0")
     assert dbmod.adventure_next("biscuit") is None
 
 
