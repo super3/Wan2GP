@@ -1252,7 +1252,7 @@ def test_adventure_children_start_from_parents_last_frame(client):
         m._adventure_render_one(scene, "biscuit")
     assert seen["settings"]["image_prompt_type"] == "V"
     assert seen["settings"]["sliding_window_overlap"] == 120
-    assert seen["settings"]["video_length"] == 481
+    assert seen["settings"]["video_length"] == 362   # the A/B-proven shape
     assert seen["media"]["video_source"] == {"b64": _b64.b64encode(b"clip").decode()}
     trim.assert_called_once()
     assert dbmod.adventure_video(scene["id"]) == b"TRIMMED:" + MP4

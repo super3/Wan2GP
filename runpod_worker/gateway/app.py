@@ -724,10 +724,13 @@ def _adventure_lane() -> None:
 
 #: 5 s of the parent's tail conditions each child scene (the D variant of the
 #: continuity A/B): the child flows out of the parent instead of cutting.
-#: 120 context frames + 361 new frames = 481, exactly the model's largest
-#: single window, and the new content is still a full 15 s scene.
+#: 362 is the EXACT shape the A/B validated end to end: one default-size
+#: window where 120 frames are context and 242 (10.1 s) are new story. A
+#: 481-frame request looked like "context plus a full 15 s scene" but spills
+#: past the default window and killed production workers mid-job; do not
+#: raise this again without proving the longer shape on a scratch endpoint.
 CONTINUITY_OVERLAP_FRAMES = 120
-CONTINUITY_WINDOW_FRAMES = 481
+CONTINUITY_WINDOW_FRAMES = 362
 
 
 def _video_duration_s(data: bytes) -> float | None:
