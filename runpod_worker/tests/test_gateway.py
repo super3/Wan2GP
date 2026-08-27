@@ -1090,7 +1090,7 @@ def test_adventure_renders_in_encounter_order_and_serves_from_db(client):
     from runpod_worker.gateway import db as dbmod
     scene = dbmod.adventure_next("biscuit")
     assert scene["id"] == "n0"                     # the opening scene first
-    with mock.patch.object(m, "_rp", side_effect=_backend(run_id="adv-1")), \
+    with mock.patch.object(m, "_rp_adv", side_effect=_backend(run_id="adv-1")), \
          mock.patch.object(m.time, "sleep", lambda s: None):
         m._adventure_render_one(scene)
     assert dbmod.adventure_status("biscuit")["n0"]["status"] == "ready"
@@ -1115,7 +1115,7 @@ def test_adventure_loop_retries_failures_then_moves_on(client):
             return {"id": "adv-x"}
         return {"status": "FAILED", "output": {"message": "cuda meltdown"}}
 
-    with mock.patch.object(m, "_rp", side_effect=boom), \
+    with mock.patch.object(m, "_rp_adv", side_effect=boom), \
          mock.patch.object(m.time, "sleep", lambda s: None):
         m._adventure_loop()                        # runs to exhaustion
     statuses = dbmod.adventure_status("biscuit")
@@ -1245,7 +1245,7 @@ def test_adventure_children_start_from_parents_last_frame(client):
             return {"id": "adv-c"}
         return COMPLETED
 
-    with mock.patch.object(m, "_rp", side_effect=fake), \
+    with mock.patch.object(m, "_rp_adv", side_effect=fake), \
          mock.patch.object(m, "_video_duration_s", return_value=15.083), \
          mock.patch.object(m, "_trim_lead", side_effect=lambda d, s: b"TRIMMED:" + d) as trim, \
          mock.patch.object(m.time, "sleep", lambda s: None):
@@ -1258,7 +1258,7 @@ def test_adventure_children_start_from_parents_last_frame(client):
     assert dbmod.adventure_video(scene["id"]) == b"TRIMMED:" + MP4
     # and the root scene submits with no start image at all
     seen.clear()
-    with mock.patch.object(m, "_rp", side_effect=fake), \
+    with mock.patch.object(m, "_rp_adv", side_effect=fake), \
          mock.patch.object(m.time, "sleep", lambda s: None):
         m._adventure_render_one({"id": "n0", "prompt": "x"}, "biscuit")
     assert seen["settings"]["image_prompt_type"] == "" and seen["media"] == {}
@@ -1281,7 +1281,7 @@ def test_old_worker_image_requeues_without_burning_attempts(client):
         return {"status": "FAILED",
                 "error": "ffmpeg decode failed: Unrecognized option 'fps_mode'."}
 
-    with mock.patch.object(m, "_rp", side_effect=fake), \
+    with mock.patch.object(m, "_rp_adv", side_effect=fake), \
          mock.patch.object(m, "_video_duration_s", return_value=15.0), \
          mock.patch.object(m.time, "sleep", lambda s: None):
         m._adventure_render_one(scene, "biscuit")     # must not raise

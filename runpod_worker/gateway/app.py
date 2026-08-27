@@ -271,11 +271,7 @@ def _startup() -> None:
              "title": nodes[nid]["title"], "prompt": nodes[nid]["prompt"],
              "parent_id": story.parent_of(slug, nid)}
             for pos, nid in enumerate(story.order_of(slug))])
-    # Default OFF while the continuity rollout is diagnosed: every render
-    # attempt is real GPU spend, and a failing loop with retries drained the
-    # balance once already. Set GATEWAY_ADVENTURE_AUTOGEN=1 (or flip this
-    # default back) to resume rendering.
-    if os.environ.get("GATEWAY_ADVENTURE_AUTOGEN", "0").strip() != "0":
+    if os.environ.get("GATEWAY_ADVENTURE_AUTOGEN", "1").strip() != "0":
         _start_adventure_renderer()
 
 
@@ -421,8 +417,8 @@ def auth(request: Request, authorization: str = Header(default="")) -> Ident:
     return Ident(kh, "key", row.get("daily_limit") or DAILY_LIMIT, kh)
 
 
-def _rp(path: str, payload: dict | None = None, timeout: int = 60) -> dict:
-    url = f"{RUNPOD_API}/{_env('RUNPOD_ENDPOINT_ID')}/{path}"
+def _rp_to(endpoint_id: str, path: str, payload: dict | None, timeout: int) -> dict:
+    url = f"{RUNPOD_API}/{endpoint_id}/{path}"
     data = json.dumps(payload).encode() if payload is not None else None
     req = urllib.request.Request(
         url, data=data,
@@ -431,6 +427,24 @@ def _rp(path: str, payload: dict | None = None, timeout: int = 60) -> dict:
         method="POST" if data else "GET")
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read())
+
+
+def _rp(path: str, payload: dict | None = None, timeout: int = 60) -> dict:
+    """Customer traffic: the endpoint the product has always run on."""
+    return _rp_to(_env("RUNPOD_ENDPOINT_ID"), path, payload, timeout)
+
+
+#: The adventure renderer submits to its own endpoint. Continuation jobs
+#: (video_source + sliding_window_overlap) proved reliable on this endpoint
+#: configuration, while the customer endpoint's worker pool kills the same
+#: payload ~30 s into the denoise (undiagnosed; Studio's job shapes are fine
+#: there). Isolating the renderer also keeps story rendering from ever
+#: queueing behind customer generations.
+ADVENTURE_ENDPOINT = os.environ.get("GATEWAY_ADVENTURE_ENDPOINT", "wgek53vffwnxq0")
+
+
+def _rp_adv(path: str, payload: dict | None = None, timeout: int = 60) -> dict:
+    return _rp_to(ADVENTURE_ENDPOINT, path, payload, timeout)
 
 
 class VideoRequest(BaseModel):
@@ -702,8 +716,19 @@ def _adventure_loop() -> None:
         lane.join()
 
 
+#: Circuit breaker: every render attempt is real GPU spend, and one bad day
+#: (bad worker pool, broken release) turns retries into a money pump. After
+#: this many failed attempts across the process, the lanes stop; the next
+#: deploy resets both the fuse and the scenes' attempt counters.
+_ADVENTURE_FUSE_LIMIT = int(os.environ.get("GATEWAY_ADVENTURE_FUSE", "6"))
+_adventure_failures = 0
+
+
 def _adventure_lane() -> None:
+    global _adventure_failures
     while True:
+        if _adventure_failures >= _ADVENTURE_FUSE_LIMIT:
+            return                         # fuse blown: stop spending
         scene, slug = None, None
         for candidate in story.STORIES:
             scene = db.adventure_claim(candidate)
@@ -722,6 +747,7 @@ def _adventure_lane() -> None:
         try:
             _adventure_render_one(scene, slug)
         except Exception as exc:  # noqa: BLE001 - one bad scene must not end the run
+            _adventure_failures += 1
             db.adventure_mark(scene["id"], "failed",
                               error=f"{type(exc).__name__}: {exc}")
 
@@ -803,7 +829,7 @@ def _adventure_render_one(scene: dict, slug: str = story.STORY_ID) -> None:
         settings["video_length"] = CONTINUITY_WINDOW_FRAMES
         media["video_source"] = {"b64": base64.b64encode(parent).decode()}
         trim_lead_s = _video_duration_s(parent)
-    created = _rp("run", {"input": {
+    created = _rp_adv("run", {"input": {
         "model_type": MODEL_TYPE, "profile": ACCEL_PROFILE,
         "settings": settings, "media": media,
         "output": {"mode": "auto"},
@@ -813,11 +839,11 @@ def _adventure_render_one(scene: dict, slug: str = story.STORY_ID) -> None:
     if not job_id:
         raise RuntimeError("submit returned no job id")
     db.adventure_mark(sid, "rendering", job_id=job_id)
-    deadline = time.monotonic() + 2200      # cold start + a 481-frame window, with slack
+    deadline = time.monotonic() + 2200      # cold start + a full window, with slack
     while time.monotonic() < deadline:
         time.sleep(5)
         try:
-            st = _rp(f"status/{job_id}", timeout=30)
+            st = _rp_adv(f"status/{job_id}", timeout=30)
         except Exception:
             continue                        # a blip mid-render is not a failure
         state = st.get("status")
