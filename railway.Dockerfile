@@ -18,6 +18,8 @@ COPY runpod_worker/gateway/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY runpod_worker/gateway/app.py runpod_worker/gateway/db.py runpod_worker/gateway/story.py ./
+# The MiniMax official prompt-writing guide, imported by the enhancer.
+COPY models/minimax_h3/prompt_enhancer.py ./prompt_guide.py
 COPY runpod_worker/gateway/static ./static
 
 # RUNPOD_API_KEY, RUNPOD_ENDPOINT_ID, GATEWAY_KEYS and DATABASE_URL come from

@@ -89,6 +89,90 @@ DEFAULT_ASPECT = "horizontal"
 ACCEL_PROFILE = "Turbo Lightx2v FL2V 4 Steps v1.1 768p"
 MODEL_TYPE = "minimax_h3_fl2va_pruned"
 
+# ---- prompt enhancement ----------------------------------------------------
+#: RunPod's managed public LLM endpoint (create an API key, call it -- no
+#: deployment). The SAME account key the video endpoint uses works here, so
+#: enhancement adds no new credential. Token-priced, cents per thousand
+#: enhancements; a failure of any kind falls back to the raw prompt rather
+#: than failing the generation the caller actually paid for.
+LLM_ENDPOINT = os.environ.get("GATEWAY_LLM_ENDPOINT", "qwen3-32b-awq")
+LLM_MODEL = os.environ.get("GATEWAY_LLM_MODEL", "Qwen/Qwen3-32B-AWQ")
+LLM_TIMEOUT_S = float(os.environ.get("GATEWAY_LLM_TIMEOUT_S", "30"))
+#: A prompt already in the H3 structured format (the example chips, a reused
+#: gallery prompt, a power user pasting the full format) must NOT go through
+#: the enhancer again -- it IS the enhanced form.
+_H3_FORMAT_PREFIX = "integrated_multimodal_description:"
+
+
+def _load_prompt_guide() -> str | None:
+    """MiniMax's official FL2VA prompt-writing guide, shipped with the repo as
+    models/minimax_h3/prompt_enhancer.py (pure string definitions). The
+    container build copies that file next to this one as prompt_guide.py; the
+    repo layout finds it in the tree. No guide -> enhancement quietly becomes
+    a pass-through rather than a crash at import."""
+    try:
+        try:
+            from . import prompt_guide  # type: ignore[attr-defined]
+        except ImportError:
+            import prompt_guide  # type: ignore[no-redef]
+        return prompt_guide.FL2VA_PROMPT_INFOS
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        source = (Path(__file__).resolve().parents[2]
+                  / "models" / "minimax_h3" / "prompt_enhancer.py")
+        namespace: dict[str, Any] = {}
+        exec(source.read_text(), namespace)  # noqa: S102 - our own checked-in file
+        return namespace["FL2VA_PROMPT_INFOS"]
+    except Exception:  # noqa: BLE001
+        return None
+
+
+PROMPT_GUIDE = _load_prompt_guide()
+
+
+def _llm_chat(messages: list[dict], max_tokens: int = 800) -> str:
+    """One chat completion against the public endpoint; raises on any failure
+    (the caller decides what a failure means)."""
+    req = urllib.request.Request(
+        f"{RUNPOD_API}/{LLM_ENDPOINT}/openai/v1/chat/completions",
+        data=json.dumps({"model": LLM_MODEL, "messages": messages,
+                         "max_tokens": max_tokens, "temperature": 0.7}).encode(),
+        headers={"Content-Type": "application/json",
+                 "Authorization": f"Bearer {_env('RUNPOD_API_KEY')}"})
+    with urllib.request.urlopen(req, timeout=LLM_TIMEOUT_S) as r:
+        payload = json.loads(r.read())
+    return (payload["choices"][0]["message"].get("content") or "").strip()
+
+
+def _enhance_prompt(prompt: str, duration_s: int) -> str:
+    """Expand a plain-language idea into the full H3 structured prompt.
+
+    Fail-open by design: enhancement is a quality upgrade, never a gate. Any
+    problem -- guide missing, endpoint down, timeout, output that is not in
+    the H3 format -- returns the original prompt unchanged.
+    """
+    if not PROMPT_GUIDE:
+        return prompt
+    if prompt.lstrip().lower().startswith(_H3_FORMAT_PREFIX):
+        return prompt
+    shots = ("a single continuous shot" if duration_s <= 5
+             else "one to three shots with timed cuts")
+    system = (
+        "You are a prompt writer for the MiniMax H3 video model. Rewrite the "
+        "user's idea into one H3 FL2VA prompt following this official guide "
+        "exactly. Output ONLY the prompt text, no commentary, no markdown "
+        f"fences. Target {shots} totalling about {duration_s} seconds. "
+        "/no_think\n\n" + PROMPT_GUIDE)
+    try:
+        out = _llm_chat([{"role": "system", "content": system},
+                         {"role": "user", "content": prompt}])
+    except Exception:  # noqa: BLE001 - fail open, the generation must proceed
+        return prompt
+    if not out.lstrip().lower().startswith(_H3_FORMAT_PREFIX):
+        return prompt
+    return out[:4000]
+
 CACHE = Path(os.environ.get("GATEWAY_CACHE", "/tmp/gateway-videos"))
 CACHE.mkdir(parents=True, exist_ok=True)
 
@@ -372,6 +456,12 @@ class VideoRequest(BaseModel):
     #: -1 (or omitted) picks a random seed; the resolved value is returned so a
     #: generation can be reproduced exactly.
     seed: int | None = Field(default=None, ge=-1, le=2**31 - 1)
+    #: Expand a plain-language idea into the full H3 structured prompt before
+    #: generating. Prompts already in the H3 format (they start with
+    #: "integrated_multimodal_description:") are never re-enhanced, so the
+    #: Studio example chips and reused gallery prompts pass through verbatim.
+    enhance_prompt: bool = Field(
+        default=False, description="expand a short prompt into the H3 format")
 
 
 #: Wall-clock seconds per (tier, duration) a warm request takes end to end
@@ -462,6 +552,10 @@ def create(body: VideoRequest, ident: Ident = Depends(auth)) -> dict:
     if not db.try_consume_quota(ident.quota_hash, today, ident.limit):
         raise HTTPException(429, f"daily limit of {ident.limit} videos reached")
 
+    prompt = body.prompt
+    if body.enhance_prompt:
+        prompt = _enhance_prompt(prompt, body.duration_s)
+
     frames = DURATIONS[body.duration_s]
     # Only 480p at 5 or 10 s fits inside SYNC_TIMEOUT (measured ~22 s and
     # ~56 s). Everything else takes minutes; a held connection cannot outlast
@@ -471,7 +565,7 @@ def create(body: VideoRequest, ident: Ident = Depends(auth)) -> dict:
     background = body.background or tier != "480p" or body.duration_s > 10
     _purge_expired_cache()
     settings: dict[str, Any] = {
-        "prompt": body.prompt,
+        "prompt": prompt,
         "resolution": DIMENSIONS[(tier, aspect)],
         "video_length": frames,
         "sample_solver": "euler",
@@ -695,6 +789,16 @@ def _adventure_render_one(scene: dict) -> None:
             video=base64.b64decode(video["data"]))
         return
     raise RuntimeError("timed out waiting for the scene")
+
+
+@app.get("/adventures", include_in_schema=False)
+def adventures_home():
+    """The browse page: one featured story that is real (Biscuit) and a shelf
+    of coming-soon cards. Static by design -- there is one story."""
+    page = STATIC / "adventures.html"
+    if not page.exists():
+        raise HTTPException(404, "adventures page not installed")
+    return FileResponse(page, media_type="text/html")
 
 
 @app.get("/adventure", include_in_schema=False)

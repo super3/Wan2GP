@@ -1241,3 +1241,104 @@ def test_adventure_link_unfurls_with_a_poster(client):
     assert r.status_code == 200
     assert r.headers["content-type"] == "image/jpeg"
     assert r.content[:3] == b"\xff\xd8\xff"
+
+
+# --- prompt enhancement ------------------------------------------------------
+
+H3_PROMPT = ("integrated_multimodal_description: [Shot 1] A fox on a ridge.\n"
+             "overall_soundscape: Wind.\nnon_diegetic_music: None.")
+
+
+def test_enhancement_rewrites_a_plain_prompt(client):
+    c, m = client
+    seen = {}
+
+    def fake(path, payload=None, timeout=60):
+        if payload:
+            seen.update(payload["input"]["settings"])
+            return {"id": "job-1"}
+        return COMPLETED
+
+    with mock.patch.object(m, "_rp", side_effect=fake), \
+         mock.patch.object(m, "PROMPT_GUIDE", "guide text"), \
+         mock.patch.object(m, "_llm_chat", return_value=H3_PROMPT) as llm:
+        r = c.post("/v1/videos",
+                   json={"prompt": "a fox on a ridge", "enhance_prompt": True},
+                   headers=_hdr(KEY_A))
+    assert r.status_code == 200
+    assert seen["prompt"] == H3_PROMPT
+    # the raw idea went to the LLM as the user message
+    assert llm.call_args[0][0][-1] == {"role": "user", "content": "a fox on a ridge"}
+
+
+def test_already_formatted_prompts_are_never_reenhanced(client):
+    """The Studio example chips ship the full H3 format; running them through
+    the enhancer again would mangle curated prompts and waste tokens."""
+    c, m = client
+    seen = {}
+
+    def fake(path, payload=None, timeout=60):
+        if payload:
+            seen.update(payload["input"]["settings"])
+            return {"id": "job-1"}
+        return COMPLETED
+
+    with mock.patch.object(m, "_rp", side_effect=fake), \
+         mock.patch.object(m, "PROMPT_GUIDE", "guide text"), \
+         mock.patch.object(m, "_llm_chat") as llm:
+        r = c.post("/v1/videos",
+                   json={"prompt": H3_PROMPT, "enhance_prompt": True},
+                   headers=_hdr(KEY_A))
+    assert r.status_code == 200
+    assert seen["prompt"] == H3_PROMPT
+    llm.assert_not_called()
+
+
+def test_enhancement_fails_open(client):
+    """The LLM being down, slow, or off-format must never block the
+    generation the caller actually paid for."""
+    c, m = client
+    seen = {}
+
+    def fake(path, payload=None, timeout=60):
+        if payload:
+            seen.update(payload["input"]["settings"])
+            return {"id": "job-1"}
+        return COMPLETED
+
+    for bad in (RuntimeError("down"), None):
+        with mock.patch.object(m, "_rp", side_effect=fake), \
+             mock.patch.object(m, "PROMPT_GUIDE", "guide text"), \
+             mock.patch.object(
+                 m, "_llm_chat",
+                 **({"side_effect": bad} if bad else {"return_value": "not the format"})):
+            r = c.post("/v1/videos",
+                       json={"prompt": "a fox", "enhance_prompt": True},
+                       headers=_hdr(KEY_A))
+        assert r.status_code == 200
+        assert seen["prompt"] == "a fox"
+
+
+def test_enhancement_is_off_by_default(client):
+    c, m = client
+    with mock.patch.object(m, "_rp", _backend()), \
+         mock.patch.object(m, "_llm_chat") as llm:
+        r = c.post("/v1/videos", json={"prompt": "a fox"}, headers=_hdr(KEY_A))
+    assert r.status_code == 200
+    llm.assert_not_called()
+
+
+def test_prompt_guide_loads_from_the_repo_tree():
+    """In the repo layout the guide resolves from models/minimax_h3; the
+    container ships it as a sibling module. Either way enhancement has the
+    official MiniMax guide, not a stub."""
+    from runpod_worker.gateway import app as m
+    assert m.PROMPT_GUIDE and "integrated_multimodal_description" in m.PROMPT_GUIDE
+
+
+def test_adventures_home_is_served(client):
+    c, _ = client
+    r = c.get("/adventures")
+    assert r.status_code == 200
+    assert "BISCUIT" in r.text
+    assert "/adventure" in r.text

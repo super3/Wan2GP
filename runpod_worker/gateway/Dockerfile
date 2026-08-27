@@ -14,6 +14,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # db.py and static/ ship with the app; the old boot-script deploys curl'd
 # app.py alone, which is why the missing static/ copy never surfaced.
+# NOTE: a gateway-rooted context cannot reach models/minimax_h3/
+# prompt_enhancer.py, so this build ships WITHOUT the prompt guide and
+# enhancement is a pass-through. Production (railway.Dockerfile, repo-root
+# context) copies it in as prompt_guide.py. To match that here, copy the
+# file into this directory as prompt_guide.py before building.
 COPY app.py db.py story.py ./
 COPY static ./static
 

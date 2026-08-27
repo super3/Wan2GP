@@ -55,11 +55,20 @@
   .hint { font-size:12px; color:#6b665e; margin:6px 0 0; line-height:1.5; }
   .prompt-head { display:flex; align-items:baseline; justify-content:space-between; }
   .count { font-size:11px; color:#6b665e; font-family:"JetBrains Mono",monospace; }
-  textarea { width:100%; min-height:130px; resize:vertical; margin-top:5px;
+  .pbox { margin-top:5px; background:#faf9f7; border:1px solid #e3e0da; border-radius:9px;
+          overflow:hidden; }
+  .pbox:focus-within { outline:2px solid #b4531f; outline-offset:-1px; }
+  textarea { display:block; width:100%; min-height:104px; resize:none;
              font-family:"JetBrains Mono",monospace; font-size:12.5px; line-height:1.55;
-             color:#1c1a17; background:#faf9f7; border:1px solid #e3e0da; border-radius:9px;
-             padding:11px 13px; }
-  textarea:focus, input:focus { outline:2px solid #b4531f; outline-offset:-1px; }
+             color:#1c1a17; background:none; border:none; outline:none;
+             padding:11px 13px 2px; }
+  .enhrow { display:flex; justify-content:flex-start; padding:0 13px 8px; }
+  .enhrow label { display:inline-flex; align-items:center; gap:6px; font-size:12px;
+                  color:#6b665e; cursor:pointer; user-select:none; margin:0;
+                  text-transform:none; letter-spacing:normal; }
+  .enhrow input { width:14px; height:14px; accent-color:#b4531f; margin:0; cursor:pointer; }
+  input:focus { outline:2px solid #b4531f; outline-offset:-1px; }
+  .enhrow input:focus { outline:none; }
   .chips { display:flex; align-items:center; gap:6px; flex-wrap:wrap; margin-top:8px; }
   .chips span { font-size:12px; color:#6b665e; }
   .chips button { font-size:12px; color:#6b665e; background:#faf9f7; border:1px solid #e3e0da;
@@ -225,7 +234,12 @@
           <label style="margin:0">Prompt</label>
           <span class="count"><span id="chars">0</span> / 2000</span>
         </div>
-        <textarea id="prompt" spellcheck="false" maxlength="2000" placeholder="A brass desk lamp switches on in a dark study, dust drifting through the beam…"></textarea>
+        <div class="pbox">
+          <textarea id="prompt" spellcheck="false" maxlength="2000" placeholder="A brass desk lamp switches on in a dark study, dust drifting through the beam…"></textarea>
+          <div class="enhrow">
+            <label title="Expands short prompts into the full H3 format"><input type="checkbox" id="enhance" checked>Enhance prompt</label>
+          </div>
+        </div>
         <div class="chips">
           <button type="button" data-p="integrated_multimodal_description: [Shot 1] A cinematic close-up of a brass desk lamp switching on in a dark study, dust drifting through the beam. The camera pushes in slowly.&#10;overall_soundscape: A single click, a low electrical hum, faint room tone.&#10;non_diegetic_music: None.">Desk lamp</button>
           <button type="button" data-p="integrated_multimodal_description: [Shot 1] Rain streaking down a café window at dusk, neon signs blurring into bokeh beyond the glass. The camera holds still.&#10;overall_soundscape: Steady rain, muffled street noise, a distant tram bell.&#10;non_diegetic_music: None.">Rain on glass</button>
@@ -809,6 +823,11 @@ $("go").addEventListener("click", async () => {
       body: JSON.stringify({
         prompt, duration_s: Number(state.dur), resolution: state.tier,
         aspect_ratio: state.aspect, background: true,
+        // Example chips and reused gallery prompts are already in the H3
+        // format -- never re-enhance those (the server also refuses to).
+        enhance_prompt: $("enhance").checked &&
+          !prompt.trimStart().toLowerCase()
+                 .startsWith("integrated_multimodal_description:"),
         ...(Number.isFinite(seedVal) && seedVal >= 0 ? { seed: seedVal } : {}),
       }),
     });

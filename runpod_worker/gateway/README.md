@@ -79,6 +79,14 @@ X-Has-Audio  X-Generate-Seconds
 `seed` is optional in the request; `X-Seed` returns the resolved value so a
 generation can be reproduced exactly.
 
+`enhance_prompt: true` expands a plain-language idea into the full H3
+structured prompt (MiniMax's official prompt-writing guide, applied by a
+token-priced LLM on the same RunPod account) before generating. Prompts
+already in the H3 format — anything starting with
+`integrated_multimodal_description:` — pass through verbatim, and any
+enhancement failure falls back to the raw prompt rather than failing the
+generation.
+
 ### The one case that is not synchronous
 
 A warm generation is ~56 s, comfortably inside a normal HTTP timeout. A **cold
