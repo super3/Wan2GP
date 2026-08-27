@@ -1066,7 +1066,7 @@ def test_story_tree_is_well_formed():
 def test_adventure_state_and_page(client):
     c, _ = client
     body = c.get("/adventure").text
-    assert "Begin the adventure" in body
+    assert 'id="begin"' in body and "Play now" in body    # the title-card gate
     assert "Branch map" in body
     assert "/adventure/state" in body and "/adventure/scene/" in body
     st = c.get("/adventure/state").json()

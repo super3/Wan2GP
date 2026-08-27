@@ -18,7 +18,7 @@
 <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 26 26%22><rect width=%2226%22 height=%2226%22 rx=%227%22 fill=%22%23e8874a%22/><path d=%22M13 5.5l1.7 5.3 5.5 2.2-5.5 2.2L13 20.5l-1.7-5.3L5.8 13l5.5-2.2z%22 fill=%22%23141312%22/></svg>">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;500;650&family=JetBrains+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;500;650;800&family=JetBrains+Mono:wght@400;500&display=swap">
 <style>
   * { box-sizing:border-box; }
   [hidden] { display:none !important; }
@@ -30,13 +30,15 @@
   @keyframes omFade { from { opacity:0 } to { opacity:1 } }
   @keyframes omRise { from { opacity:0; transform:translateY(10px) } to { opacity:1; transform:none } }
   header { background:#0f0e0d; border-bottom:1px solid #221f1c; }
-  .hwrap { max-width:1080px; margin:0 auto; padding:15px 28px;
+  .hwrap { max-width:1200px; margin:0 auto; padding:15px 28px;
            display:flex; align-items:center; justify-content:space-between; gap:16px; }
   .hwrap .tag { font-size:10.5px; letter-spacing:.16em; text-transform:uppercase;
                 color:#a09a90; padding-top:2px; }
+  .hwrap .back { color:inherit; margin-right:9px; }
+  .hwrap .back:hover { color:#e8874a; text-decoration:none; }
   .hwrap .by { font-family:"JetBrains Mono",monospace; font-size:11px; color:#6b665e; }
   .hwrap a.by:hover { color:#e8874a; text-decoration:none; }
-  main { max-width:1080px; margin:0 auto; padding:26px 28px 70px; }
+  main { max-width:1200px; margin:0 auto; padding:26px 28px 70px; }
   .stage { position:relative; aspect-ratio:16/9; border-radius:12px; overflow:hidden;
            border:1px solid #221f1c;
            background:repeating-linear-gradient(45deg,#181614,#181614 12px,#1b1917 12px,#1b1917 24px); }
@@ -81,13 +83,33 @@
   .skip:hover { color:#f5f3f0; border-color:#e8874a; }
   .prog { position:absolute; left:0; bottom:0; height:3px; width:0%;
           background:#e8874a; transition:width .12s linear; }
-  .beginbox, .waitbox { position:absolute; inset:0; display:flex; flex-direction:column;
-              align-items:center; justify-content:center; gap:14px; background:rgba(15,14,13,.7); }
+  .waitbox { position:absolute; inset:0; display:flex; flex-direction:column;
+             align-items:center; justify-content:center; gap:14px; background:rgba(15,14,13,.7); }
   .begin { display:inline-flex; align-items:center; gap:10px; font-size:16px; font-weight:650;
            color:#141312; background:#e8874a; border:1px solid #e8874a; border-radius:10px;
            padding:14px 28px; }
   .begin:hover { background:#f0a06e; border-color:#f0a06e; }
-  .beginbox .sub, .waitbox .sub { font-size:12.5px; color:#a09a90; }
+  .waitbox .sub { font-size:12.5px; color:#a09a90; }
+  /* Netflix-style title card shown before the first user gesture (which is
+     what unlocks audio autoplay for every scene after it). */
+  .beginbox { position:absolute; inset:0; }
+  .beginbox .art { position:absolute; inset:0;
+                   background:url("/adventure/poster.jpg") center/cover no-repeat; }
+  .beginbox .shade { position:absolute; inset:0; background:
+      linear-gradient(180deg, rgba(20,19,18,0) 30%, rgba(20,19,18,.94) 92%),
+      linear-gradient(90deg, rgba(20,19,18,.5) 0%, rgba(20,19,18,0) 55%); }
+  .beginbox .inner { position:absolute; left:0; right:0; bottom:0;
+                     padding:26px 32px 32px; display:flex; flex-direction:column;
+                     gap:10px; animation:omFade .4s ease-out; }
+  .cardtag { width:max-content; font-size:10px; font-weight:650; letter-spacing:.12em;
+             color:#e8874a; border:1px solid rgba(232,135,74,.45); border-radius:4px;
+             padding:2px 8px; background:rgba(20,19,18,.55); }
+  .cardtitle { font-size:54px; font-weight:800; letter-spacing:.06em; line-height:1.02;
+               margin:0; text-shadow:0 2px 14px rgba(0,0,0,.65); }
+  .cardline { font-size:14.5px; color:#dcd7cf; margin:0; max-width:56ch;
+              text-shadow:0 1px 4px rgba(0,0,0,.65); }
+  .cardcta { display:flex; align-items:center; gap:16px; flex-wrap:wrap; margin-top:8px; }
+  .cardcta .sub { font-size:12.5px; color:#c9c4bb; text-shadow:0 1px 3px rgba(0,0,0,.6); }
   .waitbox .big { font-family:"JetBrains Mono",monospace; font-size:14px; color:#e8874a; }
   .pathline { display:flex; justify-content:space-between; align-items:baseline; gap:16px;
               flex-wrap:wrap; margin:10px 2px 0; font-family:"JetBrains Mono",monospace;
@@ -125,15 +147,21 @@
     .scenetag { font-size:9px; }
     .choice { font-size:13px; padding:10px 12px; }
     .begin { font-size:14px; padding:11px 20px; }
-    .beginbox .sub, .waitbox .sub { font-size:11px; padding:0 16px; text-align:center; }
+    .waitbox .sub { font-size:11px; padding:0 16px; text-align:center; }
+    .beginbox .inner { padding:12px 14px 16px; gap:6px; }
+    .cardtag { display:none; }
+    .cardtitle { font-size:26px; }
+    .cardline { font-size:12px; display:-webkit-box; -webkit-line-clamp:2;
+                -webkit-box-orient:vertical; overflow:hidden; }
+    .cardcta .sub { font-size:10.5px; }
     .skip { bottom:12px; right:10px; }
   }
 </style>
 </head>
 <body>
 <header><div class="hwrap">
-  <span class="tag"><a href="/adventures" style="color:inherit">◂ ADVENTURES</a> · A choose-your-path adventure</span>
-  <a class="by" href="https://h3studio.up.railway.app/">powered by Minimax H3 Studio</a>
+  <span class="tag"><a class="back" href="/adventures" title="All adventures">◂</a>A choose-your-path adventure</span>
+  <a class="by" href="https://h3studio.up.railway.app/">powered by Minimax H3</a>
 </div></header>
 
 <main>
@@ -156,8 +184,17 @@
       </div>
     </div>
     <div class="beginbox" id="beginbox">
-      <button type="button" class="begin" id="begin">▶&nbsp; Begin the adventure</button>
-      <span class="sub">15-second scenes with sound. Best with volume on</span>
+      <div class="art"></div>
+      <div class="shade"></div>
+      <div class="inner">
+        <span class="cardtag">A CHOOSE-YOUR-PATH ADVENTURE</span>
+        <h1 class="cardtitle">BISCUIT</h1>
+        <p class="cardline">A corgi, an open gate, and one big morning. Every choice is a new 15-second scene, generated in real time.</p>
+        <div class="cardcta">
+          <button type="button" class="begin" id="begin">▶&nbsp; Play now</button>
+          <span class="sub">15-second scenes with sound. Best with volume on</span>
+        </div>
+      </div>
     </div>
     <div class="waitbox" id="waitbox" hidden>
       <span class="big" id="waitmsg">rendering this scene…</span>
