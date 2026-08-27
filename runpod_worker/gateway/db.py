@@ -442,9 +442,11 @@ def adventure_status(story: str) -> dict[str, dict[str, Any]]:
     with engine().connect() as cx:
         rows = cx.execute(
             sa.select(adventure_scenes.c.id, adventure_scenes.c.status,
-                      adventure_scenes.c.seed, adventure_scenes.c.attempts)
+                      adventure_scenes.c.seed, adventure_scenes.c.attempts,
+                      adventure_scenes.c.error, adventure_scenes.c.job_id)
             .where(adventure_scenes.c.story == story)).all()
-    return {r[0]: {"status": r[1], "seed": r[2], "attempts": r[3]} for r in rows}
+    return {r[0]: {"status": r[1], "seed": r[2], "attempts": r[3],
+                   "error": r[4], "job_id": r[5]} for r in rows}
 
 
 def adventure_video(scene_id: str) -> bytes | None:

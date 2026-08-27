@@ -271,7 +271,11 @@ def _startup() -> None:
              "title": nodes[nid]["title"], "prompt": nodes[nid]["prompt"],
              "parent_id": story.parent_of(slug, nid)}
             for pos, nid in enumerate(story.order_of(slug))])
-    if os.environ.get("GATEWAY_ADVENTURE_AUTOGEN", "1").strip() != "0":
+    # Default OFF while the continuity rollout is diagnosed: every render
+    # attempt is real GPU spend, and a failing loop with retries drained the
+    # balance once already. Set GATEWAY_ADVENTURE_AUTOGEN=1 (or flip this
+    # default back) to resume rendering.
+    if os.environ.get("GATEWAY_ADVENTURE_AUTOGEN", "0").strip() != "0":
         _start_adventure_renderer()
 
 
@@ -922,17 +926,24 @@ def adventure_poster(slug: str = story.STORY_ID):
 
 @app.get("/adventures/{slug}/state")
 @app.get("/adventure/state")                       # legacy alias
-def adventure_state(slug: str = story.STORY_ID) -> dict:
+def adventure_state(slug: str = story.STORY_ID, debug: int = 0) -> dict:
     """The story tree (no prompts) with each scene's live render status --
     the page builds the branch map from this and polls it while scenes are
-    still rendering. Public: the story is shared by everyone."""
+    still rendering. Public: the story is shared by everyone. ?debug=1 adds
+    each scene's last error, attempts and backend job id -- render-ops
+    telemetry, nothing secret."""
     _story_or_404(slug)
     statuses = db.adventure_status(slug)
     nodes = []
     for node in story.public_tree(slug):
         row = statuses.get(node["id"], {})
-        nodes.append({**node, "status": row.get("status", "queued"),
-                      "seed": row.get("seed")})
+        entry = {**node, "status": row.get("status", "queued"),
+                 "seed": row.get("seed")}
+        if debug:
+            entry.update({"error": row.get("error"),
+                          "attempts": row.get("attempts"),
+                          "job_id": row.get("job_id")})
+        nodes.append(entry)
     return {"story": slug,
             "scene_s": story.SCENE_DURATION_S, "nodes": nodes}
 
