@@ -1219,6 +1219,35 @@ def test_adventure_children_start_from_parents_last_frame(client):
     assert seen["settings"]["video_length"] == 362
 
 
+def test_old_worker_image_requeues_without_burning_attempts(client):
+    """A continuation job that fails with the old image's ffmpeg signature is
+    the backend's fault, not the scene's: it goes back to queued with attempts
+    reset, so the story survives any wait for the fixed image to roll out."""
+    c, m = client
+    from runpod_worker.gateway import db as dbmod
+    dbmod.adventure_claim("biscuit")
+    dbmod.adventure_mark("n0", "ready", video=b"clip")
+    scene = dbmod.adventure_claim("biscuit")
+
+    def fake(path, payload=None, timeout=60):
+        if payload:
+            return {"id": "adv-x"}
+        return {"status": "FAILED",
+                "error": "ffmpeg decode failed: Unrecognized option 'fps_mode'."}
+
+    with mock.patch.object(m, "_rp", side_effect=fake), \
+         mock.patch.object(m, "_video_duration_s", return_value=15.0), \
+         mock.patch.object(m.time, "sleep", lambda s: None):
+        m._adventure_render_one(scene, "biscuit")     # must not raise
+    row = dbmod.adventure_status("biscuit")[scene["id"]]
+    assert row["status"] == "queued"
+    import sqlalchemy as sa
+    with dbmod.engine().connect() as cx:
+        attempts = cx.execute(sa.select(dbmod.adventure_scenes.c.attempts).where(
+            dbmod.adventure_scenes.c.id == scene["id"])).scalar_one()
+    assert attempts == 0
+
+
 def test_adventure_continuity_migration_requeues_old_clips(client):
     """Rows rendered before the continuity migration have no parent_id; the
     seed backfills it ONCE and requeues them so the tree becomes continuous.

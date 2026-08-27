@@ -369,7 +369,7 @@ def adventure_any_rendering(story: str) -> bool:
 def adventure_mark(scene_id: str, status: str, *, job_id: str | None = None,
                    seed: int | None = None, generate_s: float | None = None,
                    error: str | None = None, video: bytes | None = None,
-                   bump_attempts: bool = False) -> None:
+                   bump_attempts: bool = False, reset_attempts: bool = False) -> None:
     values: dict[str, Any] = {"status": status, "updated_at": _now()}
     if job_id is not None:
         values["job_id"] = job_id
@@ -383,6 +383,8 @@ def adventure_mark(scene_id: str, status: str, *, job_id: str | None = None,
         values["video"] = video
     if bump_attempts:
         values["attempts"] = adventure_scenes.c.attempts + 1
+    if reset_attempts:
+        values["attempts"] = 0
     with engine().begin() as cx:
         cx.execute(adventure_scenes.update()
                    .where(adventure_scenes.c.id == scene_id).values(**values))

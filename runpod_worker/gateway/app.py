@@ -812,6 +812,15 @@ def _adventure_render_one(scene: dict, slug: str = story.STORY_ID) -> None:
         if state in ("IN_QUEUE", "IN_PROGRESS"):
             continue
         if state != "COMPLETED":
+            if "fps_mode" in json.dumps(st):
+                # The worker image predates video_source support (its ffmpeg
+                # rejects the decoder's flag). Not this scene's fault: requeue
+                # without burning an attempt and back off until the endpoint
+                # runs the fixed image.
+                db.adventure_mark(sid, "queued", reset_attempts=True,
+                                  error="waiting for a worker image with video_source support")
+                time.sleep(120)
+                return
             raise RuntimeError((st.get("output") or {}).get("message", f"job {state}"))
         out = st.get("output") or {}
         video = out.get("video") or {}
