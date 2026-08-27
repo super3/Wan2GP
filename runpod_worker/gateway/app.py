@@ -688,6 +688,7 @@ def _adventure_loop() -> None:
     # after every deploy.)
     for slug in story.STORIES:
         db.adventure_requeue_stale(slug, older_than_s=0)
+        db.adventure_reset_broken_chain(slug)
     lanes = [threading.Thread(target=_adventure_lane, daemon=True,
                               name=f"adventure-lane-{i}")
              for i in range(max(1, ADVENTURE_LANES))]
@@ -784,6 +785,10 @@ def _adventure_render_one(scene: dict, slug: str = story.STORY_ID) -> None:
     trim_lead_s: float | None = None
     parent_id = story.parent_of(slug, sid)
     parent = db.adventure_video(parent_id) if parent_id is not None else None
+    if parent_id is not None and parent is None:
+        # The claim gate should make this unreachable; a silent fallback
+        # here would bake a cut into a story sold on continuity.
+        raise RuntimeError(f"parent clip for {sid} missing; not rendering a cut")
     if parent is not None:
         # Continue the parent's video: its last 5 s condition the new scene.
         settings["image_prompt_type"] = "V"

@@ -323,17 +323,17 @@ def adventure_claim(story: str, max_attempts: int = 3) -> dict[str, Any] | None:
     parallel render lanes never double-claim on ANY engine -- a plain
     select-then-update raced under SQLite's deferred transactions and let
     two lanes bump the same scene twice. A child is only claimable once its
-    parent's clip exists (its start frame comes from it) or the parent is
-    terminally failed (render without continuity rather than never). The
-    attempt is spent at claim time -- a lane that dies still burned its try."""
+    parent's clip exists: the child CONTINUES that clip, so rendering
+    without it would bake a visible discontinuity into the product. A
+    failed parent therefore blocks its subtree until it is requeued (every
+    deploy retries failures via adventure_reset_broken_chain). The attempt
+    is spent at claim time -- a lane that dies still burned its try."""
     parent = adventure_scenes.alias("parent")
     parent_done = sa.or_(
         adventure_scenes.c.parent_id.is_(None),
         sa.exists(sa.select(parent.c.id).where(
             parent.c.id == adventure_scenes.c.parent_id,
-            sa.or_(parent.c.status == "ready",
-                   sa.and_(parent.c.status == "failed",
-                           parent.c.attempts >= max_attempts)))))
+            parent.c.status == "ready")))
     for _ in range(10):                    # races are rare; retries settle them
         with engine().connect() as cx:
             row = cx.execute(
@@ -356,6 +356,44 @@ def adventure_claim(story: str, max_attempts: int = 3) -> dict[str, Any] | None:
         if won:
             return {"id": row[0], "prompt": row[1]}
     return None
+
+
+def adventure_reset_broken_chain(story: str) -> int:
+    """Deploy-time self-healing for the continuity chain. Two repairs, run
+    to a fixpoint because each can expose the other one level down:
+
+    * failed scenes are requeued with fresh attempts -- a deploy is the
+      deliberate moment to retry what previously burned out (e.g. an infra
+      failure fixed since);
+    * a scene whose clip exists but whose PARENT is no longer ready was
+      rendered against a clip that is being replaced (or, historically,
+      with no clip at all): its footage cannot flow from what the parent
+      will become, so it re-renders too.
+
+    Roots are exempt from the second rule and finished trees are a no-op.
+    Returns how many rows were requeued."""
+    total = 0
+    for _ in range(8):                     # tree depth bounds the cascade
+        with engine().begin() as cx:
+            failed = cx.execute(adventure_scenes.update().where(
+                adventure_scenes.c.story == story,
+                adventure_scenes.c.status == "failed",
+            ).values(status="queued", attempts=0, error=None,
+                     updated_at=_now())).rowcount
+            parent = adventure_scenes.alias("parent")
+            stale = cx.execute(adventure_scenes.update().where(
+                adventure_scenes.c.story == story,
+                adventure_scenes.c.status == "ready",
+                adventure_scenes.c.parent_id.is_not(None),
+                sa.exists(sa.select(parent.c.id).where(
+                    parent.c.id == adventure_scenes.c.parent_id,
+                    parent.c.status != "ready")),
+            ).values(status="queued", attempts=0, error=None, video=None,
+                     updated_at=_now())).rowcount
+        total += failed + stale
+        if failed + stale == 0:
+            break
+    return total
 
 
 def adventure_any_rendering(story: str) -> bool:

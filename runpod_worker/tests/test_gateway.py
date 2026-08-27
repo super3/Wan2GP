@@ -1119,7 +1119,12 @@ def test_adventure_loop_retries_failures_then_moves_on(client):
          mock.patch.object(m.time, "sleep", lambda s: None):
         m._adventure_loop()                        # runs to exhaustion
     statuses = dbmod.adventure_status("biscuit")
-    assert all(v["status"] == "failed" for v in statuses.values())
+    # The root burns its retries; everything below it stays queued (a child
+    # continues its parent's clip, so it must never render past a failed
+    # parent) and the loop still terminates instead of spinning.
+    assert statuses["n0"]["status"] == "failed"
+    assert all(v["status"] == "queued"
+               for k, v in statuses.items() if k != "n0")
     assert all(v["attempts"] == 3 for v in statuses.values())
     assert dbmod.adventure_next("biscuit") is None
 
@@ -1175,6 +1180,45 @@ def test_adventure_claim_two_lanes_and_parent_gating(client):
     a, b = dbmod.adventure_claim("biscuit"), dbmod.adventure_claim("biscuit")
     assert {a["id"], b["id"]} == {"n_van", "n_bakery"}    # both paths at once
     assert dbmod.adventure_claim("biscuit") is None       # depth 3 blocked
+
+
+def test_failed_parent_blocks_subtree_and_deploy_reset_heals_it(client):
+    """A child CONTINUES its parent's clip, so a failed parent must block its
+    whole subtree (never silently render a cut), and the deploy-time reset
+    requeues the failure plus any scene that was rendered against a parent
+    that is no longer ready."""
+    c, m = client
+    from runpod_worker.gateway import db as dbmod
+    dbmod.adventure_claim("biscuit")
+    dbmod.adventure_mark("n0", "ready", video=b"clip")
+    for _ in range(3):                                    # burn n_van out
+        while True:
+            s = dbmod.adventure_claim("biscuit")
+            assert s is not None
+            if s["id"] == "n_van":
+                dbmod.adventure_mark("n_van", "failed", error="boom")
+                break
+            dbmod.adventure_mark(s["id"], "ready", video=b"clip")
+    blocked = {"n_ride", "n_glitter", "end_mayor", "end_park",
+               "end_party", "end_surprise"}
+    while (s := dbmod.adventure_claim("biscuit")) is not None:
+        assert s["id"] not in blocked                     # subtree stays gated
+        dbmod.adventure_mark(s["id"], "ready", video=b"clip")
+    st = dbmod.adventure_status("biscuit")
+    assert st["n_van"]["status"] == "failed"
+    assert st["n_ride"]["status"] == "queued"
+    # Simulate the historical bug: a child rendered while its parent was
+    # failed. The reset must requeue it along with the failure itself.
+    with dbmod.engine().begin() as cx:
+        cx.execute(dbmod.adventure_scenes.update()
+                   .where(dbmod.adventure_scenes.c.id == "n_ride")
+                   .values(status="ready", video=b"a baked-in cut"))
+    assert dbmod.adventure_reset_broken_chain("biscuit") >= 2
+    st = dbmod.adventure_status("biscuit")
+    assert st["n_van"]["status"] == "queued"              # retries next pass
+    assert st["n_ride"]["status"] == "queued"             # cut clip discarded
+    assert dbmod.adventure_video("n_ride") is None
+    assert dbmod.adventure_reset_broken_chain("biscuit") == 0   # idempotent
 
 
 def test_adventure_children_start_from_parents_last_frame(client):
