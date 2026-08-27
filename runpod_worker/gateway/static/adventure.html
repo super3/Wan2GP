@@ -32,10 +32,8 @@
   header { background:#0f0e0d; border-bottom:1px solid #221f1c; }
   .hwrap { max-width:1200px; margin:0 auto; padding:15px 28px;
            display:flex; align-items:center; justify-content:space-between; gap:16px; }
-  .hwrap .tag { font-size:10.5px; letter-spacing:.16em; text-transform:uppercase;
-                color:#a09a90; padding-top:2px; }
-  .hwrap .back { color:inherit; margin-right:9px; }
-  .hwrap .back:hover { color:#e8874a; text-decoration:none; }
+  .wordmark { font-size:17px; font-weight:800; letter-spacing:.24em; color:#f5f3f0; }
+  a.wordmark:hover { color:#e8874a; text-decoration:none; }
   .hwrap .by { font-family:"JetBrains Mono",monospace; font-size:11px; color:#6b665e; }
   .hwrap a.by:hover { color:#e8874a; text-decoration:none; }
   main { max-width:1200px; margin:0 auto; padding:26px 28px 70px; }
@@ -139,7 +137,6 @@
   .foot { margin:36px auto 0; text-align:center; font-size:13px; color:#6b665e; max-width:64ch; }
   @media (max-width: 720px) {
     main { padding:14px 12px 50px; }
-    .hwrap { padding:12px 16px; }
     .overlay { padding:12px 14px 14px; gap:10px; }
     .stitle { font-size:19px; margin:5px 0; }
     .sdesc { font-size:12px; line-height:1.5; display:-webkit-box;
@@ -160,7 +157,7 @@
 </head>
 <body>
 <header><div class="hwrap">
-  <span class="tag"><a class="back" href="/adventures" title="All adventures">◂</a>A choose-your-path adventure</span>
+  <a class="wordmark" href="/adventures" title="All adventures">ADVENTURES</a>
   <a class="by" href="https://h3studio.up.railway.app/">powered by Minimax H3</a>
 </div></header>
 
