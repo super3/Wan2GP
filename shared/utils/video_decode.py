@@ -394,6 +394,27 @@ def _parse_first_showinfo_pts_time(stderr_text):
     return None
 
 
+_FPS_PASSTHROUGH_ARGS = None
+
+
+def _fps_passthrough_args(ffmpeg_path):
+    """``-fps_mode`` arrived in ffmpeg 5.1; older builds (e.g. Ubuntu 22.04's
+    4.4) reject it outright. ``-vsync 0`` is the pre-5.1 spelling with the
+    same passthrough semantics and is still accepted by current ffmpeg, so
+    probe the binary's help text once and pick whichever it understands."""
+    global _FPS_PASSTHROUGH_ARGS
+    if _FPS_PASSTHROUGH_ARGS is None:
+        try:
+            help_text = subprocess.run(
+                [ffmpeg_path, "-hide_banner", "-h", "long"],
+                capture_output=True, timeout=10).stdout.decode(errors="ignore")
+        except Exception:
+            help_text = ""
+        _FPS_PASSTHROUGH_ARGS = (["-fps_mode", "passthrough"]
+                                 if "fps_mode" in help_text else ["-vsync", "0"])
+    return _FPS_PASSTHROUGH_ARGS
+
+
 def _decode_contiguous_video_frames_ffmpeg(video_path, start_frame, max_frames, bridge="torch", hdr_linear=False):
     metadata = probe_video_stream_metadata(video_path)
     if metadata is None:
@@ -444,7 +465,7 @@ def _decode_contiguous_video_frames_ffmpeg(video_path, start_frame, max_frames, 
     if len(video_filter) > 0:
         cmd += ["-vf", video_filter]
     out_pix_fmt = "gbrpf32le" if hdr_linear else "rgb24"
-    cmd += ["-fps_mode", "passthrough", "-frames:v", str(requested_frames), "-f", "rawvideo", "-pix_fmt", out_pix_fmt, "pipe:1"]
+    cmd += [*_fps_passthrough_args(ffmpeg_path), "-frames:v", str(requested_frames), "-f", "rawvideo", "-pix_fmt", out_pix_fmt, "pipe:1"]
     process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=10**7)
     frame_bytes = metadata["display_width"] * metadata["display_height"] * 3 * (4 if hdr_linear else 1)
     frame_dtype = np.float32 if hdr_linear else np.uint8
@@ -527,7 +548,7 @@ def decode_video_frame_indices_ffmpeg(video_path, frame_indices, bridge="torch",
         cmd += ["-ss", f"{float(metadata.get('start_time') or 0.0) + (actual_start / fps_float):.12g}"]
     cmd += ["-i", decode_path, "-an", "-sn", "-vf", video_filter]
     out_pix_fmt = "gbrpf32le" if hdr_linear else "rgb24"
-    cmd += ["-fps_mode", "passthrough", "-frames:v", str(len(unique_indices)), "-f", "rawvideo", "-pix_fmt", out_pix_fmt, "pipe:1"]
+    cmd += [*_fps_passthrough_args(ffmpeg_path), "-frames:v", str(len(unique_indices)), "-f", "rawvideo", "-pix_fmt", out_pix_fmt, "pipe:1"]
     process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=10**7)
     frame_bytes = metadata["display_width"] * metadata["display_height"] * 3 * (4 if hdr_linear else 1)
     frame_dtype = np.float32 if hdr_linear else np.uint8
