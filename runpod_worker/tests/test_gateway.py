@@ -1065,11 +1065,17 @@ def test_story_tree_is_well_formed():
 
 def test_adventure_state_and_page(client):
     c, _ = client
-    body = c.get("/adventure").text
+    # The canonical player URL is story-scoped; the old /adventure redirects.
+    r = c.get("/adventure", follow_redirects=False)
+    assert r.status_code == 308
+    assert r.headers["location"] == "/adventures/biscuit"
+    assert c.get("/adventures/nope").status_code == 404
+    body = c.get("/adventures/biscuit").text
     assert 'id="begin"' in body and "Play now" in body    # the title-card gate
     assert "Branch map" in body
-    assert "/adventure/state" in body and "/adventure/scene/" in body
-    st = c.get("/adventure/state").json()
+    assert 'STORY_BASE + "/state"' in body and 'STORY_BASE + "/scene/"' in body
+    st = c.get("/adventures/biscuit/state").json()
+    assert c.get("/adventure/state").json() == st          # legacy alias
     assert len(st["nodes"]) == 14
     assert st["nodes"][0]["id"] == "n0" and st["nodes"][0]["status"] == "queued"
     assert all("prompt" not in n for n in st["nodes"])   # prompts stay private
@@ -1084,12 +1090,13 @@ def test_adventure_renders_in_encounter_order_and_serves_from_db(client):
          mock.patch.object(m.time, "sleep", lambda s: None):
         m._adventure_render_one(scene)
     assert dbmod.adventure_status("biscuit")["n0"]["status"] == "ready"
-    r = c.get("/adventure/scene/n0")
+    r = c.get("/adventures/biscuit/scene/n0")
     assert r.status_code == 200 and r.content == MP4
     assert r.headers["content-type"].startswith("video/mp4")
+    assert c.get("/adventure/scene/n0").content == MP4        # legacy alias
     assert dbmod.adventure_next("biscuit")["id"] == "n_van"   # then depth 2
-    assert c.get("/adventure/scene/n_bakery").status_code == 404  # not yet
-    assert c.get("/adventure/scene/nope").status_code == 404
+    assert c.get("/adventures/biscuit/scene/n_bakery").status_code == 404  # not yet
+    assert c.get("/adventures/biscuit/scene/nope").status_code == 404
 
 
 def test_adventure_loop_retries_failures_then_moves_on(client):
@@ -1234,10 +1241,11 @@ def test_adventure_link_unfurls_with_a_poster(client):
     """Reddit/Discord/Twitter scrape Open Graph tags; without them a shared
     link is bare text. og:image must be an absolute URL and must serve."""
     c, _ = client
-    body = c.get("/adventure").text
-    assert 'property="og:image" content="https://h3studio.up.railway.app/adventure/poster.jpg"' in body
+    body = c.get("/adventures/biscuit").text
+    assert 'property="og:image" content="https://h3studio.up.railway.app/adventures/biscuit/poster.jpg"' in body
     assert 'name="twitter:card" content="summary_large_image"' in body
-    r = c.get("/adventure/poster.jpg")
+    assert c.get("/adventure/poster.jpg").status_code == 200   # legacy og scrapes
+    r = c.get("/adventures/biscuit/poster.jpg")
     assert r.status_code == 200
     assert r.headers["content-type"] == "image/jpeg"
     assert r.content[:3] == b"\xff\xd8\xff"
@@ -1376,9 +1384,9 @@ def test_waitlist_rejects_non_addresses(client):
 
 def test_waitlist_form_is_on_both_adventure_pages(client):
     c, _ = client
-    for path in ("/adventures", "/adventure"):
+    for path in ("/adventures", "/adventures/biscuit"):
         body = c.get(path).text
         assert "Get early access" in body, path
         assert "/adventure/waitlist" in body, path
     assert "Get notified" in c.get("/adventures").text
-    assert "Keep me posted" in c.get("/adventure").text
+    assert "Keep me posted" in c.get("/adventures/biscuit").text

@@ -55,7 +55,7 @@ except ImportError:                      # flat /app layout in the container
 
 import jwt
 from fastapi import Depends, FastAPI, HTTPException, Header, Request
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
 from pydantic import BaseModel, Field
 
 RUNPOD_API = "https://api.runpod.ai/v2"
@@ -801,17 +801,33 @@ def adventures_home():
     return FileResponse(page, media_type="text/html")
 
 
+def _story_or_404(slug: str) -> str:
+    if slug not in story.STORIES:
+        raise HTTPException(404, "no such story")
+    return slug
+
+
 @app.get("/adventure", include_in_schema=False)
-def adventure_page():
+def adventure_legacy():
+    """The pre-slug URL. Permanent redirect so old links and bookmarks land
+    on the canonical story page."""
+    return RedirectResponse(f"/adventures/{story.STORY_ID}", status_code=308)
+
+
+@app.get("/adventures/{slug}", include_in_schema=False)
+def adventure_page(slug: str):
+    _story_or_404(slug)
     page = STATIC / "adventure.html"
     if not page.exists():
         raise HTTPException(404, "adventure page not installed")
     return FileResponse(page, media_type="text/html")
 
 
-@app.get("/adventure/poster.jpg", include_in_schema=False)
-def adventure_poster():
+@app.get("/adventures/{slug}/poster.jpg", include_in_schema=False)
+@app.get("/adventure/poster.jpg", include_in_schema=False)   # og:image legacy
+def adventure_poster(slug: str = story.STORY_ID):
     """The link-preview image (og:image) social scrapers fetch."""
+    _story_or_404(slug)
     poster = STATIC / "adventure-poster.jpg"
     if not poster.exists():
         raise HTTPException(404, "poster not installed")
@@ -819,8 +835,10 @@ def adventure_poster():
                         headers={"Cache-Control": "public, max-age=86400"})
 
 
-@app.get("/adventure/state")
-def adventure_state() -> dict:
+@app.get("/adventures/{slug}/state")
+@app.get("/adventure/state")                       # legacy alias
+def adventure_state(slug: str = story.STORY_ID) -> dict:
+    _story_or_404(slug)
     """The story tree (no prompts) with each scene's live render status --
     the page builds the branch map from this and polls it while scenes are
     still rendering. Public: the story is shared by everyone."""
@@ -862,8 +880,10 @@ def adventure_waitlist(body: WaitlistRequest, request: Request) -> None:
     db.waitlist_add(email, body.source)
 
 
-@app.get("/adventure/scene/{scene_id}")
-def adventure_scene(scene_id: str):
+@app.get("/adventures/{slug}/scene/{scene_id}")
+@app.get("/adventure/scene/{scene_id}")            # legacy alias
+def adventure_scene(scene_id: str, slug: str = story.STORY_ID):
+    _story_or_404(slug)
     if scene_id not in story.NODES:
         raise HTTPException(404, "no such scene")
     data = db.adventure_video(scene_id)

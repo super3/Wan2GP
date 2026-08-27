@@ -23,6 +23,11 @@ BISCUIT = ("Biscuit, a small cheerful corgi with a copper-and-white coat, "
 
 STORY_ID = "biscuit"
 
+#: Every playable story, by URL slug: /adventures/{slug} is the player page
+#: and all of a story's API routes hang off it. A new story is a new entry
+#: here plus its node definitions -- the routes never change.
+STORIES: dict[str, str] = {STORY_ID: "Biscuit"}
+
 #: Seconds per scene and the pixel size every scene is rendered at.
 SCENE_DURATION_S = 15
 SCENE_RESOLUTION = "832x480"
