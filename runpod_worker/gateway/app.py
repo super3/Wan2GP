@@ -264,11 +264,13 @@ if _EXAMPLES.exists():
 @app.on_event("startup")
 def _startup() -> None:
     _seed_env_keys()
-    db.adventure_seed(story.STORY_ID, [
-        {"id": nid, "position": pos, "depth": story.depth_of(nid),
-         "title": story.NODES[nid]["title"], "prompt": story.NODES[nid]["prompt"],
-         "parent_id": story.parent_of(nid)}
-        for pos, nid in enumerate(story.ORDER)])
+    for slug in story.STORIES:
+        nodes = story.nodes_of(slug)
+        db.adventure_seed(slug, [
+            {"id": nid, "position": pos, "depth": story.depth_of(slug, nid),
+             "title": nodes[nid]["title"], "prompt": nodes[nid]["prompt"],
+             "parent_id": story.parent_of(slug, nid)}
+            for pos, nid in enumerate(story.order_of(slug))])
     if os.environ.get("GATEWAY_ADVENTURE_AUTOGEN", "1").strip() != "0":
         _start_adventure_renderer()
 
@@ -684,7 +686,8 @@ def _adventure_loop() -> None:
     # out the steady-state staleness window. (A deploy's brief old/new
     # overlap can duplicate one render -- cents -- versus a 15-minute stall
     # after every deploy.)
-    db.adventure_requeue_stale(story.STORY_ID, older_than_s=0)
+    for slug in story.STORIES:
+        db.adventure_requeue_stale(slug, older_than_s=0)
     lanes = [threading.Thread(target=_adventure_lane, daemon=True,
                               name=f"adventure-lane-{i}")
              for i in range(max(1, ADVENTURE_LANES))]
@@ -696,47 +699,76 @@ def _adventure_loop() -> None:
 
 def _adventure_lane() -> None:
     while True:
-        scene = db.adventure_claim(story.STORY_ID)
+        scene, slug = None, None
+        for candidate in story.STORIES:
+            scene = db.adventure_claim(candidate)
+            if scene is not None:
+                slug = candidate
+                break
         if scene is None:
             # Nothing claimable: children may be waiting on a parent another
             # lane is rendering, or a dead process left a stale claim.
-            db.adventure_requeue_stale(story.STORY_ID)
-            if not db.adventure_any_rendering(story.STORY_ID):
+            for candidate in story.STORIES:
+                db.adventure_requeue_stale(candidate)
+            if not any(db.adventure_any_rendering(s) for s in story.STORIES):
                 return                 # every scene ready (or out of retries)
             time.sleep(30)
             continue
         try:
-            _adventure_render_one(scene)
+            _adventure_render_one(scene, slug)
         except Exception as exc:  # noqa: BLE001 - one bad scene must not end the run
             db.adventure_mark(scene["id"], "failed",
                               error=f"{type(exc).__name__}: {exc}")
 
 
-def _last_frame_b64(parent_id: str) -> str | None:
-    """The parent clip's final frame as base64 JPEG -- the child's image_start.
-    None when the parent has no stored video (terminally failed) or ffmpeg is
-    unavailable: the child then renders without continuity rather than never."""
-    data = db.adventure_video(parent_id)
-    if data is None:
-        return None
+#: 5 s of the parent's tail conditions each child scene (the D variant of the
+#: continuity A/B): the child flows out of the parent instead of cutting.
+#: 120 context frames + 361 new frames = 481, exactly the model's largest
+#: single window, and the new content is still a full 15 s scene.
+CONTINUITY_OVERLAP_FRAMES = 120
+CONTINUITY_WINDOW_FRAMES = 481
+
+
+def _video_duration_s(data: bytes) -> float | None:
     import subprocess
     import tempfile
     try:
         with tempfile.TemporaryDirectory() as td:
-            src, out = Path(td) / "parent.mp4", Path(td) / "last.jpg"
+            src = Path(td) / "v.mp4"
             src.write_bytes(data)
             proc = subprocess.run(
-                ["ffmpeg", "-nostdin", "-sseof", "-0.25", "-i", str(src),
-                 "-frames:v", "1", "-update", "1", "-q:v", "2", str(out)],
+                ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                 "-of", "default=noprint_wrappers=1:nokey=1", str(src)],
                 capture_output=True, timeout=60)
-            if proc.returncode != 0 or not out.exists():
-                return None
-            return base64.b64encode(out.read_bytes()).decode()
-    except Exception:  # noqa: BLE001 - continuity is best effort
+            return float(proc.stdout.decode().strip())
+    except Exception:  # noqa: BLE001
         return None
 
 
-def _adventure_render_one(scene: dict) -> None:
+def _trim_lead(data: bytes, lead_s: float) -> bytes:
+    """A continuation's output carries the whole parent clip in front of the
+    new content; the stored scene must be only the new part. Fail-open: an
+    untrimmed clip is a worse UX but a working story."""
+    import subprocess
+    import tempfile
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            src, out = Path(td) / "full.mp4", Path(td) / "scene.mp4"
+            src.write_bytes(data)
+            proc = subprocess.run(
+                ["ffmpeg", "-nostdin", "-v", "error", "-ss", f"{lead_s:.6f}",
+                 "-i", str(src), "-c:v", "libx264", "-preset", "veryfast",
+                 "-crf", "18", "-c:a", "aac", "-movflags", "+faststart",
+                 str(out)],
+                capture_output=True, timeout=300)
+            if proc.returncode != 0 or not out.exists():
+                return data
+            return out.read_bytes()
+    except Exception:  # noqa: BLE001
+        return data
+
+
+def _adventure_render_one(scene: dict, slug: str = story.STORY_ID) -> None:
     """Render one scene to completion and store the bytes. Raises on failure;
     the lane records it and moves on (with retries via adventure_claim)."""
     sid = scene["id"]
@@ -749,25 +781,27 @@ def _adventure_render_one(scene: dict) -> None:
         "multi_prompts_gen_type": "FG",
     }
     media: dict[str, Any] = {}
-    parent_id = story.parent_of(sid)
-    if parent_id is not None:
-        frame = _last_frame_b64(parent_id)
-        if frame:
-            # wgp reads image_start only when "S" is in image_prompt_type --
-            # the letter and the attachment must be set together.
-            settings["image_prompt_type"] = "S"
-            media["image_start"] = {"b64": frame}
+    trim_lead_s: float | None = None
+    parent_id = story.parent_of(slug, sid)
+    parent = db.adventure_video(parent_id) if parent_id is not None else None
+    if parent is not None:
+        # Continue the parent's video: its last 5 s condition the new scene.
+        settings["image_prompt_type"] = "V"
+        settings["sliding_window_overlap"] = CONTINUITY_OVERLAP_FRAMES
+        settings["video_length"] = CONTINUITY_WINDOW_FRAMES
+        media["video_source"] = {"b64": base64.b64encode(parent).decode()}
+        trim_lead_s = _video_duration_s(parent)
     created = _rp("run", {"input": {
         "model_type": MODEL_TYPE, "profile": ACCEL_PROFILE,
         "settings": settings, "media": media,
         "output": {"mode": "auto"},
-        "runtime": {"timeout_s": 1200},
+        "runtime": {"timeout_s": 1800},
     }})
     job_id = created.get("id")
     if not job_id:
         raise RuntimeError("submit returned no job id")
     db.adventure_mark(sid, "rendering", job_id=job_id)
-    deadline = time.monotonic() + 1500      # cold start + a 15 s scene, with slack
+    deadline = time.monotonic() + 2200      # cold start + a 481-frame window, with slack
     while time.monotonic() < deadline:
         time.sleep(5)
         try:
@@ -783,10 +817,14 @@ def _adventure_render_one(scene: dict) -> None:
         video = out.get("video") or {}
         if video.get("kind") != "base64":
             raise RuntimeError("no inline video in the job output")
+        data = base64.b64decode(video["data"])
+        if trim_lead_s:
+            # A continuation returns parent + new; store only the new scene.
+            data = _trim_lead(data, trim_lead_s)
         db.adventure_mark(
             sid, "ready", seed=out.get("seed"),
             generate_s=(out.get("metrics") or {}).get("generate_s"),
-            video=base64.b64decode(video["data"]))
+            video=data)
         return
     raise RuntimeError("timed out waiting for the scene")
 
@@ -816,39 +854,69 @@ def adventure_legacy():
 
 @app.get("/adventures/{slug}", include_in_schema=False)
 def adventure_page(slug: str):
+    """One player page serves every story: its metadata rides on template
+    tokens filled from the registry, and everything else the page needs it
+    fetches from the story-scoped state route."""
     _story_or_404(slug)
     page = STATIC / "adventure.html"
     if not page.exists():
         raise HTTPException(404, "adventure page not installed")
-    return FileResponse(page, media_type="text/html")
+    meta = story.STORIES[slug]
+    html = page.read_text()
+    for token, value in (("{{SLUG}}", slug),
+                         ("{{PAGE_TITLE}}", meta["page_title"]),
+                         ("{{STORY_TITLE}}", meta["title"].upper()),
+                         ("{{BLURB}}", meta["blurb"])):
+        html = html.replace(token, value)
+    return Response(content=html, media_type="text/html")
 
 
 @app.get("/adventures/{slug}/poster.jpg", include_in_schema=False)
 @app.get("/adventure/poster.jpg", include_in_schema=False)   # og:image legacy
 def adventure_poster(slug: str = story.STORY_ID):
-    """The link-preview image (og:image) social scrapers fetch."""
+    """The link-preview image (og:image) social scrapers fetch. Shipped art
+    when the repo has it; otherwise a frame pulled from the story's opening
+    scene once that has rendered."""
     _story_or_404(slug)
-    poster = STATIC / "adventure-poster.jpg"
-    if not poster.exists():
-        raise HTTPException(404, "poster not installed")
-    return FileResponse(poster, media_type="image/jpeg",
-                        headers={"Cache-Control": "public, max-age=86400"})
+    for name in (f"adventure-poster-{slug}.jpg",
+                 "adventure-poster.jpg" if slug == story.STORY_ID else ""):
+        if name and (STATIC / name).exists():
+            return FileResponse(STATIC / name, media_type="image/jpeg",
+                                headers={"Cache-Control": "public, max-age=86400"})
+    cached = CACHE / f"poster-{slug}.jpg"
+    if not cached.exists():
+        opening = db.adventure_video(story.order_of(slug)[0])
+        if opening is None:
+            raise HTTPException(404, "poster not available yet")
+        import subprocess
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            src = Path(td) / "n0.mp4"
+            src.write_bytes(opening)
+            proc = subprocess.run(
+                ["ffmpeg", "-nostdin", "-v", "error", "-ss", "8", "-i", str(src),
+                 "-frames:v", "1", "-update", "1", "-q:v", "2", str(cached)],
+                capture_output=True, timeout=60)
+            if proc.returncode != 0 or not cached.exists():
+                raise HTTPException(404, "poster not available yet")
+    return FileResponse(cached, media_type="image/jpeg",
+                        headers={"Cache-Control": "public, max-age=3600"})
 
 
 @app.get("/adventures/{slug}/state")
 @app.get("/adventure/state")                       # legacy alias
 def adventure_state(slug: str = story.STORY_ID) -> dict:
-    _story_or_404(slug)
     """The story tree (no prompts) with each scene's live render status --
     the page builds the branch map from this and polls it while scenes are
     still rendering. Public: the story is shared by everyone."""
-    statuses = db.adventure_status(story.STORY_ID)
+    _story_or_404(slug)
+    statuses = db.adventure_status(slug)
     nodes = []
-    for node in story.public_tree():
+    for node in story.public_tree(slug):
         row = statuses.get(node["id"], {})
         nodes.append({**node, "status": row.get("status", "queued"),
                       "seed": row.get("seed")})
-    return {"story": story.STORY_ID,
+    return {"story": slug,
             "scene_s": story.SCENE_DURATION_S, "nodes": nodes}
 
 
@@ -884,7 +952,7 @@ def adventure_waitlist(body: WaitlistRequest, request: Request) -> None:
 @app.get("/adventure/scene/{scene_id}")            # legacy alias
 def adventure_scene(scene_id: str, slug: str = story.STORY_ID):
     _story_or_404(slug)
-    if scene_id not in story.NODES:
+    if scene_id not in story.nodes_of(slug):
         raise HTTPException(404, "no such scene")
     data = db.adventure_video(scene_id)
     if data is None:

@@ -3,18 +3,18 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Biscuit: A Choose-Your-Path Adventure</title>
+<title>{{PAGE_TITLE}}</title>
 <meta name="description" content="A choose-your-own-adventure where every scene is a 15-second AI-generated video with sound. Two paths, seven endings, powered by Minimax H3.">
 <meta property="og:type" content="website">
-<meta property="og:url" content="https://h3studio.up.railway.app/adventures/biscuit">
-<meta property="og:title" content="Biscuit: A Choose-Your-Path Adventure">
+<meta property="og:url" content="https://h3studio.up.railway.app/adventures/{{SLUG}}">
+<meta property="og:title" content="{{PAGE_TITLE}}">
 <meta property="og:description" content="A choose-your-own-adventure where every scene is a 15-second AI-generated video with sound. Two paths, seven endings, powered by Minimax H3.">
-<meta property="og:image" content="https://h3studio.up.railway.app/adventures/biscuit/poster.jpg">
+<meta property="og:image" content="https://h3studio.up.railway.app/adventures/{{SLUG}}/poster.jpg">
 <meta property="og:image:width" content="832">
 <meta property="og:image:height" content="480">
 <meta name="twitter:card" content="summary_large_image">
-<meta name="twitter:title" content="Biscuit: A Choose-Your-Path Adventure">
-<meta name="twitter:image" content="https://h3studio.up.railway.app/adventures/biscuit/poster.jpg">
+<meta name="twitter:title" content="{{PAGE_TITLE}}">
+<meta name="twitter:image" content="https://h3studio.up.railway.app/adventures/{{SLUG}}/poster.jpg">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 26 26%22><rect width=%2226%22 height=%2226%22 rx=%227%22 fill=%22%23e8874a%22/><path d=%22M13 5.5l1.7 5.3 5.5 2.2-5.5 2.2L13 20.5l-1.7-5.3L5.8 13l5.5-2.2z%22 fill=%22%23141312%22/></svg>">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -113,7 +113,7 @@
      what unlocks audio autoplay for every scene after it). */
   .beginbox { position:absolute; inset:0; }
   .beginbox .art { position:absolute; inset:0;
-                   background:url("/adventures/biscuit/poster.jpg") center/cover no-repeat; }
+                   background:url("/adventures/{{SLUG}}/poster.jpg") center/cover no-repeat; }
   .beginbox .shade { position:absolute; inset:0; background:
       linear-gradient(180deg, rgba(20,19,18,0) 30%, rgba(20,19,18,.94) 92%),
       linear-gradient(90deg, rgba(20,19,18,.5) 0%, rgba(20,19,18,0) 55%); }
@@ -231,8 +231,8 @@
       <div class="shade"></div>
       <div class="inner">
         <span class="cardtag">A CHOOSE-YOUR-PATH ADVENTURE</span>
-        <h1 class="cardtitle">BISCUIT</h1>
-        <p class="cardline">A corgi, an open gate, and one big morning. Every choice is a new 15-second scene, generated in real time.</p>
+        <h1 class="cardtitle">{{STORY_TITLE}}</h1>
+        <p class="cardline">{{BLURB}}</p>
         <div class="cardcta">
           <button type="button" class="begin" id="begin">▶&nbsp; Play now</button>
           <span class="sub">15-second scenes with sound. Best with volume on</span>

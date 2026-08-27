@@ -23,11 +23,6 @@ BISCUIT = ("Biscuit, a small cheerful corgi with a copper-and-white coat, "
 
 STORY_ID = "biscuit"
 
-#: Every playable story, by URL slug: /adventures/{slug} is the player page
-#: and all of a story's API routes hang off it. A new story is a new entry
-#: here plus its node definitions -- the routes never change.
-STORIES: dict[str, str] = {STORY_ID: "Biscuit"}
-
 #: Seconds per scene and the pixel size every scene is rendered at.
 SCENE_DURATION_S = 15
 SCENE_RESOLUTION = "832x480"
@@ -295,26 +290,341 @@ ORDER: list[str] = [
 ]
 
 
-def depth_of(node_id: str) -> int:
-    depths = {"n0": 1, "n_van": 2, "n_bakery": 2,
-              "n_ride": 3, "n_glitter": 3, "n_eyes": 3, "n_cat": 3}
-    return depths.get(node_id, 4)
+# ---------------------------------------------------------------------------
+# Space Picnic
+# ---------------------------------------------------------------------------
+
+PIP = ("Pip, a golden hamster astronaut with round cheeks and tiny paws, "
+       "wearing a small white spacesuit with orange stripes and an open "
+       "clear bubble helmet")
+
+SP_NODES: dict[str, dict] = {
+    "sp0": {
+        "title": "The Floating Basket",
+        "desc": ("You are Pip, a hamster with a picnic basket and a window seat "
+                 "over Earth. The moment you open the lid, everything floats: "
+                 "the sandwich, the grapes, one runaway strawberry, and a whole "
+                 "squadron of juice bubbles."),
+        "choices": [["Chase the runaway strawberry", "sp_berry"],
+                    ["Wrangle the juice bubbles", "sp_juice"]],
+        "prompt": _p(
+            "The bright observation dome of a space station, Earth glowing "
+            f"through the wide windows. {PIP} floats beside a wicker picnic "
+            "basket strapped to the floor, opening the lid. A checkered blanket "
+            "unfurls in slow motion; a sandwich, a bunch of grapes, and a "
+            "bright red strawberry drift out weightlessly in different "
+            "directions while wobbling spheres of purple juice escape a bottle. "
+            "The camera slowly orbits as the hamster looks between the fleeing "
+            "strawberry and the shimmering juice bubbles, whiskers twitching, "
+            "deciding.",
+            "A soft station hum, gentle ventilation, the creak of the wicker "
+            "lid, wet wobbles of floating juice, tiny excited hamster squeaks."),
+    },
+    "sp_berry": {
+        "title": "The Runaway Strawberry",
+        "desc": ("The strawberry has a head start and zero respect. It pinballs "
+                 "down the corridor toward the greenhouse hatch, right past the "
+                 "station's friendly robot arm, which just woke up and would "
+                 "love a job."),
+        "choices": [["Follow it into the greenhouse", "sp_green"],
+                    ["Ask the robot arm for help", "sp_arm"]],
+        "prompt": _p(
+            f"A tracking shot follows {PIP} paddling through the air down a "
+            "white station corridor, chasing a bright red strawberry that "
+            "tumbles lazily ahead, glinting in the light. The strawberry "
+            "bounces off a porthole, spins past handrails, and drifts toward a "
+            "junction: on one side glows the leafy light of a greenhouse module "
+            "hatch, on the other a friendly yellow robot arm folded against the "
+            "wall blinks awake with a curious tilt. The hamster glances between "
+            "them mid-float.",
+            "Air whooshing softly, paw taps on handrails, the ping of the "
+            "strawberry off glass, a gentle servo whir."),
+    },
+    "sp_juice": {
+        "title": "The Juice Bubbles",
+        "desc": ("Dozens of purple juice spheres wobble around the dome like a "
+                 "tiny solar system. You could drink your dessert the fun way, "
+                 "or there is a perfectly good fan clipped to the wall."),
+        "choices": [["Slurp them out of the air", "sp_slurp"],
+                    ["Herd them with a fan", "sp_fan"]],
+        "prompt": _p(
+            f"{PIP} floats in the middle of the observation dome surrounded by "
+            "dozens of wobbling purple juice spheres of every size, each "
+            "catching the light of Earth below. The hamster spins slowly, boots "
+            "over head, gently batting the largest bubble, which splits into a "
+            "cloud of smaller ones. On the wall a small handheld fan is clipped "
+            "beside the hatch. The camera drifts closer as the hamster looks "
+            "from its own open mouth to the fan and back, cheeks puffed with "
+            "mischief.",
+            "Deep wet wobbles and blips of floating liquid, the station hum, "
+            "one long thoughtful hamster squeak."),
+    },
+    "sp_green": {
+        "title": "The Greenhouse",
+        "desc": ("The greenhouse smells like tomatoes and rain. Somewhere "
+                 "between the vines, the strawberry has finally run out of "
+                 "places to hide, and a cherry tomato seems to have joined "
+                 "your side."),
+        "choices": [["Set the picnic among the plants", "spend_vines"],
+                    ["Take it back to the big window", "spend_window"]],
+        "prompt": _p(
+            f"{PIP} glides through the hatch into a lush greenhouse module "
+            "where tomato vines and lettuce grow in spiral racks under warm "
+            "pink grow-lights, water droplets floating like tiny lenses. The "
+            "strawberry drifts ahead through the leaves and the hamster weaves "
+            "after it, brushing past a floating cherry tomato that joins the "
+            "chase. The camera follows through the foliage as the hamster "
+            "finally cups the strawberry in both paws, triumphant, surrounded "
+            "by drifting greenery.",
+            "Soft irrigation mist, leaves brushing, a small victorious squeak, "
+            "droplets pattering on leaves."),
+    },
+    "sp_arm": {
+        "title": "An Unlikely Butler",
+        "desc": ("The robot arm catches the strawberry on the first try, then "
+                 "looks at you, if an arm can look, clearly asking: what else "
+                 "needs catching?"),
+        "choices": [["Let it set the table", "spend_table"],
+                    ["Share the picnic with it", "spend_crumbs"]],
+        "prompt": _p(
+            "The friendly yellow robot arm unfolds from the wall with three "
+            "smooth joints and a two-fingered gripper, its status light "
+            f"blinking like a wink at {PIP}. In one fluid motion it plucks the "
+            "tumbling strawberry from the air and holds it out. The hamster "
+            "claps its paws; the arm gently pats the hamster's helmet, then "
+            "begins collecting the drifting sandwich and grapes, stacking them "
+            "neatly on its gripper like a tray while the camera slowly pulls "
+            "back.",
+            "Precise servo whirs and soft clicks, a happy squeak, the faint "
+            "bump of the strawberry into the gripper, station hum."),
+    },
+    "sp_slurp": {
+        "title": "The Great Slurp",
+        "desc": ("You are getting good at this. Cheeks full, mustache purple, "
+                 "one last enormous bubble left, wobbling right in front of "
+                 "your nose."),
+        "choices": [["Take a victory lap", "spend_mustache"],
+                    ["Gather everything for the feast", "spend_feast"]],
+        "prompt": _p(
+            f"{PIP} darts from bubble to bubble in the observation dome, "
+            "slurping each purple sphere out of the air with comic little "
+            "gulps, cheeks growing rounder with every catch. Each slurp sends "
+            "the hamster into a gentle backwards spin against the glow of "
+            "Earth. The final and largest bubble wobbles right in front of the "
+            "lens; the hamster looks straight into it, its reflection stretched "
+            "and upside down, and grins before the last enormous slurp leaves a "
+            "purple mustache across its whiskers.",
+            "Comic wet slurps and pops, tiny gulps, giggly squeaks between "
+            "catches, one big final gulp."),
+    },
+    "sp_fan": {
+        "title": "The Bubble Shepherd",
+        "desc": ("The fan hums, and suddenly you are not chasing bubbles "
+                 "anymore, you are conducting them. The whole glittering school "
+                 "drifts wherever you point."),
+        "choices": [["Spin them into a ring", "spend_ring"],
+                    ["Round them up for the feast", "spend_feast"]],
+        "prompt": _p(
+            f"{PIP} clips its boots to a rail, aims the small handheld fan, and "
+            "switches it on: a gentle breeze catches the field of purple juice "
+            "bubbles and they drift together in a slow glittering current "
+            "across the dome. The hamster conducts them like an orchestra, "
+            "sweeping the fan in wide arcs, herding stragglers away from air "
+            "vents, until the whole shimmering school of spheres streams in "
+            "formation past the window with Earth turning below.",
+            "A small fan's whirr rising and falling, dozens of soft wobbles "
+            "moving together, satisfied squeaks, the deep station hum."),
+    },
+    "spend_vines": {
+        "title": "Picnic in the Vines",
+        "desc": ("Dinner is served on four leaves and a floating blanket. The "
+                 "tomato stays for dessert. Best seat in orbit, no contest."),
+        "choices": [],
+        "prompt": _p(
+            f"{PIP} spreads the checkered blanket in mid-air between the tomato "
+            "vines, pinning its corners to four leaves, and lays out the "
+            "strawberry, a floating cherry tomato, and a drifting lettuce leaf "
+            "like fine dining. The hamster tucks a leaf under its chin as a "
+            "napkin and nibbles the strawberry while grow-lights glow pink "
+            "through the foliage and droplets drift like tiny chandeliers. The "
+            "camera slowly circles the tiny impossible garden party.",
+            "Leaves rustling, soft mist, dainty little nibbles, a contented "
+            "squeak melody hummed between bites."),
+    },
+    "spend_window": {
+        "title": "Strawberry Over Earth",
+        "desc": ("Just you, one strawberry, and the whole blue planet rolling "
+                 "by underneath. Some picnics are worth chasing."),
+        "choices": [],
+        "prompt": _p(
+            f"{PIP} floats cross-legged in front of the observation dome's "
+            "widest window, the checkered picnic blanket drifting behind like a "
+            "cape, and takes a slow happy bite of the strawberry while Earth "
+            "rolls blue and bright below. Crumbs sparkle and drift like tiny "
+            "stars around the hamster's whiskers. The camera pulls back gently "
+            "until the small round silhouette hangs framed against the planet, "
+            "completely content.",
+            "A tiny crunch and happy chewing, the deep peaceful hum of the "
+            "station, one soft satisfied sigh of a squeak."),
+    },
+    "spend_table": {
+        "title": "The Perfect Table",
+        "desc": ("The arm holds the blanket flat like a proper table and pours "
+                 "juice into a perfect floating sphere. Fine dining, 400 "
+                 "kilometers up."),
+        "choices": [],
+        "prompt": _p(
+            "In the observation dome the yellow robot arm holds the picnic "
+            f"blanket perfectly flat like a floating table while {PIP} arranges "
+            "the rescued sandwich, grapes, and strawberry on top, everything "
+            "gently bobbing in place. The arm extends a second small gripper "
+            "holding the juice bottle and pours: the juice forms a neat "
+            "wobbling sphere above a cup as the hamster applauds. The camera "
+            "circles the absurdly elegant zero-gravity table setting with "
+            "Earth beyond the glass.",
+            "Smooth servos, the wobble of poured juice, delighted applause of "
+            "tiny paws, one proud beep from the arm."),
+    },
+    "spend_crumbs": {
+        "title": "Crumbs for the Robot",
+        "desc": ("You share your sandwich with a robot arm that cannot eat, and "
+                 "it rocks you like a swing anyway. New best friend: "
+                 "confirmed."),
+        "choices": [],
+        "prompt": _p(
+            f"{PIP} sits on the robot arm's gripper like a swing, sharing the "
+            "picnic: the hamster takes a bite of the sandwich, then holds a "
+            "grape up to the arm's camera lens as if feeding it, and the arm's "
+            "status light blinks pink. Together they watch drifting crumbs "
+            "sparkle in a sunbeam through the corridor porthole, the arm gently "
+            "rocking the hamster back and forth. The camera slowly pulls away "
+            "down the corridor as they sway.",
+            "A soft servo rocking rhythm, tiny bites, a friendly synth beep "
+            "answering each squeak, warm station hum."),
+    },
+    "spend_mustache": {
+        "title": "The Purple Mustache",
+        "desc": ("Victory laps, purple mustache, hiccups that spin you faster. "
+                 "Nobody in orbit has ever been happier."),
+        "choices": [],
+        "prompt": _p(
+            f"{PIP} tumbles in slow victorious somersaults across the "
+            "observation dome, purple juice mustache across its whiskers and "
+            "cheeks packed round, giggling between hiccups that each send it "
+            "spinning a little faster. The empty juice bottle drifts past; the "
+            "hamster salutes it. The camera rotates with the spin so Earth "
+            "wheels around behind, until the hamster spreads all four paws wide "
+            "and simply floats, grinning up into the lens with the messiest, "
+            "happiest face in orbit.",
+            "Helpless squeaky giggles interrupted by tiny hiccup pops, the "
+            "bottle clinking off glass, one long happy exhale."),
+    },
+    "spend_feast": {
+        "title": "The Zero-G Feast",
+        "desc": ("Everything you rescued now orbits you like a tiny solar "
+                 "system of snacks. You eat like a ringmaster. The crumbs "
+                 "sparkle."),
+        "choices": [],
+        "prompt": _p(
+            f"The whole picnic reassembled: {PIP} floats at the center of the "
+            "observation dome with the checkered blanket spread beneath like a "
+            "magic carpet, the sandwich, grapes, strawberry, and a "
+            "constellation of small juice spheres arranged in a slow orbit "
+            "around it like a tiny solar system of snacks. The hamster plucks "
+            "items from orbit one by one, taking bites as they pass, arms wide "
+            "like a ringmaster, while Earth glows through the window behind.",
+            "A gentle carousel of wobbles, cheerful nibbles and gulps, tiny "
+            "ringmaster squeaks, the deep contented hum of the station."),
+    },
+    "spend_ring": {
+        "title": "The Bubble Ring",
+        "desc": ("The bubbles form a slow golden ring with you in the middle, "
+                 "just as the sun rises over Earth. You made a planet ring out "
+                 "of juice."),
+        "choices": [],
+        "prompt": _p(
+            f"With one last sweep of the fan, {PIP} bends the stream of juice "
+            "bubbles into a slowly turning ring, a tiny glittering planet ring "
+            "right there in the dome, and floats into its center. The hamster "
+            "hangs at the middle of the orbiting spheres, arms out, as the ring "
+            "catches the sunrise coming over Earth's horizon and every bubble "
+            "ignites gold at once. The camera pulls back to frame the hamster "
+            "crowned by its ring against the window.",
+            "The fan winding down to silence, a chorus of soft synchronized "
+            "wobbles, an awed tiny squeak, a sunrise-warm hum."),
+    },
+}
+
+SP_ORDER: list[str] = [
+    "sp0",
+    "sp_berry", "sp_juice",
+    "sp_green", "sp_arm", "sp_slurp", "sp_fan",
+    "spend_vines", "spend_window", "spend_table", "spend_crumbs",
+    "spend_mustache", "spend_feast", "spend_ring",
+]
 
 
-def parent_of(node_id: str) -> str | None:
-    """The scene whose last frame this one starts from (FL2V continuity).
-    end_roll is reachable from two parents; the FIRST in encounter order is
-    canonical, so the other transition is a cut rather than a match."""
-    for pid in ORDER:
-        for _label, target in NODES[pid]["choices"]:
+# ---------------------------------------------------------------------------
+# The registry and story-scoped helpers
+# ---------------------------------------------------------------------------
+
+#: Every playable story, by URL slug: /adventures/{slug} is the player page
+#: and all of a story's API routes hang off it. A new story is a new entry
+#: here plus its node definitions -- the routes never change. "card" is the
+#: one-liner under its shelf card; "blurb" is the title-card pitch line.
+STORIES: dict[str, dict] = {
+    "biscuit": {
+        "title": "Biscuit",
+        "page_title": "Biscuit: A Choose-Your-Path Adventure",
+        "card": "A corgi's big day out",
+        "blurb": ("A corgi, an open gate, and one big morning. Every choice is "
+                  "a new 15-second scene, generated in real time."),
+        "nodes": NODES, "order": ORDER,
+    },
+    "space-picnic": {
+        "title": "Space Picnic",
+        "page_title": "Space Picnic: A Choose-Your-Path Adventure",
+        "card": "A picnic in zero gravity",
+        "blurb": ("A hamster, a picnic basket, and zero gravity. Every choice "
+                  "is a new 15-second scene, generated in real time."),
+        "nodes": SP_NODES, "order": SP_ORDER,
+    },
+}
+
+
+def nodes_of(slug: str) -> dict[str, dict]:
+    return STORIES[slug]["nodes"]
+
+
+def order_of(slug: str) -> list[str]:
+    return STORIES[slug]["order"]
+
+
+def depth_of(slug: str, node_id: str) -> int:
+    """Computed from the tree: ORDER lists parents before children, so one
+    pass assigns every node its first-encounter depth."""
+    depths = {order_of(slug)[0]: 1}
+    for nid in order_of(slug):
+        for _label, target in nodes_of(slug)[nid]["choices"]:
+            depths.setdefault(target, depths[nid] + 1)
+    return depths[node_id]
+
+
+def parent_of(slug: str, node_id: str) -> str | None:
+    """The scene this one continues from. A shared ending is reachable from
+    two parents; the FIRST in encounter order is canonical, so the other
+    transition is a cut rather than a continuation."""
+    for pid in order_of(slug):
+        for _label, target in nodes_of(slug)[pid]["choices"]:
             if target == node_id:
                 return pid
     return None
 
 
-def public_tree() -> list[dict]:
+def public_tree(slug: str) -> list[dict]:
     """The story without prompts, in encounter order -- what the page needs."""
-    return [{"id": nid, "depth": depth_of(nid),
-             "title": NODES[nid]["title"], "desc": NODES[nid]["desc"],
-             "choices": NODES[nid]["choices"]}
-            for nid in ORDER]
+    nodes = nodes_of(slug)
+    return [{"id": nid, "depth": depth_of(slug, nid),
+             "title": nodes[nid]["title"], "desc": nodes[nid]["desc"],
+             "choices": nodes[nid]["choices"]}
+            for nid in order_of(slug)]

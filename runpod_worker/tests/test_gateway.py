@@ -1051,16 +1051,20 @@ def test_story_tree_is_well_formed():
     encounter order must be breadth-first so the renderer makes the
     earliest-needed clips first."""
     from runpod_worker.gateway import story
-    assert len(story.ORDER) == len(set(story.ORDER)) == len(story.NODES) == 14
-    for node in story.NODES.values():
-        for _label, target in node["choices"]:
-            assert target in story.NODES
-        assert node["prompt"].startswith("integrated_multimodal_description")
-        assert "overall_soundscape" in node["prompt"]
-    depths = [story.depth_of(n) for n in story.ORDER]
-    assert depths == sorted(depths) and depths[0] == 1 and max(depths) == 4
-    ends = [n for n in story.NODES.values() if not n["choices"]]
-    assert len(ends) == 7
+    assert set(story.STORIES) == {"biscuit", "space-picnic"}
+    for slug in story.STORIES:
+        nodes, order = story.nodes_of(slug), story.order_of(slug)
+        assert len(order) == len(set(order)) == len(nodes) == 14
+        for node in nodes.values():
+            for _label, target in node["choices"]:
+                assert target in nodes
+            assert node["prompt"].startswith("integrated_multimodal_description")
+            assert "overall_soundscape" in node["prompt"]
+        depths = [story.depth_of(slug, n) for n in order]
+        assert depths == sorted(depths) and depths[0] == 1 and max(depths) == 4
+        assert len([n for n in nodes.values() if not n["choices"]]) == 7
+    # Scene ids are globally unique: the scenes table keys on id alone.
+    assert not set(story.nodes_of("biscuit")) & set(story.nodes_of("space-picnic"))
 
 
 def test_adventure_state_and_page(client):
@@ -1139,7 +1143,7 @@ def test_adventure_seed_never_clobbers_finished_work(client):
     from runpod_worker.gateway import story as st
     dbmod.adventure_mark("n0", "ready", video=b"precious bytes")
     dbmod.adventure_seed(st.STORY_ID, [
-        {"id": nid, "position": pos, "depth": st.depth_of(nid),
+        {"id": nid, "position": pos, "depth": st.depth_of(st.STORY_ID, nid),
          "title": st.NODES[nid]["title"], "prompt": st.NODES[nid]["prompt"]}
         for pos, nid in enumerate(st.ORDER)])
     assert dbmod.adventure_status("biscuit")["n0"]["status"] == "ready"
@@ -1174,11 +1178,16 @@ def test_adventure_claim_two_lanes_and_parent_gating(client):
 
 
 def test_adventure_children_start_from_parents_last_frame(client):
+    """Continuity is now the 5 s video prefix (the D variant of the A/B):
+    a child submits the parent's clip as video_source with the max overlap,
+    asks for the full 481-frame window, and trims the parent's duration off
+    the front of the result before storing it."""
     c, m = client
     from runpod_worker.gateway import db as dbmod
     from runpod_worker.gateway import story as st
-    assert st.parent_of("n0") is None
-    assert st.parent_of("end_roll") == "n_eyes"           # canonical, not n_cat
+    assert st.parent_of("biscuit", "n0") is None
+    assert st.parent_of("biscuit", "end_roll") == "n_eyes"  # canonical, not n_cat
+    assert st.parent_of("space-picnic", "spend_feast") == "sp_slurp"
     dbmod.adventure_claim("biscuit")
     dbmod.adventure_mark("n0", "ready", video=b"clip")
     scene = dbmod.adventure_claim("biscuit")
@@ -1191,17 +1200,23 @@ def test_adventure_children_start_from_parents_last_frame(client):
         return COMPLETED
 
     with mock.patch.object(m, "_rp", side_effect=fake), \
-         mock.patch.object(m, "_last_frame_b64", return_value="FRAME64"), \
+         mock.patch.object(m, "_video_duration_s", return_value=15.083), \
+         mock.patch.object(m, "_trim_lead", side_effect=lambda d, s: b"TRIMMED:" + d) as trim, \
          mock.patch.object(m.time, "sleep", lambda s: None):
-        m._adventure_render_one(scene)
-    assert seen["settings"]["image_prompt_type"] == "S"
-    assert seen["media"]["image_start"] == {"b64": "FRAME64"}
+        m._adventure_render_one(scene, "biscuit")
+    assert seen["settings"]["image_prompt_type"] == "V"
+    assert seen["settings"]["sliding_window_overlap"] == 120
+    assert seen["settings"]["video_length"] == 481
+    assert seen["media"]["video_source"] == {"b64": _b64.b64encode(b"clip").decode()}
+    trim.assert_called_once()
+    assert dbmod.adventure_video(scene["id"]) == b"TRIMMED:" + MP4
     # and the root scene submits with no start image at all
     seen.clear()
     with mock.patch.object(m, "_rp", side_effect=fake), \
          mock.patch.object(m.time, "sleep", lambda s: None):
-        m._adventure_render_one({"id": "n0", "prompt": "x"})
+        m._adventure_render_one({"id": "n0", "prompt": "x"}, "biscuit")
     assert seen["settings"]["image_prompt_type"] == "" and seen["media"] == {}
+    assert seen["settings"]["video_length"] == 362
 
 
 def test_adventure_continuity_migration_requeues_old_clips(client):
@@ -1218,9 +1233,9 @@ def test_adventure_continuity_migration_requeues_old_clips(client):
                    .where(dbmod.adventure_scenes.c.id.in_(("n0", "n_van")))
                    .values(status="ready", video=b"old", parent_id=None))
     dbmod.adventure_seed(st.STORY_ID, [
-        {"id": nid, "position": pos, "depth": st.depth_of(nid),
+        {"id": nid, "position": pos, "depth": st.depth_of(st.STORY_ID, nid),
          "title": st.NODES[nid]["title"], "prompt": st.NODES[nid]["prompt"],
-         "parent_id": st.parent_of(nid)}
+         "parent_id": st.parent_of(st.STORY_ID, nid)}
         for pos, nid in enumerate(st.ORDER)])
     statuses = dbmod.adventure_status("biscuit")
     assert statuses["n0"]["status"] == "ready"            # root untouched
