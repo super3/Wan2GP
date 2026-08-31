@@ -401,37 +401,29 @@ Resources:
   - Native MCP resources for WanGP Markdown documentation under `docs/`.
 - `wangp://docs/settings/prompt-flags`
   - Focused definitions for `image_prompt_type`, `video_prompt_type`, and `audio_prompt_type` flags.
+- `wangp://skills/large-artifact-workflows`
+  - On-demand methodology for bounded batch construction, revision-safe updates, finalization, compact references, and persistent ledgers.
+- `wangp://skills/long-form-story`
+  - On-demand methodology for chapter artifacts and a story-continuity ledger.
 
 Tools:
 
-- `wangp_list_models(..., name=None, query=None, limit=10, offset=0, include_availability=False)`
-  - Compact metadata page capped at 10 records, with the same filters as `list_model_metadata(...)`. String filters accept case-insensitive `*` and `?` globs. Detailed `setting_values` are omitted; fetch one selected model's schema instead. For generation without a user-specified model, use the corresponding default template rather than browsing.
-  - Set `include_availability=True` to include the optional `availability` field.
-- `wangp_search_models(query, ..., limit=10, offset=0, include_availability=False)`
-  - Searches user-facing names, model ids, architectures, family fields, and descriptions. Returns matches plus `total_matches` and `has_more`.
-- `wangp_list_model_defs(...)`
-  - Full model definitions with metadata.
-- `wangp_get_model(model_type)`
-  - Returns model capabilities and detailed parameter declarations, but omits the redundant embedded `settings` block. Use it only when required parameters remain unclear after inspecting a template and compact schema. Use `wangp_get_default_settings` for raw generation requests, not after a template query.
-- `wangp_get_model_metadata(model_type, include_availability=False)`
-- `wangp_get_model_availability(model_type)`
-  - Local file availability for one model using the same status as the UI selector: `available` (blue), `partial` (yellow), or `missing` (black).
-- `wangp_list_model_availability(...)`
-  - Availability records with the same filters as `wangp_list_models(...)`.
-- `wangp_get_default_settings(model_type)`
-  - Returns pristine model defaults after WanGP removes irrelevant fields and fixed `settings_version`/`type` metadata. User-saved UI defaults are not included.
+- `wangp_models(query="", filters=None, limit=10, offset=0)`
+  - Searches models and returns compact records with supported capabilities and media roles as arrays. `filters` accepts `family`, `base_model_type`, `finetune`, `model_type`, `main_output`, `inputs`, or `name`; string filters support case-insensitive `*` and `?` globs.
+- `wangp_model(model_type, view="schema", property=None)`
+  - Returns one model's compact `schema`, `definition`, or pristine generation `defaults`. Deepy's compact server previews top-level definition strings longer than 256 characters and appends the exact property name and full character count; pass that root `property` with `view="definition"` to retrieve its complete native value. Standalone MCP definitions remain unabridged. Use the default schema first and request the definition only when exact parameters remain unclear. Availability is intentionally separate from this tool.
+- `wangp_model_settings(model_type, setting_id=None)`
+  - With only `model_type`, lists saved user settings, accelerator profiles, and presets. Each entry has a prefixed `id` and `type`; pass one returned id as `setting_id` to fetch its full content.
 - `wangp_list_loras(model_type, name=None)`
   - Recursively returns locally available `.safetensors` and `.sft` LoRAs for the model family. `name` optionally filters subfolder-relative identifiers using case-insensitive `*` and `?` globs. Returned values are suitable for `activated_loras`; supply corresponding weights through `loras_multipliers`.
-- `wangp_get_model_schema(model_type)`
-  - Returns compact capability, media-role, frame-limit, prompt-guidance, and sliding-window metadata.
 - `wangp_list_gallery(media_type="all", limit=50, selected_only=False)`
   - Lists compact summaries of the current session's image, video, and audio Gallery items with one `media_id` per item and selection state. Paths and generation settings are omitted. Set `selected_only=True` to return only the live visual and/or audio selections, including the selected video's current playback time when available.
 - `wangp_get_media_settings(media_id=None, path=None)`
   - Returns the generation settings stored in or extracted from exactly one media file. Use `media_id` with a value returned by `wangp_list_gallery`; use the mutually exclusive `path` input only when filesystem reads are enabled.
-- `wangp_list_files(path, extensions=None)` *(filesystem reads enabled only)*
-  - Lists files directly inside a server directory with optional extension filtering, returning filenames, paths, extensions, and byte sizes.
-- `wangp_query_file(media_id=None, path=None)` *(filesystem reads enabled only)*
-  - Inspects exactly one source: `media_id` for Gallery media, or `path` for a server file. Returns resolution, frames, FPS, duration and audio-track information for visual media; duration, sample rate, channels and track count for audio; or UTF-8 text up to 16,000 characters.
+- `wangp_io(action=None, arguments=None)`
+  - With no action, returns the compact allowed action list and accessible roots; pass one action without arguments for its schema, then pass arguments to execute it. Actions cover listing, metadata, ranged UTF-8 reading, text search, literal text writing, finalized-artifact text export, directory creation, copying, moving, permanent deletion, safe ZIP creation/extraction, and downloads. `read_text` accepts only its declared line-range arguments and returns `eof` plus `next_line`; unsupported byte-offset parameters are rejected. `write_artifact_text` requires a finalized `$artifact` reference, renders it directly to the destination, rejects literal content, and returns structural/hash verification with `readback_required=false`. ZIP extraction rejects traversal and symlink entries and does not replace existing files unless `overwrite=true`. Directory listings accept an implicit-extension `media_type` filter (`all`, `image`, `video`, `audio`, `txt`, or `other`) in addition to `pattern`; typed filters return files only, while `other` excludes supported media and `.txt` files. Listings return `has_more` and `next_offset`; repeat the same list call with `offset=next_offset` to continue. Deepy may shorten a requested page to keep its tool result within the active context-safe output budget. For a list that will be processed rather than merely displayed, pass `store_artifact=true` and optionally `artifact_id`/`artifact_title`; the exact returned page is stored and the tool returns compact artifact metadata instead of repeating every entry. Move and delete accept writable paths only, and deleting a non-empty directory requires `recursive=true`. Deepy's scoped mode uses `@alias/path` and resolves plain paths from `@outputs`; standalone MCP `--mcp-allow-read-file-system` permits absolute reads.
+- `wangp_artifact(action=None, arguments=None)`
+  - Manages session-scoped `record_set` collections and mutable `ledger` project memory. Omitting both parameters returns the inline thresholds (10 items and approximately 2,048 payload tokens), actions, limits, and skill resources; pass an action without arguments for its schema, then repeat the top-level action with a separate top-level arguments object to execute it. Omitting the action while passing `arguments={}` directly lists existing artifacts. A complete call accidentally nested as `{action, arguments}` inside `arguments` is normalized, while other missing-action payloads fail explicitly instead of silently returning discovery. Actions are `create`, `list`, `prepare`, `append`, `commit_item`, `query`, `status`, `update_records`, `update_ledger`, `finalize`, and `delete`. Mutations support optimistic `expected_revision` checks and idempotent `operation_id` values. A record set may opt into a ledger-linked sequential workflow; managed results expose a cursor, phase, and binding `next_required_action`. Each iteration is `prepare` followed by one atomic `commit_item`, which stores the exact item, applies its compact ledger delta, and advances the cursor together. `prepare` returns bounded context plus exact queries for authoritative older data; it does not load the complete project. Finalization can validate item count, required fields, uniqueness, contiguous numbering, and a numeric total. Record sets must be finalized before another tool consumes them; ledgers remain mutable.
 - `wangp_create_gallery_upload(filename)` *(HTTP transports only)*
   - Creates a short-lived HTTP PUT URL. A successful upload returns the new Gallery record and selects it.
 - `wangp_create_gallery_download(media_id)` *(HTTP transports only)*
@@ -443,13 +435,28 @@ Tools:
 - `wangp_postprocess(media_id=None, path=None, process=None, parameters=None)`
   - Provide exactly one source: `media_id` for Gallery media, or `path` for a server file when filesystem reads are enabled. With no process, discovers compatible post-processing operations. With a returned process id, queues the operation through WanGP and returns a job id.
 - `wangp_toolbox(action=None, arguments=None)`
-  - With no action, returns a compact utility list; pass one action without arguments for its exact schema, then pass arguments to execute it. Supports joint visual inspection of up to five images or video frames, extraction, transcription, resize/crop, audio replacement, video merging, media-detail, and documentation operations using media IDs. Direct paths require filesystem-read permission.
+  - With no action, returns a compact utility list; pass one action without arguments for its exact schema, then pass arguments to execute it. Supports adding authorized image/video/audio files to its Gallery, joint visual inspection of up to five images or video frames, extraction, transcription, resize/crop, audio replacement, video merging, media-detail, and documentation operations using media IDs. Its nested arguments accept compact `$artifact` references. `add_to_gallery` accepts one `path` or up to 50 `paths`, including `output_file` values returned by other toolbox actions; it applies visible-history retention once per Gallery before the batch, keeps the entire batch, selects existing items without duplication, does not rewrite source metadata, and does not create generated-media chat cards. Direct paths require filesystem-read permission.
 - `wangp_generate(source, wait=False, timeout_s=None, event_limit=20)`
-  - Starts a job from a settings dict, task dict, manifest dict, or task list. Media fields accept media IDs returned by `wangp_list_gallery`; direct paths require filesystem-read permission. Terminal results include matching compact `gallery_items` records.
+  - Starts a job from a settings dict, task dict, manifest dict, or task list. Media fields accept media IDs returned by `wangp_list_gallery`; direct paths require filesystem-read permission. Any nested value may be a compact `$artifact` reference, which is resolved server-side before validation/submission. Terminal results include matching compact `gallery_items` records.
 - `wangp_get_job(job_id, event_limit=20)`
   - Polls progress/events/result.
 - `wangp_cancel_job(job_id)`
   - Requests cancellation.
+
+Deepy's in-process MCP exposes only the three compact model-data tools above. Standalone MCP clients retain the legacy granular endpoints (`wangp_list_models`, `wangp_search_models`, `wangp_list_model_defs`, `wangp_get_model`, `wangp_get_model_metadata`, `wangp_get_model_availability`, `wangp_list_model_availability`, `wangp_get_default_settings`, and `wangp_get_model_schema`) for compatibility.
+
+An artifact reference is a JSON object with `$artifact` set to an artifact ID. Optional `where` filters records, `select` extracts one dotted field, and `offset`/`limit` select a range. `template` formats every object record, while `join` joins the selected/formatted values into one string; `prefix` and `suffix` apply to each joined value. Without `join`, selection returns an array. References may appear recursively in `wangp_io` and `wangp_toolbox` arguments and in `wangp_generate` source values. For example:
+
+```json
+{
+  "$artifact": "artifact_0123456789ab",
+  "where": [{"field": "approved", "op": "eq", "value": true}],
+  "template": "[/duration={duration_seconds}s] {prompt}",
+  "join": "\n\n"
+}
+```
+
+Supported filter operators are `eq`, `ne`, `contains`, `starts_with`, `ends_with`, `in`, `gt`, `gte`, `lt`, and `lte`. Artifact storage is bounded to 32 artifacts, 10,000 items, and 8 MiB per artifact; query pages are capped at 500 records.
 
 ## Getting Outputs In Memory
 

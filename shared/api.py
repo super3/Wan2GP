@@ -16,6 +16,7 @@ import re
 import sys
 import threading
 import time
+import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterator, Sequence
@@ -659,6 +660,35 @@ class WanGPSession:
         settings["model_type"] = str(model_type)
         return settings
 
+    def get_model_settings(self, model_type: str, setting_id: str | None = None) -> dict[str, Any]:
+        runtime = self._ensure_runtime()
+        with _pushd(runtime.root):
+            model_def = runtime.module.get_model_def(model_type)
+            if model_def is None:
+                raise ValueError(f"Unknown model_type: {model_type}")
+            entries = []
+            kinds = {"accelerator_profiles": ("accelerator_profile", "accelerator profile"), "preset_settings": ("preset", "preset")}
+            for group_id, _, paths in runtime.module._get_builtin_lset_groups(model_type):
+                prefix, setting_type = kinds[group_id]
+                entries += [{"id": f"{prefix}:{str(path).replace(chr(92), '/')}", "type": setting_type, "_path": runtime.module._builtin_lset_file_path(path)} for path in paths]
+            lora_dir = Path(runtime.module.get_lora_dir(model_type))
+            entries += [{"id": f"user_settings:{path.name}", "type": "user settings", "_path": str(path)} for path in sorted((*lora_dir.glob("*.json"), *lora_dir.glob("*.zip")), key=lambda path: path.name.casefold())]
+            if setting_id is None:
+                return {"model_type": str(model_type), "settings": [{key: value for key, value in entry.items() if key != "_path"} for entry in entries]}
+            entry = next((entry for entry in entries if entry["id"] == setting_id), None)
+            if entry is None:
+                raise ValueError(f"Unknown setting_id for {model_type}: {setting_id}")
+            path = Path(entry["_path"])
+            if path.suffix.lower() == ".zip":
+                with zipfile.ZipFile(path) as archive:
+                    manifest = json.loads(archive.read("queue.json").decode("utf-8"))
+                if not isinstance(manifest, list) or not manifest or not isinstance(manifest[0], dict):
+                    raise ValueError(f"Invalid settings bundle: {path.name}")
+                content = manifest[0].get("params", manifest[0])
+            else:
+                content = json.loads(path.read_text(encoding="utf-8"))
+            return {"model_type": str(model_type), "id": entry["id"], "type": entry["type"], "content": content}
+
     def merge_settings_with_defaults(self, settings: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(settings, dict):
             raise TypeError("settings must be a dictionary")
@@ -1164,6 +1194,12 @@ class WanGPSession:
 
     @staticmethod
     def _normalize_settings_values(settings: dict[str, Any]) -> None:
+        video_length = settings.get("video_length")
+        if isinstance(video_length, str):
+            try:
+                settings["video_length"] = int(video_length.strip())
+            except ValueError as exc:
+                raise ValueError("video_length must be an integer frame count or a duration such as '10s'") from exc
         force_fps = settings.get("force_fps")
         if isinstance(force_fps, (int, float)) and not isinstance(force_fps, bool):
             if isinstance(force_fps, float) and not force_fps.is_integer():

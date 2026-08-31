@@ -19,9 +19,9 @@ import anyio
 from anyio.from_thread import start_blocking_portal
 
 from shared.api import WanGPSession
-from shared.deepy.config import DEEPY_ALLOW_READ_FILE_SYSTEM_DEFAULT, DEEPY_ALLOW_READ_FILE_SYSTEM_KEY, DEEPY_CONTEXT_TOKENS_DEFAULT, DEEPY_CONTEXT_TOKENS_KEY, DEEPY_MCP_AUTO_DISCOVER_PATHS_DEFAULT, DEEPY_MCP_AUTO_DISCOVER_PATHS_KEY, DEEPY_PRIME_MCP_SERVERS_KEY, get_deepy_config_value, normalize_deepy_allow_read_file_system, normalize_deepy_context_tokens, normalize_deepy_mcp_auto_discover_paths, normalize_deepy_prime_mcp_servers
+from shared.deepy.config import DEEPY_CONTEXT_TOKENS_DEFAULT, DEEPY_CONTEXT_TOKENS_KEY, DEEPY_MCP_AUTO_DISCOVER_PATHS_DEFAULT, DEEPY_MCP_AUTO_DISCOVER_PATHS_KEY, DEEPY_PRIME_MCP_SERVERS_KEY, get_deepy_config_value, get_deepy_runtime_config, normalize_deepy_context_tokens, normalize_deepy_mcp_auto_discover_paths, normalize_deepy_prime_mcp_servers
 from shared.gradio import assistant_chat
-from shared.mcp_server import build_inprocess_server
+from shared.mcp_server import build_inprocess_server, resolve_gallery_media_path
 
 
 _MARKDOWN_HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
@@ -150,14 +150,21 @@ class DeepyPrimeTools:
         self.send_cmd = send_cmd
         self.assistant_session = assistant_session
         self._zero_tools = zero_tools
-        self.allow_read_file_system = normalize_deepy_allow_read_file_system(get_deepy_config_value(DEEPY_ALLOW_READ_FILE_SYSTEM_KEY, DEEPY_ALLOW_READ_FILE_SYSTEM_DEFAULT))
+        from shared.deepy.filesystem import build_file_access_policy
+
+        self.file_access_policy = zero_tools._file_access_policy() if zero_tools is not None else build_file_access_policy(get_deepy_runtime_config())
+        self.assistant_session.file_access_policy = self.file_access_policy
+        if getattr(self.assistant_session, "artifact_workspace", None) is None:
+            from shared.deepy.artifacts import ArtifactWorkspace
+            self.assistant_session.artifact_workspace = ArtifactWorkspace()
+        self.allow_read_file_system = self.file_access_policy.read_enabled
         from shared.utils.plugins import get_deepy_prime_plugin_tools
 
         self._plugin_tools_by_name = {definition.name: definition for definition in get_deepy_prime_plugin_tools() if not definition.requires_file_system or self.allow_read_file_system}
         self._tool_progress_callback: Callable[..., None] | None = None
         self._api_session = WanGPSession(webui_state=state, console_output=False, console_isatty=False)
         self._api_session._gradio_webui_context = {"defer_load_queue_trigger": True}
-        self._server = build_inprocess_server(self._api_session, toolbox=zero_tools, default_job_event_limit=0, allow_read_file_system=self.allow_read_file_system)
+        self._server = build_inprocess_server(self._api_session, toolbox=zero_tools, default_job_event_limit=0, file_access_policy=self.file_access_policy, artifact_workspace=self.assistant_session.artifact_workspace)
         self._external_servers = normalize_deepy_prime_mcp_servers(get_deepy_config_value(DEEPY_PRIME_MCP_SERVERS_KEY, {}))
         self._auto_discover_mcp_paths = normalize_deepy_mcp_auto_discover_paths(get_deepy_config_value(DEEPY_MCP_AUTO_DISCOVER_PATHS_KEY, DEEPY_MCP_AUTO_DISCOVER_PATHS_DEFAULT))
         self._external_server_errors: dict[str, str] = {}
@@ -321,11 +328,7 @@ class DeepyPrimeTools:
                         if server_name != "wangp":
                             description = f"External MCP server '{server_name}'. {description}".strip()
                         self._tool_defs.append({"type": "function", "function": {"name": exposed_name, "description": description, "parameters": dict(tool.inputSchema or {"type": "object", "properties": {}})}})
-                self._tool_defs.extend([
-                    {"type": "function", "function": {"name": "mcp_list_resources", "description": "List documentation and other resources exposed by connected MCP servers.", "parameters": {"type": "object", "properties": {"server": {"type": "string", "description": "Optional MCP server name such as wangp."}}}}},
-                    {"type": "function", "function": {"name": "mcp_search_resource", "description": "Search one Markdown MCP resource and return up to five ranked section excerpts without adding the full document to context.", "parameters": {"type": "object", "properties": {"server": {"type": "string", "description": "MCP server name, normally wangp."}, "uri": {"type": "string", "description": "Exact resource URI."}, "query": {"type": "string", "description": "Keywords or a short natural-language question."}}, "required": ["server", "uri", "query"]}}},
-                    {"type": "function", "function": {"name": "mcp_read_resource", "description": "Read one MCP resource by exact server and URI. For Markdown, optional section returns only matching heading sections.", "parameters": {"type": "object", "properties": {"server": {"type": "string", "description": "MCP server name, normally wangp."}, "uri": {"type": "string", "description": "Exact resource URI."}, "section": {"type": "string", "description": "Optional exact or partial Markdown heading path, or a case-insensitive * and ? glob."}}, "required": ["server", "uri"]}}},
-                ])
+                self._tool_defs.append({"type": "function", "function": {"name": "mcp_resource", "description": "List resources when uri is omitted. With a uri, provide query to search Markdown, or omit query to read it; optional section limits a read to matching headings. Server is optional when the uri uniquely identifies a resource.", "parameters": {"type": "object", "properties": {"server": {"type": "string", "description": "Optional MCP server name such as wangp."}, "uri": {"type": "string", "description": "Exact resource URI; omit to list resources."}, "query": {"type": "string", "description": "Keywords or a short natural-language question for Markdown search."}, "section": {"type": "string", "description": "Exact or partial Markdown heading path, or a case-insensitive * and ? glob, for a filtered read."}}}}})
                 self._ready_event.set()
 
                 while True:
@@ -334,38 +337,40 @@ class DeepyPrimeTools:
                         break
                     tool_name, arguments, future = request
                     try:
-                        if tool_name == "mcp_list_resources":
-                            requested_server = str(arguments.get("server", "") or "").strip()
-                            resources = [resource for resource in self._resource_defs if not requested_server or resource["server"] == requested_server]
-                            future.set_result({"status": "done", "resources": resources, "count": len(resources), "unavailable_servers": dict(self._external_server_errors)})
-                            continue
-                        if tool_name == "mcp_search_resource":
+                        if tool_name == "mcp_resource":
                             server_name = str(arguments.get("server", "") or "").strip()
                             uri = str(arguments.get("uri", "") or "").strip()
                             query = str(arguments.get("query", "") or "").strip()
-                            if server_name not in clients:
-                                raise ValueError(f"Unknown MCP server: {server_name}")
-                            resource_def = next((resource for resource in self._resource_defs if resource["server"] == server_name and resource["uri"] == uri), None)
-                            if resource_def is None:
-                                raise ValueError(f"Unknown MCP resource for server '{server_name}': {uri}")
-                            resource_result = await clients[server_name].read_resource(uri)
-                            matches = []
-                            for content in resource_result.contents:
-                                if not hasattr(content, "text"):
-                                    raise ValueError("Markdown resource search is only available for text resources.")
-                                matches.extend(_search_markdown_sections(str(content.text), query, title=resource_def["title"] or resource_def["name"]))
-                            matches.sort(key=lambda item: (-int(item["score"]), len(str(item["section"]))))
-                            future.set_result({"status": "done", "server": server_name, "uri": uri, "query": query, "matches": matches[:5]})
-                            continue
-                        if tool_name == "mcp_read_resource":
-                            server_name = str(arguments.get("server", "") or "").strip()
-                            uri = str(arguments.get("uri", "") or "").strip()
                             section_filter = str(arguments.get("section", "") or "").strip()
-                            if server_name not in clients:
+                            if not uri:
+                                if query or section_filter:
+                                    raise ValueError("uri is required when query or section is provided")
+                                resources = [resource for resource in self._resource_defs if not server_name or resource["server"] == server_name]
+                                future.set_result({"status": "done", "resources": resources, "count": len(resources), "unavailable_servers": dict(self._external_server_errors)})
+                                continue
+                            if query and section_filter:
+                                raise ValueError("query and section are mutually exclusive")
+                            if server_name and server_name not in clients:
                                 raise ValueError(f"Unknown MCP server: {server_name}")
-                            if not any(resource["server"] == server_name and resource["uri"] == uri for resource in self._resource_defs):
-                                raise ValueError(f"Unknown MCP resource for server '{server_name}': {uri}")
+                            resource_matches = [resource for resource in self._resource_defs if resource["uri"] == uri and (not server_name or resource["server"] == server_name)]
+                            if not resource_matches:
+                                raise ValueError(f"Unknown MCP resource{f' for server {server_name!r}' if server_name else ''}: {uri}")
+                            matching_servers = sorted({resource["server"] for resource in resource_matches})
+                            if not server_name:
+                                if len(matching_servers) != 1:
+                                    raise ValueError(f"Resource URI is exposed by multiple MCP servers; specify one of: {', '.join(matching_servers)}")
+                                server_name = matching_servers[0]
                             resource_result = await clients[server_name].read_resource(uri)
+                            if query:
+                                matches = []
+                                resource_def = resource_matches[0]
+                                for content in resource_result.contents:
+                                    if not hasattr(content, "text"):
+                                        raise ValueError("Markdown resource search is only available for text resources.")
+                                    matches.extend(_search_markdown_sections(str(content.text), query, title=resource_def["title"] or resource_def["name"]))
+                                matches.sort(key=lambda item: (-int(item["score"]), len(str(item["section"]))))
+                                future.set_result({"status": "done", "server": server_name, "uri": uri, "query": query, "matches": matches[:5]})
+                                continue
                             contents = []
                             matched_sections = []
                             for content in resource_result.contents:
@@ -399,10 +404,12 @@ class DeepyPrimeTools:
         self._request_queue.put((tool_name, dict(arguments or {}), future))
         result = future.result()
         if isinstance(result, dict):
-            return self._enforce_output_budget(tool_name, result)
+            normalized = self._enforce_output_budget(tool_name, self.file_access_policy.virtualize_result(result))
+            self._remember_gallery_download_references(tool_name, normalized)
+            return normalized
         content_text = "\n".join(str(getattr(item, "text", "") or "") for item in result.content if getattr(item, "type", "") == "text").strip()
         if result.isError:
-            return {"status": "error", "tool": tool_name, "error": content_text or f"MCP tool '{tool_name}' failed."}
+            return self.file_access_policy.virtualize_result({"status": "error", "tool": tool_name, "error": content_text or f"MCP tool '{tool_name}' failed."})
         payload = result.structuredContent
         if payload is None and content_text:
             try:
@@ -414,7 +421,32 @@ class DeepyPrimeTools:
             normalized.setdefault("status", "done")
         else:
             normalized = {"status": "done", "content": payload}
-        return self._enforce_output_budget(tool_name, normalized)
+        normalized = self._enforce_output_budget(tool_name, self.file_access_policy.virtualize_result(normalized))
+        self._remember_gallery_download_references(tool_name, normalized)
+        return normalized
+
+    def _remember_gallery_download_references(self, tool_name: str, result: Any) -> None:
+        route = self._tool_routes.get(tool_name)
+        if route is None or route[0] != "wangp":
+            return
+        media_ids = []
+
+        def collect(value: Any, key: str = "") -> None:
+            if isinstance(value, dict):
+                for child_key, child_value in value.items():
+                    collect(child_value, str(child_key).casefold())
+            elif isinstance(value, (list, tuple)):
+                for child_value in value:
+                    collect(child_value, key)
+            elif key in {"media_id", "media_ids"} and isinstance(value, str) and re.fullmatch(r"(?:visual|audio):[a-f0-9]{12}", value.strip(), re.IGNORECASE):
+                media_ids.append(value.strip().casefold())
+
+        collect(result)
+        for media_id in dict.fromkeys(media_ids):
+            try:
+                self.assistant_session.gallery_download_registry[media_id] = resolve_gallery_media_path(self._api_session, media_id)
+            except (FileNotFoundError, KeyError, OSError, ValueError):
+                continue
 
     @staticmethod
     def _enforce_output_budget(tool_name: str, result: dict[str, Any]) -> dict[str, Any]:
@@ -422,6 +454,40 @@ class DeepyPrimeTools:
         max_chars = max(8000, min(normalize_deepy_context_tokens(get_deepy_config_value(DEEPY_CONTEXT_TOKENS_KEY, DEEPY_CONTEXT_TOKENS_DEFAULT)), 100000))
         if len(serialized) <= max_chars:
             return result
+        if tool_name == "wangp_io" and isinstance(result.get("entries"), list) and result["entries"]:
+            page = dict(result)
+            entries = page["entries"] = []
+            offset = int(page["offset"])
+            page.update(count=0, has_more=True, next_offset=offset)
+            for entry in result["entries"]:
+                entries.append(entry)
+                page.update(count=len(entries), next_offset=offset + len(entries))
+                if len(json.dumps(page, ensure_ascii=False, separators=(",", ":"), default=str)) > max_chars:
+                    entries.pop()
+                    page.update(count=len(entries), next_offset=offset + len(entries))
+                    break
+            page["has_more"] = bool(result.get("has_more")) or len(entries) < len(result["entries"])
+            if not page["has_more"]:
+                page["next_offset"] = None
+            if entries and len(json.dumps(page, ensure_ascii=False, separators=(",", ":"), default=str)) <= max_chars:
+                return page
+        if tool_name == "wangp_artifact" and isinstance(result.get("items"), list) and result["items"]:
+            page = dict(result)
+            source_items = page["items"]
+            items = page["items"] = []
+            offset = int(page.get("offset", 0) or 0)
+            for item in source_items:
+                items.append(item)
+                page.update(count=len(items), has_more=True, next_offset=offset + len(items))
+                if len(json.dumps(page, ensure_ascii=False, separators=(",", ":"), default=str)) > max_chars:
+                    items.pop()
+                    page.update(count=len(items), next_offset=offset + len(items))
+                    break
+            page["has_more"] = bool(result.get("has_more")) or len(items) < len(source_items)
+            if not page["has_more"]:
+                page["next_offset"] = None
+            if items and len(json.dumps(page, ensure_ascii=False, separators=(",", ":"), default=str)) <= max_chars:
+                return page
         return {
             "status": "error",
             "tool": tool_name,
@@ -434,7 +500,7 @@ class DeepyPrimeTools:
 
     def _update_tool_progress(self, status: str, status_text: str, result: dict[str, Any]) -> None:
         if callable(self._tool_progress_callback):
-            self._tool_progress_callback(status=status, status_text=status_text, result=result)
+            self._tool_progress_callback(status=status, status_text=status_text, result=self.file_access_policy.virtualize_result(result))
 
     @staticmethod
     def _finalize_generation_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
@@ -540,9 +606,20 @@ class DeepyPrimeTools:
         plugin_tool = self._plugin_tools_by_name.get(normalized_name)
         if plugin_tool is not None:
             return plugin_tool.display_name
+        if normalized_name == "wangp_notify":
+            return "Send Notification"
         if normalized_name.startswith("wangp_"):
             normalized_name = normalized_name[len("wangp_"):]
         return normalized_name.replace("_", " ").strip().title()
+
+    @staticmethod
+    def get_tool_stream_label_fields(tool_name: str) -> tuple[str, ...]:
+        return {
+            "wangp_generate": ("source",),
+            "wangp_toolbox": ("action", "arguments"),
+            "wangp_io": ("action", "arguments"),
+            "wangp_artifact": ("action", "arguments"),
+        }.get(str(tool_name or "").strip(), ())
 
     @staticmethod
     def _generation_settings(source: Any) -> list[dict[str, Any]]:
@@ -605,11 +682,26 @@ class DeepyPrimeTools:
             return f"Unknown Tool - {self.get_tool_display_name(tool_name)}"
         if self._zero_tools is not None:
             arguments = self._zero_tools.resolve_tool_label_arguments(arguments)
-        if tool_name == "wangp_toolbox":
+        if tool_name in {"wangp_toolbox", "wangp_io", "wangp_artifact"}:
             action = str(arguments.get("action", "") or "").strip()
+            action_arguments = arguments.get("arguments")
+            if tool_name == "wangp_io":
+                return assistant_chat.build_io_tool_call_label(action, action_arguments if "arguments" in arguments else None)
+            if tool_name == "wangp_artifact":
+                if not action and isinstance(action_arguments, dict):
+                    nested_action = str(action_arguments.get("action", "") or "").strip()
+                    if nested_action and isinstance(action_arguments.get("arguments"), dict):
+                        action, action_arguments = nested_action, action_arguments["arguments"]
+                    elif not action_arguments:
+                        action = "list"
+                if action == "list" and isinstance(action_arguments, dict):
+                    return "List Artifacts"
+                if not action and "arguments" in arguments:
+                    return "Artifact Request"
+                action_label = {"prepare": "Load Next Workflow Item", "commit_item": "Commit Workflow Item", "query": "Query Exact Artifact Data", "update_ledger": "Update Ledger Artifact"}.get(action, action.replace("_", " ").title())
+                return "List Artifact Actions" if not action else f"Get {action_label} Schema" if "arguments" not in arguments else action_label
             if not action:
                 return "List Toolbox Content"
-            action_arguments = arguments.get("arguments")
             if action_arguments is None:
                 action_label = self._zero_tools.get_tool_transcript_label(action, {}) if self._zero_tools is not None else action.replace("_", " ").title()
                 return f"Get {action_label} Schema"
@@ -643,6 +735,8 @@ class DeepyPrimeTools:
             if not action or call_arguments.get("arguments") is None:
                 return {"pause_runtime": False, "pause_reason": "tool"}
             return self._zero_tools.get_tool_policy(action, call_arguments["arguments"])
+        if tool_name in {"wangp_io", "wangp_artifact"}:
+            return {"pause_runtime": False, "pause_reason": "tool"}
         return {"pause_runtime": False, "pause_reason": "tool"}
 
     def validate_tool_call(self, tool_name: str, arguments: dict[str, Any]) -> str:
@@ -650,6 +744,21 @@ class DeepyPrimeTools:
         if schema is None:
             return f"Unknown MCP tool: {tool_name}"
         parameters = schema["function"].get("parameters", {})
+        for name, parameter in parameters.get("properties", {}).items():
+            value = arguments.get(name)
+            if parameter.get("type") != "object" or not isinstance(value, str):
+                continue
+            try:
+                decoded = json.loads(value)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(decoded, dict):
+                arguments[name] = decoded
+        if tool_name == "wangp_artifact" and "arguments" in arguments and not isinstance(arguments["arguments"], dict):
+            raw_arguments = arguments["arguments"]
+            if isinstance(raw_arguments, str) and "\\'" in raw_arguments:
+                return "Artifact arguments are malformed JSON: \\' is not a valid JSON escape. Write apostrophes directly inside double-quoted JSON strings, then repeat the call with arguments as an object. This is not a payload-size limit."
+            return "Artifact arguments must be a JSON object, not a JSON string. This is malformed call syntax, not a payload-size limit; repeat action and arguments as separate top-level tool parameters."
         for parameter_name in parameters.get("required", []) or []:
             if parameter_name not in arguments or arguments[parameter_name] is None:
                 return f"{parameter_name} is required."

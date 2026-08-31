@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import html
 import json
 import os
@@ -7,6 +8,7 @@ import re
 import time
 import urllib.parse
 import uuid
+from pathlib import Path
 from typing import Any
 
 import markdown
@@ -45,10 +47,18 @@ SAVE_SETTINGS_BUTTON_ID = "assistant_chat_save_settings_button"
 _IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tif", ".tiff", ".jfif", ".pjpeg"}
 _VIDEO_EXTENSIONS = deepy_video_tools.VIDEO_EXTENSIONS
 _AUDIO_EXTENSIONS = {".wav", ".mp3", ".aac", ".m4a", ".flac", ".ogg", ".opus"}
+_ARCHIVE_EXTENSIONS = {".zip", ".7z", ".rar", ".tar", ".gz", ".bz2", ".xz"}
 _MARKDOWN_EXTENSIONS = ["extra", "nl2br", "sane_lists", "fenced_code", "tables"]
 _MARKDOWN_IMAGE_RE = re.compile(r"!\[(?P<alt>[^\]]*)\]\((?P<path>[^)]+)\)")
+_DOWNLOAD_MARKDOWN_TOKEN_RE = re.compile(r"(?P<fence>```[\s\S]*?(?:```|$)|~~~[\s\S]*?(?:~~~|$))|(?P<link>!?\[(?:\\.|`[^`\n]*`|[^\]\n])*\]\([^\n)]*\))|(?P<code>`[^`\n]+`)")
+_DOWNLOAD_LINK_RE = re.compile(r"!?\[(?:\\.|`[^`\n]*`|[^\]\n])*\]\([^\n)]*\)")
+_GALLERY_MEDIA_ID_RE = re.compile(r"(?:visual|audio):[a-f0-9]{12}", re.IGNORECASE)
+_ABSOLUTE_PATH_START_RE = re.compile(r"(?<![\w:/])(?:[A-Za-z]:[\\/]|\\\\|/(?!/))")
+_TOOL_RESULT_PATH_KEYS = {"destination", "generated_files", "output_file", "output_files", "path", "paths", "source", "sources"}
+_DOWNLOAD_REFERENCE_LIMIT = 20
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 _AUDIO_THUMBNAIL_PATH = os.path.join(_REPO_ROOT, "icons", "soundwave.jpg")
+_ARCHIVE_THUMBNAIL_PATH = os.path.join(_REPO_ROOT, "icons", "zip.svg")
 SERVER_INSTANCE_ID = uuid.uuid4().hex
 _UNSET = object()
 
@@ -1010,20 +1020,12 @@ def get_css() -> str:
     padding-right: 0;
 }
 
-.wangp-assistant-chat__message--user .wangp-assistant-chat__meta-left {
-    padding-left: 78px;
-}
-
 .wangp-assistant-chat__message--user .wangp-assistant-chat__message-actions {
-    position: absolute;
-    top: 12px;
-    left: 16px;
     display: inline-flex;
     flex-direction: row;
     align-items: center;
     justify-content: flex-start;
     gap: 3px;
-    transform: none;
 }
 
 .wangp-assistant-chat__message--user .wangp-assistant-chat__body {
@@ -1443,6 +1445,10 @@ def get_css() -> str:
     min-width: 0;
 }
 
+.wangp-assistant-chat__message--assistant .wangp-assistant-chat__tool-pending {
+    color: var(--assistant-text);
+}
+
 .wangp-assistant-chat__tool-section-header {
     display: flex;
     align-items: center;
@@ -1478,6 +1484,59 @@ def get_css() -> str:
     }
 }
 
+.wangp-assistant-chat__structured-result {
+    margin-top: 10px;
+    border: 1px solid rgba(116, 190, 230, 0.22);
+    border-radius: 12px;
+    overflow: hidden;
+    color: var(--assistant-text);
+    background: rgba(7, 33, 48, 0.28);
+}
+
+.wangp-assistant-chat__structured-result-header {
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 9px 11px;
+    font-size: calc(0.76rem * var(--dock-font-scale));
+    border-bottom: 1px solid rgba(116, 190, 230, 0.18);
+}
+
+.wangp-assistant-chat__structured-result-scroll {
+    max-height: 360px;
+    overflow: auto;
+}
+
+.wangp-assistant-chat__structured-result table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: calc(0.72rem * var(--dock-font-scale));
+    color: var(--assistant-text);
+}
+
+.wangp-assistant-chat__structured-result th,
+.wangp-assistant-chat__structured-result td {
+    padding: 7px 9px;
+    border-bottom: 1px solid rgba(116, 190, 230, 0.12);
+    text-align: left;
+    vertical-align: top;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    color: var(--assistant-text);
+}
+
+.wangp-assistant-chat__structured-result a {
+    color: #bfe9ff;
+}
+
+.wangp-assistant-chat__structured-result th {
+    position: sticky;
+    top: 0;
+    color: var(--assistant-text) !important;
+    background: rgba(7, 33, 48, 0.96) !important;
+    z-index: 1;
+}
+
 .wangp-assistant-chat__attachments {
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
@@ -1509,10 +1568,35 @@ def get_css() -> str:
     flex: 0 0 88px;
     width: 88px;
     height: 88px;
+    box-sizing: border-box;
     object-fit: cover;
     border-radius: 14px;
     border: 1px solid rgba(26, 82, 114, 0.12);
     background: rgba(234, 245, 251, 0.9);
+    overflow: hidden;
+}
+
+.wangp-assistant-chat__attachment-thumb--icon {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: #2b7299;
+    background: linear-gradient(145deg, rgba(239, 249, 254, 0.98), rgba(219, 239, 249, 0.96));
+}
+
+.wangp-assistant-chat__attachment-thumb--icon svg {
+    width: 46px;
+    height: 46px;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 2;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+}
+
+.wangp-assistant-chat__attachment-thumb--archive {
+    color: #93651a;
+    background: linear-gradient(145deg, rgba(255, 249, 226, 0.98), rgba(247, 229, 171, 0.96));
 }
 
 .wangp-assistant-chat__attachment-meta {
@@ -4154,7 +4238,7 @@ def upsert_reasoning_block(session, message_id: str, reasoning_id: str | None, t
     return target_id, _event_payload({"type": "upsert_message", "message": _render_message_payload(record)}, session, revision)
 
 
-def add_tool_call(session, message_id: str, tool_name: str, arguments: dict[str, Any], tool_label: str | None = None) -> tuple[str, str | None]:
+def add_tool_call(session, message_id: str, tool_name: str, arguments: dict[str, Any], tool_label: str | None = None, request_pending: bool = False) -> tuple[str, str | None]:
     record = _find_message(session, message_id)
     if record is None:
         return "", None
@@ -4166,15 +4250,17 @@ def add_tool_call(session, message_id: str, tool_name: str, arguments: dict[str,
         "arguments": dict(arguments or {}),
         "result": None,
         "status": "running",
-        "status_text": "Running",
+        "status_text": "Preparing" if request_pending else "Running",
+        "request_pending": bool(request_pending),
         "attachment": None,
+        "attachments": [],
     }
     _ensure_message_blocks(record).append(tool_record)
     revision = _touch_chat(session)
     return tool_record["id"], _event_payload({"type": "upsert_message", "message": _render_message_payload(record)}, session, revision)
 
 
-def update_tool_call(session, message_id: str, tool_id: str, status: str | None = None, result: dict[str, Any] | object = _UNSET, status_text: str | None = None) -> str | None:
+def update_tool_call(session, message_id: str, tool_id: str, status: str | None = None, result: dict[str, Any] | object = _UNSET, status_text: str | None = None, tool_name: str | None = None, tool_label: str | None = None, arguments: dict[str, Any] | object = _UNSET, request_pending: bool | None = None) -> str | None:
     record = _find_message(session, message_id)
     if record is None:
         return None
@@ -4185,9 +4271,19 @@ def update_tool_call(session, message_id: str, tool_id: str, status: str | None 
             tool_record["status"] = str(status or "").strip().lower() or "running"
         if status_text is not None:
             tool_record["status_text"] = str(status_text or "").strip()
+        if tool_name is not None:
+            tool_record["name"] = str(tool_name or "").strip()
+        if tool_label is not None:
+            tool_record["label"] = str(tool_label or "").strip()
+        if arguments is not _UNSET:
+            tool_record["arguments"] = dict(arguments or {})
+        if request_pending is not None:
+            tool_record["request_pending"] = bool(request_pending)
         if result is not _UNSET:
             tool_record["result"] = None if result is None else dict(result or {})
-            tool_record["attachment"] = _attachment_from_tool_result(tool_record.get("result"))
+            tool_record["attachments"] = _attachments_from_tool_result(tool_record.get("result"), getattr(session, "file_access_policy", None))
+            tool_record["attachment"] = tool_record["attachments"][-1] if tool_record["attachments"] else None
+            tool_record["presentation"] = _structured_tool_presentation(tool_record, getattr(session, "file_access_policy", None))
         revision = _touch_chat(session)
         return _event_payload({"type": "upsert_message", "message": _render_message_payload(record)}, session, revision)
     return None
@@ -4326,6 +4422,76 @@ def _finish_tool_call_label(label: str) -> str:
     return compact if len(compact) <= 96 else f"{compact[:95].rstrip()}…"
 
 
+def _tool_filter_label(filters: Any) -> str:
+    if not isinstance(filters, dict):
+        return ""
+    parts = []
+    for key, value in filters.items():
+        rendered = _short_tool_label_value(value, 24)
+        if rendered:
+            parts.append(f"{_humanize_tool_value(key)}: {rendered}")
+    return ", ".join(parts)
+
+
+def build_io_tool_call_label(action: str | None = None, arguments: dict[str, Any] | None = None) -> str:
+    """Build the chat-only label for the compact IO toolbox."""
+
+    action_name = str(action or "").strip()
+    if not action_name:
+        return "List IO Tools"
+    action_label = {"list": "List Files", "info": "Get File Information", "read_text": "Read Text", "search_text": "Search Text", "write_text": "Write Text", "write_artifact_text": "Compile Artifact", "mkdir": "Create Directory", "copy": "Copy File", "move": "Move File or Directory", "delete": "Delete File or Directory", "zip": "Create ZIP", "unzip": "Extract ZIP", "download": "Prepare Download"}.get(action_name, _humanize_tool_value(action_name))
+    if arguments is None:
+        return _finish_tool_call_label(f"Get {action_label} Schema")
+
+    arguments = dict(arguments)
+    source = _short_tool_label_value(arguments.get("source") or arguments.get("path"))
+    destination = _short_tool_label_value(arguments.get("destination"))
+    if source and destination == source:
+        destination_parts = str(arguments.get("destination") or "").replace("\\", "/").split("/")
+        if len(destination_parts) > 1:
+            destination = f"{destination_parts[-2]}/{destination}"
+    if action_name == "list":
+        label = "List Filesystem Roots" if not source else f"List {'Files Recursively' if arguments.get('recursive') else 'Files'} in {source}"
+        pattern = _short_tool_label_value(arguments.get("pattern"))
+        return _finish_tool_call_label(label if not pattern or pattern == "*" else f"{label} Matching {pattern}")
+    if action_name == "info":
+        return _finish_tool_call_label(action_label if not source else f"{action_label} for {source}")
+    if action_name == "read_text":
+        start, end = arguments.get("start_line"), arguments.get("end_line")
+        if start is not None and end is not None:
+            return _finish_tool_call_label(f"Read Lines {start}–{end}{f' from {source}' if source else ''}")
+        return _finish_tool_call_label(f"Read {source or 'Text'}{f' from Line {start}' if start is not None else ''}")
+    if action_name == "search_text":
+        query = _short_tool_label_value(arguments.get("query"), 28)
+        label = f"Search {source or 'Text Files'}" + (f" for “{query}”" if query else "")
+        pattern = _short_tool_label_value(arguments.get("pattern"))
+        return _finish_tool_call_label(label if not pattern or pattern == "*" else f"{label} Matching {pattern}")
+    if action_name == "write_text":
+        mode = str(arguments.get("mode", "create") or "create").casefold()
+        verb = "Append to" if mode == "append" else "Create" if mode == "create" else "Overwrite"
+        return _finish_tool_call_label(f"{verb} Text File{f' {source}' if source else ''}")
+    if action_name == "write_artifact_text":
+        return _finish_tool_call_label(f"Compile Artifact to Text File{f' {source}' if source else ''}")
+    if action_name == "mkdir":
+        return _finish_tool_call_label(action_label if not source else f"{action_label} {source}")
+    if action_name == "copy":
+        return _finish_tool_call_label(f"Copy {source or 'File'}{f' to {destination}' if destination else ''}")
+    if action_name == "move":
+        return _finish_tool_call_label(f"Move {source or 'File or Directory'}{f' to {destination}' if destination else ''}")
+    if action_name == "delete":
+        return _finish_tool_call_label(f"Delete {source or 'File or Directory'}{' Recursively' if arguments.get('recursive') else ''}")
+    if action_name == "zip":
+        sources = arguments.get("sources")
+        count = len(sources) if isinstance(sources, list) else 0
+        label = f"Create ZIP{f' {destination}' if destination else ''}"
+        return _finish_tool_call_label(label if count == 0 else f"{label} from {count} Item{'s' if count != 1 else ''}")
+    if action_name == "unzip":
+        return _finish_tool_call_label(f"Extract {source or 'ZIP'}{f' to {destination}' if destination else ''}")
+    if action_name == "download":
+        return _finish_tool_call_label(action_label if not source else f"{action_label} for {source}")
+    return _finish_tool_call_label(action_label)
+
+
 def build_tool_call_label(
     tool_name: str,
     arguments: dict[str, Any] | None = None,
@@ -4351,8 +4517,21 @@ def build_tool_call_label(
         "get_model_availability": "Check Model Availability of",
         "get_default_settings": "Get Default Settings of",
         "get_model_schema": "Get Model Schema of",
-        "list_loras": "List LoRAs for",
     }
+    if normalized_name == "model" and model:
+        action = {"schema": "Get Model Schema of", "definition": "Get Model Definition of", "defaults": "Get Model Defaults of"}.get(str(arguments.get("view", "schema")), "Get Model Information for")
+        return _finish_tool_call_label(f"{action} {model}")
+    if normalized_name == "models":
+        query = _short_tool_label_value(arguments.get("query"))
+        filters = _tool_filter_label(arguments.get("filters"))
+        label = "Find Models" if not query else f"Find Models for {query}"
+        return _finish_tool_call_label(label if not filters else f"{label} ({filters})")
+    if normalized_name == "model_settings" and model:
+        setting_id = _short_tool_label_value(arguments.get("setting_id"))
+        return _finish_tool_call_label(f"Get {setting_id} for {model}" if setting_id else f"List Settings for {model}")
+    if normalized_name == "list_loras" and model:
+        pattern = _short_tool_label_value(arguments.get("name"))
+        return _finish_tool_call_label(f"List LoRAs for {model}" if not pattern else f"List LoRAs for {model} Matching {pattern}")
     if normalized_name in model_actions and model:
         return _finish_tool_call_label(f"{model_actions[normalized_name]} {model}")
     if normalized_name == "get_default_settings":
@@ -4365,6 +4544,11 @@ def build_tool_call_label(
     if normalized_name == "toolbox":
         action = _humanize_tool_value(arguments.get("action"))
         return _finish_tool_call_label("List Toolbox Content" if not action else f"Use Toolbox {action}")
+    if normalized_name == "io":
+        return build_io_tool_call_label(arguments.get("action"), arguments.get("arguments") if "arguments" in arguments else None)
+    if normalized_name == "notify":
+        title = _short_tool_label_value(arguments.get("title"))
+        return _finish_tool_call_label("Send Notification" if not title or title == "Deepy notification" else f"Send Notification: {title}")
     if normalized_name == "search_models":
         query = _short_tool_label_value(arguments.get("query"))
         return _finish_tool_call_label("Search Models" if not query else f'Search Models for “{query}”')
@@ -4422,6 +4606,7 @@ def build_tool_call_label(
         action = "Inspect Mid-Res Video" if bool(arguments.get("mid_res_sampling", False)) else "Inspect Video"
         return _finish_tool_call_label(f"{action}{f' {source}' if source else ''}{range_label}")
     if normalized_name == "inspect_media":
+        area = " (Selected Area)" if arguments.get("bbox") is not None else ""
         media_inputs = arguments.get("media_inputs")
         if isinstance(media_inputs, list):
             inputs = media_inputs
@@ -4444,17 +4629,35 @@ def build_tool_call_label(
                 unknown += 1
         if unknown or images + frames == 0:
             count = images + frames + unknown
-            return _finish_tool_call_label("Inspect Media" if count == 0 else "Inspect Visual" if count == 1 else f"Inspect {count} Visuals")
+            label = "Inspect Media" if count == 0 else "Inspect Visual" if count == 1 else f"Inspect {count} Visuals"
+            return _finish_tool_call_label(f"{label}{area}")
         if images and frames:
             image_text = "Image" if images == 1 else f"{images} Images"
             frame_text = "Frame" if frames == 1 else f"{frames} Frames"
-            return _finish_tool_call_label(f"Inspect {image_text} and {frame_text}")
+            return _finish_tool_call_label(f"Inspect {image_text} and {frame_text}{area}")
         if images:
-            return _finish_tool_call_label("Inspect Image" if images == 1 else f"Inspect {images} Images")
+            label = "Inspect Image" if images == 1 else f"Inspect {images} Images"
+            return _finish_tool_call_label(f"{label}{area}")
         frame_text = "Frame" if frames == 1 else f"{frames} Frames"
         if len(video_names) == frames and len(set(video_names)) == 1:
-            return _finish_tool_call_label(f"Inspect {frame_text} from {video_names[0]}")
-        return _finish_tool_call_label(f"Inspect {frame_text}" if frames == 1 else f"Inspect {frames} Video Frames")
+            return _finish_tool_call_label(f"Inspect {frame_text} from {video_names[0]}{area}")
+        label = f"Inspect {frame_text}" if frames == 1 else f"Inspect {frames} Video Frames"
+        return _finish_tool_call_label(f"{label}{area}")
+    if normalized_name == "side_by_side":
+        media_ids = arguments.get("media_ids")
+        count = len(media_ids) if isinstance(media_ids, list) else 0
+        label = "Compose Side by Side" if count == 0 else f"Compose {count} Visual{'s' if count != 1 else ''} Side by Side"
+        layout = str(arguments.get("layout", "") or "").strip().casefold()
+        layout_label = {"horizontal": " Horizontally", "vertical": " Vertically", "grid": " in a Grid"}.get(layout, f" in {layout.upper()}" if layout else "")
+        legends = arguments.get("legends")
+        legend_label = " with Legends" if isinstance(legends, list) and any(str(legend or "").strip() for legend in legends) else ""
+        return _finish_tool_call_label(f"{label}{layout_label}{legend_label}")
+    if normalized_name == "add_to_gallery":
+        paths = arguments.get("paths")
+        sources = paths if isinstance(paths, list) else [arguments.get("path")] if arguments.get("path") else []
+        if len(sources) != 1:
+            return _finish_tool_call_label("Add Media to Gallery" if not sources else f"Add {len(sources)} Media Items to Gallery")
+        return _finish_tool_call_label(f"Add to Gallery for {_short_tool_label_value(sources[0])}")
     if normalized_name == "resize_crop":
         width, height = arguments.get("width"), arguments.get("height")
         cropping = any(arguments.get(key) is not None for key in ("crop_left", "crop_top", "crop_right", "crop_bottom"))
@@ -4482,16 +4685,16 @@ def build_tool_call_label(
         reference = _humanize_tool_value(arguments.get("reference"))
         kind = _humanize_tool_value(arguments.get("media_type"))
         return _finish_tool_call_label("Resolve Media" if not reference else f"Resolve {reference}{f' {kind}' if kind and kind.casefold() != 'all' else ''}")
-    if normalized_name == "mcp_list_resources":
+    if normalized_name == "mcp_resource":
         server = _short_tool_label_value(arguments.get("server"))
-        return _finish_tool_call_label("List MCP Documents" if not server else f"List {server} Documents")
-    if normalized_name == "mcp_read_resource":
         target = _humanize_tool_value(arguments.get("uri"))
-        section = _short_tool_label_value(arguments.get("section"))
-        return _finish_tool_call_label("Read MCP Document" if not target else f"Read {section} from {target}" if section else f"Read {target}")
-    if normalized_name == "mcp_search_resource":
+        if not target:
+            return _finish_tool_call_label("List MCP Documents" if not server else f"List {server} Documents")
         query = _short_tool_label_value(arguments.get("query"))
-        return _finish_tool_call_label("Search MCP Documents" if not query else f'Search MCP Documents for “{query}”')
+        if query:
+            return _finish_tool_call_label(f'Search {target} for “{query}”')
+        section = _short_tool_label_value(arguments.get("section"))
+        return _finish_tool_call_label(f"Read {section} from {target}" if section else f"Read {target}")
 
     subjects = ("media_id", "path", "reference", "doc_id", "section", "query", "job_id", "server", "uri")
     subject = next((_short_tool_label_value(arguments.get(key)) for key in subjects if _short_tool_label_value(arguments.get(key))), "")
@@ -4555,7 +4758,299 @@ def _markdown_to_html(text: str) -> str:
         return ""
     text = html.escape(text, quote=False)
     rendered = markdown.markdown(text, extensions=_MARKDOWN_EXTENSIONS, output_format="html5")
-    return re.sub(r'<a href="(https?://[^"]+)"', r'<a href="\1" target="_blank" rel="noopener noreferrer"', rendered)
+    rendered = re.sub(r'<a href="(https?://[^"]+)"', r'<a href="\1" target="_blank" rel="noopener noreferrer"', rendered)
+    rendered = re.sub(r'<a href="(/wangp_api/gallery/media/[^"]+)"', r'<a href="\1" target="_blank" rel="noopener noreferrer"', rendered)
+    return re.sub(r'<a href="(/wangp_api/download/[a-f0-9]+)"', r'<a href="\1" download', rendered)
+
+
+def _authorized_download_path(value: Any, file_access_policy) -> str | None:
+    if file_access_policy is None:
+        return None
+    try:
+        path_text = str(value or "").strip().strip("\"'")
+        if os.name == "nt" and path_text.rstrip(" .") != path_text:
+            return None
+        candidate = Path(path_text).expanduser()
+        if candidate.is_absolute() and file_access_policy.virtualized:
+            return None
+        path = file_access_policy.resolve_path(path_text)
+        return str(path) if file_access_policy.can_read(path) and path.is_file() else None
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
+def _existing_download_path(value: Any) -> str | None:
+    try:
+        path = os.path.abspath(os.path.expanduser(str(value or "").strip()))
+        return path if os.path.isfile(path) else None
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
+def _tool_result_paths(value: Any, key: str = ""):
+    if isinstance(value, dict):
+        for child_key, child_value in value.items():
+            yield from _tool_result_paths(child_value, str(child_key or "").strip().casefold())
+    elif isinstance(value, (list, tuple)):
+        for child_value in value:
+            yield from _tool_result_paths(child_value, key)
+    elif (key in _TOOL_RESULT_PATH_KEYS or key.endswith(("_path", "_paths", "_file", "_files"))) and isinstance(value, (str, os.PathLike)):
+        yield str(value)
+
+
+def _download_reference_targets(session, record: dict[str, Any], file_access_policy) -> dict[str, str]:
+    targets: dict[str, tuple[str, str] | None] = {}
+
+    def add(reference: Any, path: str) -> None:
+        text = str(reference or "").strip()
+        if not text or "\n" in text:
+            return
+        key = text.casefold()
+        existing = targets.get(key)
+        if existing is None and key in targets:
+            return
+        if existing is not None and os.path.normcase(existing[1]) != os.path.normcase(path):
+            targets[key] = None
+        else:
+            targets[key] = (text, path)
+
+    for media in list(getattr(session, "media_registry", []) or []):
+        if not isinstance(media, dict):
+            continue
+        media_path = str(media.get("path", "") or "").strip()
+        path = _existing_download_path(media_path)
+        if path is None:
+            continue
+        add(media.get("media_id"), path)
+        media_type = str(media.get("media_type", "") or "").strip().lower()
+        if media_type in {"image", "video", "audio"}:
+            gallery = "audio" if media_type == "audio" else "visual"
+            gallery_key = hashlib.sha1(media_path.replace("\\", "/").casefold().encode("utf-8")).hexdigest()[:12]
+            add(f"{gallery}:{gallery_key}", path)
+        add(media.get("filename") or os.path.basename(path), path)
+        if file_access_policy.can_read(Path(path)):
+            add(file_access_policy.virtualize_path(path), path)
+            if not file_access_policy.virtualized:
+                add(media.get("path"), path)
+                add(path, path)
+    for media_id, media_path in dict(getattr(session, "gallery_download_registry", {}) or {}).items():
+        path = _existing_download_path(media_path)
+        if path is not None:
+            add(media_id, path)
+    for block in _ensure_message_blocks(record):
+        if not isinstance(block, dict) or block.get("type") != "tool":
+            continue
+        for value in _tool_result_paths({"arguments": block.get("arguments"), "result": block.get("result")}):
+            path = _authorized_download_path(value, file_access_policy)
+            if path is None:
+                continue
+            add(value, path)
+            add(file_access_policy.virtualize_path(path), path)
+            if not file_access_policy.virtualized:
+                add(path, path)
+            if os.path.splitext(os.path.basename(path))[1]:
+                add(os.path.basename(path), path)
+    return {value[0]: value[1] for value in targets.values() if value is not None}
+
+
+def _markdown_download_link(label: str, path: str, state: dict[str, Any], *, code: bool = False) -> str | None:
+    if state["count"] >= _DOWNLOAD_REFERENCE_LIMIT:
+        return None
+    reference = label[1:-1].strip() if code else label.strip()
+    gallery_media_id = reference.casefold() if _GALLERY_MEDIA_ID_RE.fullmatch(reference) else ""
+    path_key = f"gallery:{gallery_media_id}" if gallery_media_id else os.path.normcase(path)
+    url = state["urls"].get(path_key)
+    if url is None:
+        from shared.gradio.downloads import register_file_download, register_gallery_download
+
+        url = (register_gallery_download(gallery_media_id, path) if gallery_media_id else register_file_download(path))["url"]
+        state["urls"][path_key] = url
+    state["count"] += 1
+    escaped_label = label if code else re.sub(r"([\\`*{}\[\]()#+\-.!_|>])", r"\\\1", label)
+    return f"[{escaped_label}]({url})"
+
+
+def _rewrite_sandbox_download_link(token: str, file_access_policy) -> str:
+    marker = token.rfind("](")
+    if marker < 0 or not token.endswith(")"):
+        return token
+    target = urllib.parse.unquote(token[marker + 2:-1].strip())
+    if not target.casefold().startswith("sandbox:"):
+        return token
+    path = _authorized_download_path(target[len("sandbox:"):], file_access_policy)
+    if path is None:
+        return token
+    from shared.gradio.downloads import register_file_download
+
+    return f"{token[:marker + 2]}{register_file_download(path)['url']})"
+
+
+def _absolute_path_prefix(text: str, start: int, file_access_policy) -> tuple[int, str] | None:
+    line_end = text.find("\n", start)
+    tail = text[start : min(len(text) if line_end < 0 else line_end, start + 4096)]
+    endpoints = {len(tail), *(match.start() for match in re.finditer(r"\s+", tail))}
+    for end in sorted(endpoints, reverse=True):
+        candidate = tail[:end].rstrip()
+        variants, trimmed = [candidate], candidate
+        while trimmed and trimmed[-1] in ".,;:!?)]}'\"`*_":
+            trimmed = trimmed[:-1].rstrip()
+            variants.append(trimmed)
+        for variant in variants:
+            path = _authorized_download_path(variant, file_access_policy)
+            if path is not None:
+                return len(variant), path
+    return None
+
+
+def _linkify_absolute_paths(text: str, file_access_policy, state: dict[str, Any]) -> str:
+    if file_access_policy is None or not file_access_policy.read_enabled or state["count"] >= _DOWNLOAD_REFERENCE_LIMIT:
+        return text
+    rendered, cursor = [], 0
+    while state["count"] < _DOWNLOAD_REFERENCE_LIMIT:
+        match = _ABSOLUTE_PATH_START_RE.search(text, cursor)
+        if match is None:
+            break
+        resolved = _absolute_path_prefix(text, match.start(), file_access_policy)
+        if resolved is None:
+            rendered.append(text[cursor : match.end()])
+            cursor = match.end()
+            continue
+        length, path = resolved
+        label = text[match.start() : match.start() + length]
+        link = _markdown_download_link(label, path, state)
+        if link is None:
+            break
+        rendered.extend((text[cursor : match.start()], link))
+        cursor = match.start() + length
+    rendered.append(text[cursor:])
+    return "".join(rendered)
+
+
+def _linkify_plain_download_references(text: str, references: dict[str, str], file_access_policy, state: dict[str, Any]) -> str:
+    if references and state["count"] < _DOWNLOAD_REFERENCE_LIMIT:
+        lookup = {reference.casefold(): path for reference, path in references.items()}
+        alternatives = "|".join(re.escape(reference) for reference in sorted(references, key=len, reverse=True))
+        pattern = re.compile(rf"(?<![\w\\/])({alternatives})(?![\w\\/])", flags=re.IGNORECASE)
+
+        def replace(match: re.Match[str]) -> str:
+            path = lookup[match.group(1).casefold()]
+            return _markdown_download_link(match.group(1), path, state) or match.group(0)
+
+        text = pattern.sub(replace, text)
+    rendered, cursor = [], 0
+    for match in _DOWNLOAD_LINK_RE.finditer(text):
+        rendered.append(_linkify_absolute_paths(text[cursor : match.start()], file_access_policy, state))
+        rendered.append(match.group(0))
+        cursor = match.end()
+    rendered.append(_linkify_absolute_paths(text[cursor:], file_access_policy, state))
+    return "".join(rendered)
+
+
+def _linkify_download_markdown(text: str, references: dict[str, str], file_access_policy, state: dict[str, Any] | None = None) -> str:
+    lookup = {reference.casefold(): path for reference, path in references.items()}
+    state = {"count": 0, "urls": {}} if state is None else state
+    rendered, cursor = [], 0
+    for match in _DOWNLOAD_MARKDOWN_TOKEN_RE.finditer(text):
+        rendered.append(_linkify_plain_download_references(text[cursor : match.start()], references, file_access_policy, state))
+        token = match.group(0)
+        if match.lastgroup == "code" and state["count"] < _DOWNLOAD_REFERENCE_LIMIT:
+            value = token[1:-1].strip()
+            path = lookup.get(value.casefold()) or _authorized_download_path(value, file_access_policy)
+            token = _markdown_download_link(token, path, state, code=True) if path is not None else token
+        elif match.lastgroup == "link":
+            token = _rewrite_sandbox_download_link(token, file_access_policy)
+        rendered.append(token)
+        cursor = match.end()
+    rendered.append(_linkify_plain_download_references(text[cursor:], references, file_access_policy, state))
+    return "".join(rendered)
+
+
+def linkify_message_download_references(session, message_id: str, file_access_policy) -> str | None:
+    if file_access_policy is None:
+        return None
+    record = _find_message(session, message_id)
+    if record is None or str(record.get("role", "")).strip().lower() != "assistant":
+        return None
+    references = _download_reference_targets(session, record, file_access_policy)
+    changed, state = False, {"count": 0, "urls": {}}
+    for block in _ensure_message_blocks(record):
+        if not isinstance(block, dict) or block.get("type") != "markdown":
+            continue
+        original = str(block.get("text", "") or "")
+        linked = _linkify_download_markdown(original, references, file_access_policy, state)
+        if linked != original:
+            block["text"] = linked
+            changed = True
+    if not changed:
+        return None
+    revision = _touch_chat(session)
+    return _event_payload({"type": "upsert_message", "message": _render_message_payload(record)}, session, revision)
+
+
+def _structured_tool_presentation(tool_record: dict[str, Any], file_access_policy) -> dict[str, Any] | None:
+    result = tool_record.get("result")
+    if not isinstance(result, dict):
+        return None
+    rows = result.get("entries") if isinstance(result.get("entries"), list) else result.get("items") if isinstance(result.get("items"), list) else None
+    if rows is None and str(tool_record.get("name", "")) == "wangp_artifact" and isinstance(result.get("data"), dict):
+        rows = [{"field": key, "value": value} for key, value in result["data"].items()]
+    if not rows or not all(isinstance(row, dict) for row in rows):
+        return None
+    preferred = ["index", "name", "title", "path", "type", "duration_seconds", "size_bytes", "modified", "outline", "prompt", "content", "field", "value"]
+    available = []
+    for key in preferred:
+        if any(key in row for row in rows):
+            available.append(key)
+    for row in rows:
+        for key in row:
+            if key not in available:
+                available.append(key)
+    columns = available[:8]
+    rendered_rows = []
+    for row in rows:
+        cells = []
+        for column in columns:
+            value = row.get(column, "")
+            text = json.dumps(value, ensure_ascii=False, sort_keys=True) if isinstance(value, (dict, list)) else str(value if value is not None else "")
+            href = ""
+            if column == "path" and file_access_policy is not None:
+                path = _authorized_download_path(value, file_access_policy)
+                if path is not None:
+                    from shared.gradio.downloads import register_file_download
+                    href = register_file_download(path)["url"]
+            cells.append({"text": text, "href": href})
+        rendered_rows.append(cells)
+    total = result.get("matched")
+    offset = int(result.get("offset", 0) or 0)
+    end = offset + len(rows)
+    summary = f"{offset + 1}-{end} of {int(total)}" if total is not None else f"{offset + 1}-{end}" if offset else f"{len(rows)} item{'s' if len(rows) != 1 else ''}"
+    if result.get("has_more"):
+        summary += f"; next offset {result.get('next_offset')}"
+    return {"type": "records", "title": str(tool_record.get("label", "") or "Structured result"), "summary": summary, "columns": columns, "rows": rendered_rows}
+
+
+def _render_structured_tool_presentation(presentation: dict[str, Any] | None) -> str:
+    if not isinstance(presentation, dict) or presentation.get("type") != "records":
+        return ""
+    columns, rows = list(presentation.get("columns", []) or []), list(presentation.get("rows", []) or [])
+    if not columns or not rows:
+        return ""
+    header = "".join(f"<th>{html.escape(str(column).replace('_', ' ').title())}</th>" for column in columns)
+    body = []
+    for row in rows:
+        cells = []
+        for cell in list(row or []):
+            text = html.escape(str(cell.get("text", "")))
+            href = str(cell.get("href", "") or "").strip()
+            content = f"<a href='{html.escape(href)}' download>{text}</a>" if href else text
+            cells.append(f"<td>{content}</td>")
+        body.append(f"<tr>{''.join(cells)}</tr>")
+    return (
+        "<section class='wangp-assistant-chat__structured-result'>"
+        f"<div class='wangp-assistant-chat__structured-result-header'><strong>{html.escape(str(presentation.get('title', 'Structured result')))}</strong><span>{html.escape(str(presentation.get('summary', '')))}</span></div>"
+        f"<div class='wangp-assistant-chat__structured-result-scroll'><table><thead><tr>{header}</tr></thead><tbody>{''.join(body)}</tbody></table></div>"
+        "</section>"
+    )
 
 
 def _plain_text_to_html(text: str) -> str:
@@ -4577,15 +5072,69 @@ def _extract_attachments_from_markdown(text: str) -> tuple[str, list[dict[str, A
     return stripped, attachments
 
 
-def _attachment_from_tool_result(result: dict[str, Any] | None) -> dict[str, Any] | None:
+def _attachments_from_tool_result(result: dict[str, Any] | None, file_access_policy=None) -> list[dict[str, Any]]:
     if not isinstance(result, dict):
-        return None
-    output_file = str(result.get("output_file", "")).strip()
-    if len(output_file) == 0:
-        return None
-    ext = os.path.splitext(output_file)[1].lower()
-    label = "Generated image" if ext in _IMAGE_EXTENSIONS else ("Generated video" if ext in _VIDEO_EXTENSIONS else ("Generated audio" if ext in _AUDIO_EXTENSIONS else "Generated file"))
-    return _attachment_from_path(output_file, label)
+        return []
+    download = result.get("download")
+    if isinstance(download, dict) and str(download.get("url", "")).strip():
+        filename = str(download.get("filename", "Download file") or "Download file").strip()
+        size_bytes = download.get("size_bytes")
+        subtitle = f"{int(size_bytes):,} bytes" if isinstance(size_bytes, (int, float)) else ""
+        url = str(download["url"]).strip()
+        kind = _attachment_kind(filename, "download")
+        source_path = _physical_attachment_path(result.get("output_file") or result.get("path"), file_access_policy)
+        preview = _attachment_from_path(source_path) if source_path and kind in {"image", "video", "audio"} else None
+        bundled_thumbnail = {"audio": _AUDIO_THUMBNAIL_PATH, "archive": _ARCHIVE_THUMBNAIL_PATH}.get(kind)
+        thumb_url = str(preview.get("thumb_url", "")) if preview is not None else (_bundled_thumbnail_url(bundled_thumbnail) if bundled_thumbnail else "")
+        return [{"href": url, "label": f"Download {filename}", "subtitle": subtitle, "thumb_url": thumb_url, "kind": kind, "path_key": url, "download": filename}]
+
+    output_paths = []
+
+    def collect(payload: Any) -> None:
+        if not isinstance(payload, dict):
+            return
+        for key in ("generated_files", "output_files"):
+            values = payload.get(key)
+            if isinstance(values, (list, tuple)):
+                output_paths.extend(str(value).strip() for value in values if str(value).strip())
+        nested_result = payload.get("result")
+        if isinstance(nested_result, dict):
+            collect(nested_result)
+        output_file = str(payload.get("output_file", "") or "").strip()
+        if output_file:
+            output_paths.append(output_file)
+
+    collect(result)
+    attachments = []
+    seen_paths = set()
+    for output_path in output_paths:
+        output_file = _physical_attachment_path(output_path, file_access_policy)
+        path_key = os.path.normcase(os.path.normpath(output_file))
+        if not output_file or path_key in seen_paths:
+            continue
+        seen_paths.add(path_key)
+        ext = os.path.splitext(output_file)[1].lower()
+        label = "Generated image" if ext in _IMAGE_EXTENSIONS else ("Generated video" if ext in _VIDEO_EXTENSIONS else ("Generated audio" if ext in _AUDIO_EXTENSIONS else "Generated file"))
+        attachment = _attachment_from_path(output_file, label)
+        if attachment is not None:
+            attachments.append(attachment)
+    return attachments
+
+
+def _attachment_from_tool_result(result: dict[str, Any] | None, file_access_policy=None) -> dict[str, Any] | None:
+    attachments = _attachments_from_tool_result(result, file_access_policy)
+    return attachments[-1] if attachments else None
+
+
+def _physical_attachment_path(value: Any, file_access_policy=None) -> str:
+    path = str(value or "").strip()
+    if not path or file_access_policy is None:
+        return path
+    try:
+        resolved = file_access_policy.resolve_path(path)
+        return str(resolved) if resolved.is_file() else ""
+    except (OSError, PermissionError, ValueError):
+        return path
 
 
 def _attachment_from_path(path: str, label: str | None = None) -> dict[str, Any] | None:
@@ -4605,7 +5154,7 @@ def _attachment_from_path(path: str, label: str | None = None) -> dict[str, Any]
     if resolved_label == subtitle:
         subtitle = ""
     thumb_url = ""
-    kind = "file"
+    kind = _attachment_kind(normalized_path)
     if ext in _IMAGE_EXTENSIONS:
         kind = "image"
         thumb_url = href
@@ -4617,9 +5166,7 @@ def _attachment_from_path(path: str, label: str | None = None) -> dict[str, Any]
             thumb_url = ""
     elif ext in _AUDIO_EXTENSIONS:
         kind = "audio"
-        if os.path.isfile(_AUDIO_THUMBNAIL_PATH):
-            audio_thumb_path = os.path.normpath(_AUDIO_THUMBNAIL_PATH).replace("\\", "/")
-            thumb_url = f"/gradio_api/file={urllib.parse.quote(audio_thumb_path, safe='/')}"
+        thumb_url = _audio_thumbnail_url()
     return {
         "path_key": path_key,
         "href": href,
@@ -4628,6 +5175,43 @@ def _attachment_from_path(path: str, label: str | None = None) -> dict[str, Any]
         "kind": kind,
         "thumb_url": thumb_url,
     }
+
+
+def _attachment_kind(path: str, default: str = "file") -> str:
+    ext = os.path.splitext(str(path or ""))[1].lower()
+    if ext in _ARCHIVE_EXTENSIONS:
+        return "archive"
+    if ext in _IMAGE_EXTENSIONS:
+        return "image"
+    if ext in _VIDEO_EXTENSIONS:
+        return "video"
+    if ext in _AUDIO_EXTENSIONS:
+        return "audio"
+    return "file" if ext else default
+
+
+def _audio_thumbnail_url() -> str:
+    return _bundled_thumbnail_url(_AUDIO_THUMBNAIL_PATH)
+
+
+def _bundled_thumbnail_url(thumbnail_path: str) -> str:
+    if not os.path.isfile(thumbnail_path):
+        return ""
+    path = os.path.normpath(thumbnail_path).replace("\\", "/")
+    return f"/gradio_api/file={urllib.parse.quote(path, safe='/')}"
+
+
+def _attachment_icon(kind: str) -> str:
+    icons = {
+        "archive": "<rect x='4' y='6' width='40' height='10' rx='2'></rect><path d='M8 16v22a4 4 0 0 0 4 4h24a4 4 0 0 0 4-4V16'></path><path d='M19 25h10'></path>",
+        "audio": "<path d='M18 36V13l19-4v23'></path><path d='M18 19l19-4'></path><ellipse cx='13' cy='37' rx='5' ry='4'></ellipse><ellipse cx='32' cy='33' rx='5' ry='4'></ellipse>",
+        "download": "<path d='M24 6v24'></path><path d='m15 22 9 9 9-9'></path><path d='M10 39h28'></path>",
+        "image": "<rect x='6' y='8' width='36' height='32' rx='4'></rect><circle cx='17' cy='19' r='3'></circle><path d='m10 35 9-9 6 6 5-5 8 8'></path>",
+        "video": "<rect x='6' y='10' width='36' height='28' rx='4'></rect><path d='m20 18 11 6-11 6z'></path>",
+        "file": "<path d='M13 5h15l7 7v31H13z'></path><path d='M28 5v8h7M19 23h10M19 29h10M19 35h7'></path>",
+    }
+    icon_kind = kind if kind in icons else "file"
+    return f"<div class='wangp-assistant-chat__attachment-thumb wangp-assistant-chat__attachment-thumb--icon wangp-assistant-chat__attachment-thumb--{icon_kind}' data-attachment-icon='{icon_kind}'><svg viewBox='0 0 48 48' aria-hidden='true' focusable='false'>{icons[icon_kind]}</svg></div>"
 
 
 def _render_copy_button(source: str, label: str, text: str | None = None) -> str:
@@ -4731,7 +5315,8 @@ def _render_message_blocks(record: dict[str, Any]) -> tuple[str, set[str]]:
             continue
         if block_type == "tool":
             rendered.append(_render_tool_block(block))
-            attachment_html = _render_attachments(_dedupe_attachments([block.get("attachment")] if isinstance(block.get("attachment"), dict) else [], rendered_attachment_keys))
+            attachments = block.get("attachments") if isinstance(block.get("attachments"), list) else [block.get("attachment")] if isinstance(block.get("attachment"), dict) else []
+            attachment_html = _render_attachments(_dedupe_attachments(attachments, rendered_attachment_keys))
             if len(attachment_html) > 0:
                 rendered.append(attachment_html)
     return "".join(rendered), rendered_attachment_keys
@@ -4764,7 +5349,7 @@ def _render_context_summary_block(block: dict[str, Any]) -> str:
     return (
         f"<details class='wangp-assistant-chat__disclosure wangp-assistant-chat__disclosure--context-summary' data-context-summary-id='{html.escape(str(block.get('id', '')))}'>"
         "<summary><span class='wangp-assistant-chat__tool-title'><span class='wangp-assistant-chat__tool-chip'>Context</span>Earlier history summarized</span></summary>"
-        f"<div class='wangp-assistant-chat__disclosure-body'><div class='wangp-assistant-chat__context-summary'>{_markdown_to_html(block.get('text', ''))}</div></div>"
+        f"<div class='wangp-assistant-chat__disclosure-body'><div class='wangp-assistant-chat__context-summary'>{_markdown_to_html(block.get('text', ''))}</div>{_render_collapse_button('summary')}</div>"
         "</details>"
     )
 
@@ -4775,14 +5360,14 @@ def _render_tool_block(tool_record: dict[str, Any]) -> str:
     status = str(tool_record.get("status", "running")).strip().lower()
     status_label = str(tool_record.get("status_text", "")).strip() or {"running": "Running", "done": "Done", "error": "Error"}.get(status, status.title() or "Running")
     status_class = {"running": "running", "done": "done", "error": "error"}.get(status, "running")
+    request_pending = bool(tool_record.get("request_pending", False))
     arguments_text = html.escape(json.dumps(tool_record.get("arguments", {}), ensure_ascii=False, indent=2, sort_keys=True))
     result_payload = tool_record.get("result", {})
     result_text = html.escape(json.dumps(result_payload, ensure_ascii=False, indent=2, sort_keys=True)) if result_payload is not None else ""
     arguments_copy_button = _render_copy_button("json", f"Copy {label} arguments")
     result_copy_button = "" if result_payload is None else _render_copy_button("json", "Copy result")
-    return (
-        f"<details class='wangp-assistant-chat__disclosure wangp-assistant-chat__disclosure--tool' data-tool-id='{html.escape(str(tool_record.get('id', '')))}'>"
-        f"<summary><span class='wangp-assistant-chat__tool-title'><span class='wangp-assistant-chat__tool-chip'>Tool</span>{html.escape(label)}</span><span class='wangp-assistant-chat__tool-status wangp-assistant-chat__tool-status--{status_class}'>{html.escape(status_label)}</span></summary>"
+    pending_body = "<div class='wangp-assistant-chat__disclosure-body'><div class='wangp-assistant-chat__tool-json wangp-assistant-chat__tool-pending'>Deepy is preparing the tool request.</div></div>"
+    completed_body = (
         "<div class='wangp-assistant-chat__disclosure-body'>"
         "<div class='wangp-assistant-chat__tool-grid'>"
         f"<div class='wangp-assistant-chat__tool-json'><div class='wangp-assistant-chat__tool-section-header'><div class='wangp-assistant-chat__tool-section-title'>{html.escape(label)} Arguments</div>{arguments_copy_button}</div><pre class='wangp-assistant-chat__pre'>{arguments_text}</pre></div>"
@@ -4790,8 +5375,14 @@ def _render_tool_block(tool_record: dict[str, Any]) -> str:
         "</div>"
         f"{_render_collapse_button('tool')}"
         "</div>"
+    )
+    details = (
+        f"<details class='wangp-assistant-chat__disclosure wangp-assistant-chat__disclosure--tool' data-tool-id='{html.escape(str(tool_record.get('id', '')))}'>"
+        f"<summary><span class='wangp-assistant-chat__tool-title'><span class='wangp-assistant-chat__tool-chip'>Tool</span>{html.escape(label)}</span><span class='wangp-assistant-chat__tool-status wangp-assistant-chat__tool-status--{status_class}'>{html.escape(status_label)}</span></summary>"
+        f"{pending_body if request_pending else completed_body}"
         "</details>"
     )
+    return f"{details}{_render_structured_tool_presentation(tool_record.get('presentation'))}"
 
 
 def _render_attachments(attachments: list[dict[str, Any]]) -> str:
@@ -4809,10 +5400,12 @@ def _render_attachments(attachments: list[dict[str, Any]]) -> str:
         thumb_html = (
             f"<img class='wangp-assistant-chat__attachment-thumb' loading='lazy' src='{html.escape(thumb_url)}' alt='{label}'>"
             if len(thumb_url) > 0
-            else "<div class='wangp-assistant-chat__attachment-thumb'></div>"
+            else _attachment_icon(str(attachment.get("kind", "file")).strip().lower())
         )
+        download_name = str(attachment.get("download", "")).strip()
+        link_attributes = f" download='{html.escape(download_name)}'" if download_name else " target='_blank' rel='noopener'"
         cards.append(
-            f"<a class='wangp-assistant-chat__attachment' href='{html.escape(href)}' target='_blank' rel='noopener'>"
+            f"<a class='wangp-assistant-chat__attachment' href='{html.escape(href)}'{link_attributes}>"
             f"{thumb_html}"
             "<span class='wangp-assistant-chat__attachment-meta'>"
             f"<span class='wangp-assistant-chat__attachment-title'>{label}</span>"

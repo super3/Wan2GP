@@ -44,7 +44,7 @@ from pathlib import Path
 from datetime import datetime
 import gradio as gr
 from shared.gradio import downloads as gradio_downloads
-from shared.gradio import gradio_model_switch_patch, gradio_queue_focus_patch, video_preview
+from shared.gradio import gradio_model_switch_patch, gradio_queue_focus_patch, gradio_startup_patch, video_preview
 from gradio.themes.utils.sizes import Size
 import random
 import json
@@ -52,6 +52,7 @@ import copy
 import numpy as np
 import importlib
 from models import model_metadata
+from shared import notifications
 from shared.utils import notification_sound
 from shared.utils.loras_mutipliers import preparse_loras_multipliers, parse_loras_multipliers
 from shared.utils.utils import convert_tensor_to_image, convert_video_tensor_to_uint8_chunked, save_image, get_video_info, get_file_creation_date, convert_image_to_video, calculate_new_dimensions, convert_image_to_tensor, calculate_dimensions_and_resize_image, rescale_and_crop, get_video_frame, resize_and_remove_background, rgb_bw_to_rgba_mask, image_editor_layer_to_rgb_mask, to_rgb_tensor, get_resampled_video_transparent, get_video_summary_extras
@@ -88,6 +89,7 @@ from shared.utils import files_locator as fl
 from shared.gradio.audio_gallery import AudioGallery  
 from shared.utils.self_refiner import normalize_self_refiner_plan, ensure_refiner_list, add_refiner_rule, remove_refiner_rule
 from shared.deepy import controller as deepy_controller
+from shared.deepy import filesystem as deepy_filesystem
 from shared.deepy import cli as deepy_cli
 from shared.deepy import gradio_ui as deepy_gradio_ui
 from shared import extra_settings
@@ -127,8 +129,8 @@ from shared.ffmpeg_setup import download_ffmpeg
 from shared.api import apply_video_length_duration, get_api_output_options, store_api_output_artifact
 from shared.utils.plugins import PluginManager, WAN2GPApplication, SYSTEM_PLUGINS
 from shared.llm_engines.nanovllm.vllm_support import resolve_lm_decoder_engine
-from shared.gradio import assistant_chat, field_help, finetune_editor, local_file_picker, model_infos, model_output_filter, model_selector_toolbar
-from shared.gradio.magic_mask import MagicMaskUI
+from shared.gradio import assistant_chat, field_help, finetune_editor, gallery_files, local_file_picker, model_infos, model_output_filter, model_selector_toolbar
+from shared.gradio.magic_mask import MagicMaskUI, video_mask_area_visible, video_mask_controls_visible, video_mask_dropdown_visible
 from shared import model_dropdowns
 from shared import settings_metadata
 from postprocessing import audio_processors as audio_processor_api
@@ -152,8 +154,8 @@ AUTOSAVE_TEMPLATE_PATH = AUTOSAVE_FILENAME
 CONFIG_FILENAME = "wgp_config.json"
 PROMPT_VARS_MAX = 10
 target_mmgp_version = "3.7.14"
-WanGP_version = "12.641"
-settings_version = 2.75
+WanGP_version = "12.647"
+settings_version = 2.77
 max_source_video_frames = 3000
 prompt_enhancer_image_caption_model, prompt_enhancer_image_caption_processor, prompt_enhancer_llm_model, prompt_enhancer_llm_tokenizer = None, None, None, None
 image_names_list = ["image_start", "image_end", "image_refs"]
@@ -172,6 +174,7 @@ app = None
 # All media attachment keys for queue save/load
 ATTACHMENT_KEYS = ["image_start", "image_end", "image_refs", "image_guide", "image_mask",
                    "video_guide", "video_guide2", "video_mask", "video_source", "audio_guide", "audio_guide2", "audio_source", "replace_voice_sample", "replace_voice_sample2", "custom_guide"]
+PRESERVE_MEDIA_ON_SETTINGS_IMPORT = True
 
 from importlib.metadata import version
 mmgp_version = version("mmgp")
@@ -822,6 +825,16 @@ def get_model_custom_settings(model_def):
         normalized.append(one)
     return normalized
 
+def apply_custom_settings_defaults(model_def, ui_defaults):
+    custom_settings = ui_defaults.get("custom_settings")
+    for setting_def in get_model_custom_settings(model_def):
+        if "default" not in setting_def:
+            continue
+        if not isinstance(custom_settings, dict):
+            custom_settings = {}
+            ui_defaults["custom_settings"] = custom_settings
+        custom_settings.setdefault(setting_def["id"], copy.deepcopy(setting_def["default"]))
+
 def get_custom_setting_slider_bounds(setting_def):
     if not isinstance(setting_def, dict) or setting_def.get("type") not in {"int", "float"} or not all(key in setting_def for key in ("min", "max", "inc")):
         return None
@@ -1063,6 +1076,7 @@ def validate_settings(state, model_type, single_prompt, inputs, silent=False):
         return err(custom_settings_error)
     inputs["custom_settings"] = parsed_custom_settings
     clear_custom_setting_slots(inputs)
+    inputs["guidance_phases"], inputs["video_prompt_type"] = normalize_phase_2_tiling_selection(model_def, inputs["guidance_phases"], inputs["video_prompt_type"])
     extra_settings_error = extra_settings.validate_inputs(inputs, model_def, get_max_frames=get_max_frames)
     if len(extra_settings_error) > 0:
         return err(extra_settings_error)
@@ -1118,9 +1132,6 @@ def validate_settings(state, model_type, single_prompt, inputs, silent=False):
     loras_multipliers = inputs["loras_multipliers"]
     activated_loras = inputs["activated_loras"]
     guidance_phases= inputs["guidance_phases"]
-    guidance_phases, video_prompt_type = normalize_phase_2_tiling_selection(model_def, guidance_phases, video_prompt_type)
-    inputs["guidance_phases"] = guidance_phases
-    inputs["video_prompt_type"] = video_prompt_type
     model_switch_phase = inputs["model_switch_phase"]    
     switch_threshold = inputs["switch_threshold"]
     switch_threshold2 = inputs["switch_threshold2"]
@@ -2101,7 +2112,11 @@ def load_queue_action(filepath, state, evt:gr.EventData):
             newly_loaded_queue = [ {"id": 0, "params": newly_loaded_queue}]
         else:
             inline_queue_source = newly_loaded_queue
-        newly_loaded_queue, error = _parse_task_manifest(newly_loaded_queue, state, None, None, "[unpack queue]", verbose_output = verbose_output )
+        try:
+            newly_loaded_queue, error = _parse_task_manifest(newly_loaded_queue, state, None, None, "[unpack queue]", verbose_output = verbose_output )
+        except Exception as exception:
+            traceback.print_exc()
+            newly_loaded_queue, error = [], f"Inline queue validation failed: {exception}"
         if error:
             if isinstance(inline_queue_source, dict):
                 inline_queue_source = [{"id": 0, "params": inline_queue_source}]
@@ -2625,6 +2640,7 @@ if not Path(config_load_filename).is_file():
         "prompt_enhancer_top_p": 0.9,
         "prompt_enhancer_randomize_seed": True,
         "audio_save_path": "outputs",
+        **notifications.default_config(),
     }
 
     with open(server_config_filename, "w", encoding="utf-8") as writer:
@@ -2635,6 +2651,7 @@ else:
     server_config = json.loads(text)
 
 server_config.setdefault("prompt_enhancer_quantization", "quanto_int8")
+notifications.apply_defaults(server_config)
 server_config.setdefault(PROMPT_ENHANCER_SPECULATIVE_DECODING_KEY, PROMPT_ENHANCER_SPECULATIVE_DECODING_DEFAULT)
 server_config[LLM_CONFIG_KEY] = normalize_llm_config(server_config)
 server_config["multi_prompts_gen_type"] = prompt_parser.normalize_multi_prompts_mode(
@@ -2646,6 +2663,7 @@ server_config.setdefault(gradio_queue_focus_patch.FOCUS_QUEUE_SERVER_CONFIG_KEY,
 gradio_queue_focus_patch.BACKGROUND_SCHEDULER_DEFAULT_ENABLED = bool(server_config.get(gradio_queue_focus_patch.FOCUS_QUEUE_SERVER_CONFIG_KEY, 1))
 gradio_queue_focus_patch.install()
 gradio_model_switch_patch.install(verbose=ui_perf_debug)
+gradio_startup_patch.install()
 
 checkpoints_paths = server_config.get("checkpoints_paths", None)
 if checkpoints_paths is None: checkpoints_paths = server_config["checkpoints_paths"] = fl.default_checkpoints_paths
@@ -3159,7 +3177,9 @@ def fix_settings(model_type, ui_defaults, min_settings_version = 0):
 
     model_handler = get_model_handler(base_model_type)
     if hasattr(model_handler, "fix_settings"):
-            model_handler.fix_settings(base_model_type, settings_version, model_def, ui_defaults)
+        model_handler.fix_settings(base_model_type, settings_version, model_def, ui_defaults)
+
+    ui_defaults["settings_version"] = settings_version
 
 def get_default_prompt(i2v):
     if i2v:
@@ -3172,6 +3192,7 @@ def get_factory_settings(model_type):
     model_def = get_model_def(model_type)
     base_model_type = get_base_model_type(model_type)
     ui_defaults = copy.deepcopy(primary_settings)
+    apply_custom_settings_defaults(model_def, ui_defaults)
     ui_defaults.update({
         "settings_version": settings_version,
         "prompt": get_default_prompt(i2v),
@@ -3184,7 +3205,8 @@ def get_factory_settings(model_type):
         ui_defaults.update(copy.deepcopy(model_settings))
     if len(ui_defaults.get("prompt", "")) == 0:
         ui_defaults["prompt"] = get_default_prompt(i2v)
-    fix_settings(model_type, ui_defaults, settings_version)
+    # needs to implement settings md version for defaults/finetunes
+    # fix_settings(model_type, ui_defaults, settings_version)
     return ui_defaults
 
 
@@ -5070,6 +5092,8 @@ def select_media(state, current_gallery_tab, input_file_list, file_selected, aud
             if isinstance(video_custom_settings, dict):
                 custom_settings = get_model_custom_settings(model_def)
                 for idx, setting_def in enumerate(custom_settings):
+                    if not custom_setting_visible(setting_def, video_video_prompt_type, video_audio_prompt_type):
+                        continue
                     setting_id = setting_def.get("id", get_custom_setting_id(setting_def, idx))
                     setting_value = video_custom_settings.get(setting_id, None)
                     if setting_value is None:
@@ -5847,8 +5871,7 @@ def edit_media(
                 **kwargs
                 ):
 
-
-
+    operation_start_time = time.time()
     gen = get_gen_info(state)
     api_return_video_uint8, api_return_audio = get_api_output_options(plugin_data)
     api_options = plugin_data.get("api", {}) if isinstance(plugin_data, dict) and isinstance(plugin_data.get("api", {}), dict) else {}
@@ -6005,6 +6028,7 @@ def edit_media(
                 image_paths.append(save_image(img, save_file=img_path, quality=server_config.get("image_output_codec", None)))
             video_path = image_paths if len(image_paths) > 1 else image_paths[0]
             print(f"Postprocessed image saved to Path: {video_path}")
+            configs["generation_time"] = round(time.time() - operation_start_time)
             record_file_metadata(video_path, configs, True, False, gen)
             if api_return_video_uint8 or api_return_audio or return_flashvsr_continue_cache:
                 store_api_output_artifact(gen, client_id, video_path, "image", sample if api_return_video_uint8 else None, None, None, None)
@@ -6036,6 +6060,7 @@ def edit_media(
         gen["total_generation"] = total_generation         
         if repeat_no >= total_generation: break
         repeat_no +=1
+        repeat_start_time = operation_start_time if repeat_no == 1 else time.time()
         gen["repeat_no"] = repeat_no
         suffix =  "" if "_post" in video_source else "_post"
 
@@ -6124,6 +6149,7 @@ def edit_media(
             new_video_path = video_path
 
         if any_change:
+            configs["generation_time"] = round(time.time() - repeat_start_time)
             if mode == "edit_remux":
                 print(f"Remuxed Video saved to Path: "+ new_video_path)
             else:
@@ -6142,6 +6168,7 @@ def edit_media(
                 save_video_metadata(new_video_path, configs, embedded_images, allow_inplace_update=True, verbose_level=verbose_level)
                 if temp_images_path is not None and os.path.isdir(temp_images_path):
                     shutil.rmtree(temp_images_path, ignore_errors= True)
+            notifications.record_generation(server_config, gen, new_video_path, configs)
             if api_return_video_uint8 or api_return_audio or return_flashvsr_continue_cache:
                 store_api_output_artifact(
                     gen,
@@ -6164,6 +6191,7 @@ def edit_media(
 
 
 def edit_audio(send_cmd, state, audio_source, postprocess_audio, replace_voice_sample, replace_voice_sample2, client_id="", plugin_data=None):
+    operation_start_time = time.time()
     gen = get_gen_info(state)
     api_return_video_uint8, api_return_audio = get_api_output_options(plugin_data)
     if gen.get("abort", False):
@@ -6202,6 +6230,7 @@ def edit_audio(send_cmd, state, audio_source, postprocess_audio, replace_voice_s
     )
     configs["postprocess_audio"] = postprocess_audio
     configs["audio_postprocess"] = audio_processor_api.format_method_label(postprocess_audio)
+    configs["generation_time"] = round(time.time() - operation_start_time)
 
     print("Postprocessed audio saved to Path: " + new_audio_path)
     record_file_metadata(new_audio_path, configs, False, True, gen)
@@ -6620,8 +6649,10 @@ def get_output_filepath(file_path, is_image, audio_only):
     return get_available_filename(base_path, file_path)
 
 
-def record_file_metadata(video_path, configs, is_image, audio_only, gen, embedded_images=None, replace_last_file=False):
-    return shared_record_file_metadata(video_path, configs, is_image, audio_only, gen, get_processed_queue=get_processed_queue, metadata_choice=server_config.get("metadata_type", "metadata"), embedded_images=embedded_images, replace_last_file=replace_last_file, lock=lock, verbose_level=verbose_level)
+def record_file_metadata(video_path, configs, is_image, audio_only, gen, embedded_images=None, replace_last_file=False, notify_generation=True, write_metadata=True, record_notification=True):
+    shared_record_file_metadata(video_path, configs, is_image, audio_only, gen, get_processed_queue=get_processed_queue, metadata_choice=server_config.get("metadata_type", "metadata"), embedded_images=embedded_images, replace_last_file=replace_last_file, lock=lock, verbose_level=verbose_level, write_metadata=write_metadata)
+    if record_notification:
+        notifications.record_generation(server_config, gen, video_path, configs, replace_last=replace_last_file, notify=notify_generation)
 
 
 def generate_media(
@@ -8346,7 +8377,8 @@ def generate_media(
                 configs["creation_date"] = datetime.fromtimestamp(end_time).isoformat(timespec="seconds")
                 configs["creation_timestamp"] = int(end_time)
                 # if sample_is_image: configs["is_image"] = True
-                record_file_metadata(video_path, configs, is_image, audio_only, gen, embedded_images=embedded_images, replace_last_file=sliding_window and window_no > 1 and not server_config.get("keep_intermediate_sliding_windows", 1))
+                keep_intermediate_windows = server_config.get("keep_intermediate_sliding_windows", 1)
+                record_file_metadata(video_path, configs, is_image, audio_only, gen, embedded_images=embedded_images, replace_last_file=sliding_window and window_no > 1 and not keep_intermediate_windows, notify_generation=not sliding_window or keep_intermediate_windows or window_no == total_windows)
                 if api_return_video_uint8 or api_return_audio or return_flashvsr_continue_cache:
                     media_type = "audio" if audio_only else ("image" if is_image else "video")
                     artifact_audio = output_new_audio_data if api_return_audio else None
@@ -8500,6 +8532,7 @@ def process_tasks(state):
                 gen["process_status"] = None
 
     start_time = time.time()
+    notification_run = notifications.start_queue(gen, len(queue))
 
     global gen_in_progress
     gen_in_progress = True
@@ -8571,6 +8604,7 @@ def process_tasks(state):
 
                 abort = gen.get("abort", False)
                 if abort:
+                    notification_run.interrupt("Generation aborted by the user.", aborted=True)
                     record_queue_error(state, queue[:1], "abort", abort=True)
                     gen["abort"] = False
                     send_cmd("status", "Video Generation Aborted")
@@ -8578,13 +8612,17 @@ def process_tasks(state):
 
                 gen["early_stop"] = False
                 gen["early_stop_forwarded"] = False
-                if not success: break
+                if not success:
+                    notification_run.interrupt("Generation stopped before the queue completed.")
+                    break
                 with lock:
                     queue[:] = [item for item in queue if item['id'] != task_id]
+                notification_run.task_completed()
                 update_global_queue_ref(queue)
                 
         except Exception as e:
             traceback.print_exc()
+            notification_run.fail(str(e))
             send_cmd("error", f"Queue worker crashed: {e}")
         finally:
             send_cmd("worker_exit", None)
@@ -8600,6 +8638,7 @@ def process_tasks(state):
         elif cmd == "info":
             gr.Info(data)
         elif cmd == "error": 
+            notification_run.fail(str(data))
             record_queue_error(state, queue, data)
             queue.clear()
             try:
@@ -8618,6 +8657,7 @@ def process_tasks(state):
             gen["prompts_max"] = 0
             gen["prompt"] = ""
             gen["status_display"] =  False
+            notifications.finish_queue(server_config, gen, notification_run, time.time() - start_time)
             release_gen()
             raise gr.Error(data, print_exception= False, duration = 0)
         elif cmd == "status":
@@ -8652,8 +8692,11 @@ def process_tasks(state):
     gen["prompt"] = ""
     end_time = time.time()
     if gen.get("abort", False):
-        record_queue_error(state, queue[:1], "abort", abort=True)
-        status = f"Video generation was aborted. Total Generation Time: {format_time(end_time-start_time)}" 
+        notification_run.interrupt("Generation aborted by the user.", aborted=True)
+    if notification_run.interrupted:
+        if notification_run.aborted:
+            record_queue_error(state, queue[:1], "abort", abort=True)
+        status = f"Queue processing was interrupted. Total Generation Time: {format_time(end_time-start_time)}"
     else:
         status = f"Total Generation Time: {format_time(end_time-start_time)}"
         try:
@@ -8662,6 +8705,7 @@ def process_tasks(state):
                 notification_sound.notify_video_completion(volume=volume)
         except Exception as e:
             print(f"Error playing notification sound: {e}")
+    notifications.finish_queue(server_config, gen, notification_run, end_time - start_time)
     gen["status"] = status
     gen["status_display"] =  False
     release_gen()
@@ -8757,7 +8801,9 @@ def process_tasks_cli(queue, state):
     total_tasks = len(queue)
     completed = 0
     skipped = 0
+    failed = 0
     start_time = time.time()
+    notification_run = notifications.start_queue(gen, total_tasks)
 
     for task_idx, task in enumerate(queue):
         task_no = task_idx + 1
@@ -8769,6 +8815,7 @@ def process_tasks_cli(queue, state):
         if validated_params is None:
             print(f"  [SKIP] Task {task_no} failed validation: {validation_error or 'Task failed validation.'}")
             skipped += 1
+            notification_run.task_skipped()
             continue
 
         # Update gen state for this task
@@ -8849,7 +8896,11 @@ def process_tasks_cli(queue, state):
 
         if not task_error:
             completed += 1
+            notification_run.task_completed()
             print(f"\n  Task {task_no} completed")
+        else:
+            failed += 1
+            notification_run.task_failed()
 
     elapsed = time.time() - start_time
     print(f"\n{'='*50}")
@@ -8857,6 +8908,7 @@ def process_tasks_cli(queue, state):
     if skipped > 0:
         summary += f" ({skipped} skipped)"
     print(summary)
+    notifications.finish_queue(server_config, gen, notification_run, elapsed)
     return completed == (total_tasks - skipped)
 
 
@@ -9910,6 +9962,8 @@ def use_video_settings(state, input_file_list, choice, source):
             if models_compatible:
                 model_type = current_model_type
             defaults = get_factory_settings(model_type)
+            if PRESERVE_MEDIA_ON_SETTINGS_IMPORT and (current_settings := get_model_settings(state, model_type)) is not None:
+                defaults.update({key: current_settings[key] for key in ATTACHMENT_KEYS if key not in configs and key in current_settings})
             defaults.update(configs)
             defaults["model_type"] = model_type
             prompt = configs.get("prompt", "")
@@ -10036,6 +10090,8 @@ def get_settings_from_file(state, file_path, allow_json, merge_with_defaults, sw
     if merge_with_defaults:
         current_settings = get_model_settings(state, model_type)
         defaults = get_factory_settings(model_type) if merge_factory_defaults else (get_default_settings(model_type) if current_settings is None else current_settings.copy())
+        if PRESERVE_MEDIA_ON_SETTINGS_IMPORT and current_settings is not None:
+            defaults.update({key: current_settings[key] for key in ATTACHMENT_KEYS if key not in configs and key in current_settings})
         has_loras_without_multipliers = "activated_loras" in configs and "loras_multipliers" not in configs
         if merge_loras is not None and model_type == current_model_type:
             lora_settings = current_settings or defaults
@@ -10726,8 +10782,8 @@ def update_image_mask_guide(state, image_mask_guide):
 
 def switch_image_guide_editor(image_mode, old_video_prompt_type , video_prompt_type, old_image_mask_guide_value, old_image_guide_value, old_image_mask_value ):
     if image_mode == 0: return gr.update(visible=False), gr.update(visible=False), gr.update(visible=False)
-    mask_in_old = "A" in old_video_prompt_type and not "U" in old_video_prompt_type
-    mask_in_new = "A" in video_prompt_type and not "U" in video_prompt_type
+    mask_in_old = video_mask_area_visible(old_video_prompt_type)
+    mask_in_new = video_mask_area_visible(video_prompt_type)
     image_mask_guide_value, image_mask_value, image_guide_value = {}, {}, {}
     visible = "V" in video_prompt_type
     if mask_in_old != mask_in_new:
@@ -10753,7 +10809,7 @@ def refresh_video_prompt_type_video_mask(state, video_prompt_type, video_prompt_
     old_video_prompt_type = video_prompt_type
     video_prompt_type = del_in_sequence(video_prompt_type, "XYZWNA")
     video_prompt_type = add_to_sequence(video_prompt_type, video_prompt_type_video_mask)
-    visible= "A" in video_prompt_type     
+    visible = video_mask_area_visible(video_prompt_type)
     model_type = get_state_model_type(state)
     model_def = get_model_def(model_type)
     image_outputs =  image_mode > 0
@@ -10779,18 +10835,18 @@ def refresh_video_prompt_type_video_guide(state, filter_type, video_prompt_type,
         letter_filter = all_guide_processes
     video_prompt_type = del_in_sequence(video_prompt_type, letter_filter)
     video_prompt_type = add_to_sequence(video_prompt_type, video_prompt_type_video_guide)
+    mask_controls_visible = video_mask_controls_visible(video_prompt_type)
+    if not mask_controls_visible:
+        video_prompt_type = del_in_sequence(video_prompt_type, "XYZWNA")
     visible = "V" in video_prompt_type
     any_outpainting= image_mode in model_def.get("video_guide_outpainting", [])
-    mask_visible = visible and "A" in video_prompt_type and not "U" in video_prompt_type
+    mask_visible = video_mask_area_visible(video_prompt_type)
     image_outputs =  image_mode > 0
     keep_frames_video_guide_visible = not image_outputs and visible and not model_def.get("keep_frames_video_guide_not_supported", False)
     image_mask_guide, image_guide, image_mask = switch_image_guide_editor(image_mode, old_video_prompt_type , video_prompt_type, old_image_mask_guide_value, old_image_guide_value, old_image_mask_value )
-    # mask_video_input_visible =  image_mode == 0 and mask_visible
     mask_preprocessing = model_def.get("mask_preprocessing", None)
-    if mask_preprocessing  is None:
-        mask_selector_visible = False
-    else:
-        mask_selector_visible = mask_preprocessing.get("visible", True)
+    mask_selector_visible = video_mask_dropdown_visible(mask_preprocessing, video_prompt_type)
+    mask_selector_update = gr.update(visible=mask_selector_visible) if mask_controls_visible else gr.update(value="", visible=False)
     ref_images_visible = "I" in video_prompt_type
     remove_background_images_ref_visible = ref_images_visible and not model_def.get("no_background_removal", False)
     custom_options = custom_checkbox = False 
@@ -10802,7 +10858,7 @@ def refresh_video_prompt_type_video_guide(state, filter_type, video_prompt_type,
             custom_checkbox = custom_video_selection.get("type","") == "checkbox"
     mask_strength_always_enabled = model_def.get("mask_strength_always_enabled", False)  
     magic_image_btn, magic_video_btn = MagicMaskUI.button_updates(image_mode, video_prompt_type)
-    return video_prompt_type, gr.update(visible=visible and not image_outputs), gr.update(visible="+" in video_prompt_type and not image_outputs), image_guide, gr.update(visible=keep_frames_video_guide_visible), gr.update(visible=visible and "G" in video_prompt_type), gr.update(visible=mask_visible and (mask_strength_always_enabled or "G" in video_prompt_type)), gr.update(visible=(visible or injected_frames_positions_visible(video_prompt_type) or "K" in video_prompt_type) and any_outpainting), gr.update(visible=visible and mask_selector_visible and not "U" in video_prompt_type), gr.update(visible=mask_visible and not image_outputs), image_mask, image_mask_guide, gr.update(visible=mask_visible), gr.update(visible=ref_images_visible), gr.update(visible=remove_background_images_ref_visible), gr.update(visible=injected_frames_positions_visible(video_prompt_type)), gr.update(visible=custom_options and not custom_checkbox), gr.update(visible=custom_options and custom_checkbox), gr.update(visible=input_video_strength_visible(model_def, image_prompt_type, video_prompt_type)), magic_image_btn, magic_video_btn, gr.update(visible=force_control_video_trim_visible(model_def, image_mode, video_prompt_type, audio_prompt_type)), custom_settings_visibility_trigger_update(state, old_video=old_video_prompt_type, new_video=video_prompt_type)
+    return video_prompt_type, gr.update(visible=visible and not image_outputs), gr.update(visible="+" in video_prompt_type and not image_outputs), image_guide, gr.update(visible=keep_frames_video_guide_visible), gr.update(visible=visible and "G" in video_prompt_type), gr.update(visible=mask_visible and (mask_strength_always_enabled or "G" in video_prompt_type)), gr.update(visible=(visible or injected_frames_positions_visible(video_prompt_type) or "K" in video_prompt_type) and any_outpainting), mask_selector_update, gr.update(visible=mask_visible and not image_outputs), image_mask, image_mask_guide, gr.update(visible=mask_visible), gr.update(visible=ref_images_visible), gr.update(visible=remove_background_images_ref_visible), gr.update(visible=injected_frames_positions_visible(video_prompt_type)), gr.update(visible=custom_options and not custom_checkbox), gr.update(visible=custom_options and custom_checkbox), gr.update(visible=input_video_strength_visible(model_def, image_prompt_type, video_prompt_type)), magic_image_btn, magic_video_btn, gr.update(visible=force_control_video_trim_visible(model_def, image_mode, video_prompt_type, audio_prompt_type)), custom_settings_visibility_trigger_update(state, old_video=old_video_prompt_type, new_video=video_prompt_type)
 
 def refresh_video_prompt_type_video_custom_dropbox(state, video_prompt_type, video_prompt_type_video_custom_dropbox):
     model_type = get_state_model_type(state)
@@ -11458,7 +11514,7 @@ def generate_media_tab(update_form = False, state_dict = None, ui_defaults = Non
             guide_selection_context_visible = dropdown_selectable or image_ref_inpaint
             guide_selector_visible = guide_preprocessing is not None and guide_preprocessing.get("visible", True)
             guide_alt_selector_visible = guide_custom_choices is not None and guide_custom_choices.get("visible", True)
-            mask_selector_visible = mask_preprocessing is not None and "V" in video_prompt_type_value and "U" not in video_prompt_type_value and mask_preprocessing.get("visible", True)
+            mask_selector_visible = video_mask_dropdown_visible(mask_preprocessing, video_prompt_type_value)
             image_ref_selector_visible = image_ref_inpaint or image_ref_choices is not None and image_ref_choices.get("visible", True)
             custom_video_selection = model_def.get("custom_video_selection", None)
             custom_video_trigger = "" if custom_video_selection is None else custom_video_selection.get("trigger", "")
@@ -11626,7 +11682,7 @@ def generate_media_tab(update_form = False, state_dict = None, ui_defaults = Non
                 video_guide2_label = model_def.get("video_guide2_label", "Control Video 2")
                 video_guide2_value = ui_defaults.get("video_guide2", None)
                 video_guide2 = gr.Video(label=video_input_label_with_info(video_guide2_label, video_guide2_value), height=gallery_height, visible=(not image_outputs) and "+" in video_prompt_type_value, value=video_guide2_value, elem_id="video_input2")
-                magic_mask_visible = "V" in video_prompt_type_value and "A" in video_prompt_type_value and "U" not in video_prompt_type_value
+                magic_mask_visible = video_mask_area_visible(video_prompt_type_value)
                 magic_mask_uis = []
                 if image_mode_value >= 1:  
                     image_guide_value = ui_defaults.get("image_guide", None)
@@ -11702,8 +11758,8 @@ def generate_media_tab(update_form = False, state_dict = None, ui_defaults = Non
                         magic_mask_uis.append(magic_mask_ui)
                         magic_mask_video_btn = magic_mask_ui.trigger
                 mask_strength_always_enabled = model_def.get("mask_strength_always_enabled", False)  
-                masking_strength = setting_slider("masking_strength", visible=(mask_strength_always_enabled or "G" in video_prompt_type_value) and "V" in video_prompt_type_value and "A" in video_prompt_type_value and not "U" in video_prompt_type_value)
-                mask_expand = setting_slider("mask_expand", visible="V" in video_prompt_type_value and "A" in video_prompt_type_value and not "U" in video_prompt_type_value)
+                masking_strength = setting_slider("masking_strength", visible=(mask_strength_always_enabled or "G" in video_prompt_type_value) and video_mask_area_visible(video_prompt_type_value))
+                mask_expand = setting_slider("mask_expand", visible=video_mask_area_visible(video_prompt_type_value))
 
                 image_refs_single_image_mode = model_def.get("one_image_ref_needed", False) or ("I" in video_prompt_type_value and (model_def.get("one_image_ref_only_with_background", False) or not any_letters(video_prompt_type_value, "KF")) and model_def.get("one_image_ref_only", False))
                 image_refs_label = "Start Image" if hunyuan_video_avatar else ("Reference Image" if image_refs_single_image_mode else "Reference Images")  + (" (each Image will be associated to a Sliding Window)" if infinitetalk else "")
@@ -12072,7 +12128,8 @@ def generate_media_tab(update_form = False, state_dict = None, ui_defaults = Non
                             if sample_solver_choices is None:
                                 sample_solver = gr.Dropdown( value="",  choices=[ ("", ""), ], visible= False, label= "Sampler Solver / Scheduler" )
                             else:
-                                sample_solver = gr.Dropdown( value=ui_get("sample_solver", sample_solver_choices[0][1]), 
+                                sample_solver_value = ui_defaults["sample_solver"] = get_default_value(sample_solver_choices, ui_get("sample_solver"), sample_solver_choices[0][1])
+                                sample_solver = gr.Dropdown( value=sample_solver_value,
                                     choices= sample_solver_choices, visible= True, label= "Sampler Solver / Scheduler"
                                 )
                             flow_shift = setting_slider("flow_shift") 
@@ -13375,6 +13432,7 @@ def create_ui():
     if not args.lock_model:
         transformer_type = model_dropdowns.select_model_for_output_filter(_get_dropdown_deps(), server_config, transformer_type)
     gradio_downloads.install_routes()
+    gallery_files.install(deepy_filesystem.build_file_access_policy(server_config))
     # Load CSS from external file
     css_path = os.path.join(os.path.dirname(__file__), "shared", "gradio", "ui_styles.css")
     with open(css_path, "r", encoding="utf-8") as f:
