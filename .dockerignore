@@ -1,0 +1,103 @@
+# .dockerignore — build context filter for runpod_worker/Dockerfile.
+#
+# The worker image does `COPY . /opt/wangp`, so without this file the build
+# context is the whole working tree: ~57 MB of .git plus whatever weights,
+# outputs and LoRAs a developer happens to have on disk (ckpts/ alone is
+# 50-60 GB once MiniMax H3 has been pulled). Everything here is either
+# regenerated inside the image or supplied at run time by the network volume.
+#
+# Docker matches these patterns against the FULL path relative to the context
+# root, so a bare `ckpts` excludes only the top-level directory, and a nested
+# match needs an explicit `**/`. That is why the __pycache__/*.pyc rules are
+# written twice.
+#
+# This is the only file this worker adds outside runpod_worker/.
+
+# --- version control and editor state ---------------------------------------
+.git
+.gitignore
+.github
+.idea
+.vscode
+.DS_Store
+**/.DS_Store
+
+# --- weights and other run-time data (mounted from the network volume) -------
+# checkpoints_paths and loras_root in the rendered wgp_config.json point at
+# /runpod-volume/{ckpts,loras}; the in-image /opt/wangp/{ckpts,loras} are empty
+# fallbacks created by the Dockerfile.
+ckpts
+loras
+loras_i2v
+storage
+samples
+cache
+tmp
+
+# Any stray weight file anywhere in the tree. No tracked file in this repo uses
+# these extensions (checked with `git ls-files`), so this cannot drop something
+# the image needs -- but one forgotten 21 GB transformer in the working tree
+# would otherwise be uploaded to the daemon on every build.
+**/*.safetensors
+**/*.ckpt
+**/*.pt
+**/*.pth
+**/*.gguf
+**/*.whl
+**/*.zip
+
+# --- generated output --------------------------------------------------------
+# The worker writes to /tmp/wangp-out (WANGP_OUTPUT_DIR), never to these.
+outputs
+outputs2
+gradio_outputs
+
+# --- state the image must generate for itself, not inherit -------------------
+# settings/: `import wgp` does os.mkdir("settings") (wgp.py:2549) and
+#   get_default_settings() json.dump()s settings/<model_type>_settings.json
+#   (wgp.py:3174). A stale copy from a developer's UI session would be read back
+#   as this endpoint's defaults.
+# wgp_config.json: config.ensure_wgp_config() renders the real one into
+#   /opt/wangp/config/. A file at the repo root would be the one shared/api.py
+#   treats as the default path (shared/api.py:1070), silently shadowing it.
+# loras_url_cache*.json: a URL->local-file cache keyed to another machine's
+#   lora_dir.
+settings
+wgp_config.json
+loras_url_cache.json
+loras_url_cache_v2.json
+plugins_local.json
+
+# Locally cloned plugins (the two patterns .gitignore uses). Plugin code from a
+# developer's tree is not part of a reproducible worker image.
+plugins/wan2gp-*
+plugins/wangp-*
+
+# ffmpeg binaries: the image installs the apt package and re-runs
+# download_ffmpeg() itself. A Windows or macOS ffmpeg_bins/ from a developer's
+# tree would land on PATH ahead of the Linux one (shared/ffmpeg_setup.py:64-81).
+ffmpeg_bins
+ffmpeg_quarantine
+
+# --- python build/test droppings --------------------------------------------
+__pycache__
+**/__pycache__
+*.pyc
+**/*.pyc
+*.pyo
+**/*.pyo
+.pytest_cache
+**/.pytest_cache
+.mypy_cache
+.ruff_cache
+*.egg-info
+**/*.egg-info
+.venv
+venv
+env
+.env
+.env.*
+
+# NOTE: finetunes/ is deliberately NOT excluded. It is gitignored, so it is
+# absent from a fresh clone, but when it does exist it holds hand-written model
+# definitions (small JSON) that an operator may have pinned the endpoint to.

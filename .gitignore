@@ -21,6 +21,12 @@
 *.backup
 *.pkl
 *.html
+# ...but the endpoint tester is source, not a stray render. A bare *.html
+# makes `git add -A` skip it with no error, exactly as the bare `.*` on line 1
+# once ate .dockerignore and the CI workflow.
+!runpod_worker/webdemo/*.html
+!runpod_worker/gateway/static/*.html
+!runpod_worker/gateway/static/examples/*.mp4
 !plugins/motion_designer/assets/motion_designer_iframe_template.html
 *.pdf
 *.whl
@@ -32,6 +38,10 @@ storage/
 samples/
 !.gitignore
 !requirements.txt
+# The leading `.*` rule above hides every dotted path, which would silently
+# drop the Docker build context file and the CI definitions.
+!.dockerignore
+!.github/
 .DS_Store
 *DS_Store
 google/

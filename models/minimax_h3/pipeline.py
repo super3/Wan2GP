@@ -895,6 +895,11 @@ class MiniMaxH3Pipeline:
                 for step in tqdm(range(model_steps), desc=pass_description):
                     self._set_interrupt_state()
                     self._check_abort()
+                    # Previews show the model's denoised PREDICTION, not the
+                    # noisy state x_t: with a 4-step schedule x_t stays
+                    # noise-dominated until the last step and previews of it
+                    # are useless static.
+                    denoised_preview = None
                     payload["attention_sparsity"] = tau_start + (SOL_ATTN_TAU_END - tau_start) * step / tau_denominator
                     offload.set_step_no_for_lora(self.transformer, step)
                     if pdd:
@@ -921,6 +926,7 @@ class MiniMaxH3Pipeline:
                         spectrum.finish_step()
                     if stage_solver == "er_sde":
                         video_denoised = video_velocity.float().mul_(sigma_video).add_(video)
+                        denoised_preview = video_denoised
                         if effective_sigmas_video is None and source_latents is not None and step_editable_mask is not None:
                             _blend_video_source(video_denoised, source_latents, step_editable_mask)
                         audio_denoised = None
@@ -951,6 +957,7 @@ class MiniMaxH3Pipeline:
                         video_ratio = sigma_video_next / sigma_video
                         if not target_video_condition_frames:
                             video_denoised = video_velocity.mul_(sigma_video).add_(video)
+                            denoised_preview = video_denoised
                             if effective_sigmas_video is None and source_latents is not None and step_editable_mask is not None:
                                 _blend_video_source(video_denoised, source_latents, step_editable_mask)
                             if effective_sigmas_video is None:
@@ -966,6 +973,7 @@ class MiniMaxH3Pipeline:
                         coefficients = res_coefficients[step]
                         if not target_video_condition_frames:
                             video_denoised = video_velocity.mul_(sigma_video).add_(video)
+                            denoised_preview = video_denoised
                             if effective_sigmas_video is None and source_latents is not None and step_editable_mask is not None:
                                 _blend_video_source(video_denoised, source_latents, step_editable_mask)
                             _res_multistep_update(video, video_denoised, old_video_denoised, coefficients)
@@ -1033,7 +1041,9 @@ class MiniMaxH3Pipeline:
                                                1.0 - VISUAL_COND_TIMESTEP if preserve_input_mask_values or keep_grouped_rows_fixed else None)
                     video_velocity = audio_velocity = video_denoised = audio_velocity_tail = None
                     if callback is not None:
-                        preview = video[0].detach().cpu() if not offline_spectrum or spectrum.replaying else None
+                        preview_src = denoised_preview if denoised_preview is not None else video
+                        preview = preview_src[0].detach().cpu() if not offline_spectrum or spectrum.replaying else None
+                        denoised_preview = None
                         callback(step, preview, False, denoising_extra=pass_extra, **({"pass_no": pass_no} if pass_no >= 0 else {}))
 
             try:
