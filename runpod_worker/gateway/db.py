@@ -57,42 +57,6 @@ jobs = sa.Table(
     sa.Column("created_at", sa.DateTime, nullable=False),
 )
 
-#: One row per adventure scene. Unlike customer clips (delivery-buffered and
-#: deleted), these ARE the product: generated once, kept forever, shared by
-#: every player. The mp4 bytes live in the row -- 14 scenes at a few MB each
-#: is nothing to Postgres, and it inherits Railway's durability with no new
-#: storage service.
-adventure_scenes = sa.Table(
-    "adventure_scenes", _metadata,
-    sa.Column("id", sa.String(40), primary_key=True),
-    sa.Column("story", sa.String(40), nullable=False, index=True),
-    sa.Column("position", sa.Integer, nullable=False),   # encounter order
-    sa.Column("depth", sa.Integer, nullable=False),
-    sa.Column("title", sa.String(200), nullable=False),
-    sa.Column("prompt", sa.Text, nullable=False),
-    sa.Column("status", sa.String(16), nullable=False, server_default="queued"),
-    sa.Column("attempts", sa.Integer, nullable=False, server_default="0"),
-    #: FL2V continuity: this scene's clip starts from parent's last frame,
-    #: so a child is only renderable once its parent is done.
-    sa.Column("parent_id", sa.String(40), nullable=True),
-    sa.Column("job_id", sa.String(80), nullable=True),
-    sa.Column("seed", sa.Integer, nullable=True),
-    sa.Column("generate_s", sa.Float, nullable=True),
-    sa.Column("error", sa.String(500), nullable=True),
-    sa.Column("video", sa.LargeBinary, nullable=True),
-    sa.Column("updated_at", sa.DateTime, nullable=False),
-)
-
-#: Waitlist signups from the adventure pages. Email is the primary key, so a
-#: repeat signup is a quiet no-op instead of a duplicate row, and the table
-#: cannot grow past one row per address.
-waitlist = sa.Table(
-    "waitlist", _metadata,
-    sa.Column("email", sa.String(254), primary_key=True),
-    sa.Column("source", sa.String(40), nullable=False),
-    sa.Column("created_at", sa.DateTime, nullable=False),
-)
-
 _engine: sa.Engine | None = None
 
 
@@ -119,8 +83,7 @@ def engine() -> sa.Engine:
         _metadata.create_all(_engine)
         # create_all never alters an existing table; add columns introduced
         # after first deploy by hand and ignore "already exists".
-        for ddl in ("ALTER TABLE jobs ADD COLUMN wall_s FLOAT",
-                    "ALTER TABLE adventure_scenes ADD COLUMN parent_id VARCHAR(40)"):
+        for ddl in ("ALTER TABLE jobs ADD COLUMN wall_s FLOAT",):
             try:
                 with _engine.begin() as cx:
                     cx.execute(sa.text(ddl))
@@ -259,204 +222,6 @@ def record_job(job_id: str, key_hash: str, *, resolution: str, duration_s: int,
             duration_s=duration_s, seed=seed, created_at=_now()))
 
 
-# ---------------------------------------------------------------------------
-# adventure scenes
-# ---------------------------------------------------------------------------
-
-def adventure_seed(story: str, scenes: list[dict[str, Any]]) -> None:
-    """Insert missing scene rows; existing rows (and their videos) are never
-    touched, so re-deploys are free and finished work is never re-done.
-
-    One deliberate exception: a row whose parent_id is NULL while the
-    definition has one predates the continuity migration -- its clip was
-    rendered without the parent's last frame. Backfill the parent and requeue
-    it so the whole tree is continuous. Runs exactly once per row."""
-    with engine().begin() as cx:
-        have = {r[0]: r[1] for r in cx.execute(
-            sa.select(adventure_scenes.c.id, adventure_scenes.c.parent_id)
-            .where(adventure_scenes.c.story == story)).all()}
-        for scene in scenes:
-            if scene["id"] not in have:
-                cx.execute(adventure_scenes.insert().values(
-                    id=scene["id"], story=story, position=scene["position"],
-                    depth=scene["depth"], title=scene["title"],
-                    prompt=scene["prompt"], parent_id=scene.get("parent_id"),
-                    updated_at=_now()))
-            elif have[scene["id"]] is None and scene.get("parent_id"):
-                cx.execute(adventure_scenes.update()
-                           .where(adventure_scenes.c.id == scene["id"])
-                           .values(parent_id=scene["parent_id"],
-                                   status="queued", attempts=0,
-                                   updated_at=_now()))
-
-
-def adventure_requeue_stale(story: str, older_than_s: int = 900) -> None:
-    """A 'rendering' row whose app died mid-job would block forever; put it
-    back in the queue after a generous timeout."""
-    cutoff = _now() - _dt.timedelta(seconds=older_than_s)
-    with engine().begin() as cx:
-        cx.execute(adventure_scenes.update().where(
-            adventure_scenes.c.story == story,
-            adventure_scenes.c.status == "rendering",
-            adventure_scenes.c.updated_at < cutoff,
-        ).values(status="queued", updated_at=_now()))
-
-
-def adventure_next(story: str, max_attempts: int = 3) -> dict[str, Any] | None:
-    """The next scene to render: strictly by encounter order, and gated the
-    same way as adventure_claim -- a child continues its parent's clip, so it
-    is not "next" until that clip exists. Failed scenes come back around
-    until max_attempts so one flake cannot hole the story, then stay failed
-    (blocking their subtree) until a deploy resets them."""
-    parent = adventure_scenes.alias("parent")
-    parent_done = sa.or_(
-        adventure_scenes.c.parent_id.is_(None),
-        sa.exists(sa.select(parent.c.id).where(
-            parent.c.id == adventure_scenes.c.parent_id,
-            parent.c.status == "ready")))
-    with engine().connect() as cx:
-        row = cx.execute(
-            sa.select(adventure_scenes.c.id, adventure_scenes.c.prompt,
-                      adventure_scenes.c.attempts)
-            .where(adventure_scenes.c.story == story,
-                   adventure_scenes.c.status.in_(("queued", "failed")),
-                   adventure_scenes.c.attempts < max_attempts,
-                   parent_done)
-            .order_by(adventure_scenes.c.position).limit(1)).first()
-    return {"id": row[0], "prompt": row[1], "attempts": row[2]} if row else None
-
-
-def adventure_claim(story: str, max_attempts: int = 3) -> dict[str, Any] | None:
-    """Atomically take the next scene in encounter order and flip it to
-    'rendering'. The claim is a compare-and-swap on (status, attempts), so
-    parallel render lanes never double-claim on ANY engine -- a plain
-    select-then-update raced under SQLite's deferred transactions and let
-    two lanes bump the same scene twice. A child is only claimable once its
-    parent's clip exists: the child CONTINUES that clip, so rendering
-    without it would bake a visible discontinuity into the product. A
-    failed parent therefore blocks its subtree until it is requeued (every
-    deploy retries failures via adventure_reset_broken_chain). The attempt
-    is spent at claim time -- a lane that dies still burned its try."""
-    parent = adventure_scenes.alias("parent")
-    parent_done = sa.or_(
-        adventure_scenes.c.parent_id.is_(None),
-        sa.exists(sa.select(parent.c.id).where(
-            parent.c.id == adventure_scenes.c.parent_id,
-            parent.c.status == "ready")))
-    for _ in range(10):                    # races are rare; retries settle them
-        with engine().connect() as cx:
-            row = cx.execute(
-                sa.select(adventure_scenes.c.id, adventure_scenes.c.prompt,
-                          adventure_scenes.c.attempts)
-                .where(adventure_scenes.c.story == story,
-                       adventure_scenes.c.status.in_(("queued", "failed")),
-                       adventure_scenes.c.attempts < max_attempts,
-                       parent_done)
-                .order_by(adventure_scenes.c.position).limit(1)).first()
-        if row is None:
-            return None
-        with engine().begin() as cx:
-            won = cx.execute(adventure_scenes.update().where(
-                adventure_scenes.c.id == row[0],
-                adventure_scenes.c.status.in_(("queued", "failed")),
-                adventure_scenes.c.attempts == row[2],
-            ).values(status="rendering", attempts=row[2] + 1,
-                     updated_at=_now())).rowcount
-        if won:
-            return {"id": row[0], "prompt": row[1]}
-    return None
-
-
-def adventure_reset_broken_chain(story: str) -> int:
-    """Deploy-time self-healing for the continuity chain. Two repairs, run
-    to a fixpoint because each can expose the other one level down:
-
-    * failed scenes are requeued with fresh attempts -- a deploy is the
-      deliberate moment to retry what previously burned out (e.g. an infra
-      failure fixed since);
-    * a scene whose clip exists but whose PARENT is no longer ready was
-      rendered against a clip that is being replaced (or, historically,
-      with no clip at all): its footage cannot flow from what the parent
-      will become, so it re-renders too.
-
-    Roots are exempt from the second rule and finished trees are a no-op.
-    Returns how many rows were requeued."""
-    total = 0
-    for _ in range(8):                     # tree depth bounds the cascade
-        with engine().begin() as cx:
-            failed = cx.execute(adventure_scenes.update().where(
-                adventure_scenes.c.story == story,
-                adventure_scenes.c.status == "failed",
-            ).values(status="queued", attempts=0, error=None,
-                     updated_at=_now())).rowcount
-            parent = adventure_scenes.alias("parent")
-            stale = cx.execute(adventure_scenes.update().where(
-                adventure_scenes.c.story == story,
-                adventure_scenes.c.status == "ready",
-                adventure_scenes.c.parent_id.is_not(None),
-                sa.exists(sa.select(parent.c.id).where(
-                    parent.c.id == adventure_scenes.c.parent_id,
-                    parent.c.status != "ready")),
-            ).values(status="queued", attempts=0, error=None, video=None,
-                     updated_at=_now())).rowcount
-        total += failed + stale
-        if failed + stale == 0:
-            break
-    return total
-
-
-def adventure_any_rendering(story: str) -> bool:
-    with engine().connect() as cx:
-        row = cx.execute(sa.select(adventure_scenes.c.id).where(
-            adventure_scenes.c.story == story,
-            adventure_scenes.c.status == "rendering").limit(1)).first()
-    return row is not None
-
-
-def adventure_mark(scene_id: str, status: str, *, job_id: str | None = None,
-                   seed: int | None = None, generate_s: float | None = None,
-                   error: str | None = None, video: bytes | None = None,
-                   bump_attempts: bool = False, reset_attempts: bool = False) -> None:
-    values: dict[str, Any] = {"status": status, "updated_at": _now()}
-    if job_id is not None:
-        values["job_id"] = job_id
-    if seed is not None:
-        values["seed"] = seed
-    if generate_s is not None:
-        values["generate_s"] = generate_s
-    if error is not None:
-        values["error"] = error[:500]
-    if video is not None:
-        values["video"] = video
-    if bump_attempts:
-        values["attempts"] = adventure_scenes.c.attempts + 1
-    if reset_attempts:
-        values["attempts"] = 0
-    with engine().begin() as cx:
-        cx.execute(adventure_scenes.update()
-                   .where(adventure_scenes.c.id == scene_id).values(**values))
-
-
-def adventure_status(story: str) -> dict[str, dict[str, Any]]:
-    """Per-scene status WITHOUT the video bytes -- the page polls this."""
-    with engine().connect() as cx:
-        rows = cx.execute(
-            sa.select(adventure_scenes.c.id, adventure_scenes.c.status,
-                      adventure_scenes.c.seed, adventure_scenes.c.attempts,
-                      adventure_scenes.c.error, adventure_scenes.c.job_id)
-            .where(adventure_scenes.c.story == story)).all()
-    return {r[0]: {"status": r[1], "seed": r[2], "attempts": r[3],
-                   "error": r[4], "job_id": r[5]} for r in rows}
-
-
-def adventure_video(scene_id: str) -> bytes | None:
-    with engine().connect() as cx:
-        row = cx.execute(sa.select(adventure_scenes.c.video).where(
-            adventure_scenes.c.id == scene_id,
-            adventure_scenes.c.status == "ready")).first()
-    return row[0] if row else None
-
-
 def recent_wall_times(limit: int = 200) -> dict[tuple[str, int], list[float]]:
     """The last `limit` completions' wall-clock seconds (submit to observed
     completion), grouped by (resolution, duration_s). The estimate the page
@@ -478,23 +243,6 @@ def job_owned_by(job_id: str, key_hash: str) -> bool:
         row = cx.execute(sa.select(jobs.c.id).where(
             jobs.c.id == job_id, jobs.c.key_hash == key_hash)).first()
     return row is not None
-
-
-def waitlist_add(email: str, source: str) -> bool:
-    """Record one signup. True if the address is new, False if it was already
-    on the list -- both are success to the caller."""
-    try:
-        with engine().begin() as cx:
-            cx.execute(waitlist.insert().values(
-                email=email, source=source[:40], created_at=_now()))
-        return True
-    except sa.exc.IntegrityError:
-        return False
-
-
-def waitlist_count() -> int:
-    with engine().connect() as cx:
-        return int(cx.execute(sa.select(sa.func.count()).select_from(waitlist)).scalar_one())
 
 
 def mark_job(job_id: str, status: str, generate_s: float | None = None) -> None:

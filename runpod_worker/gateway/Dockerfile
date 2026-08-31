@@ -3,8 +3,7 @@
 # endpoint behind it.
 FROM python:3.12-slim
 
-# ffmpeg: the adventure renderer extracts each parent clip's last frame
-# as the child scene's start image (FL2V continuity).
+# ffmpeg: kept for media probing.
 RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
@@ -19,7 +18,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # enhancement is a pass-through. Production (railway.Dockerfile, repo-root
 # context) copies it in as prompt_guide.py. To match that here, copy the
 # file into this directory as prompt_guide.py before building.
-COPY app.py db.py story.py ./
+COPY app.py db.py ./
 COPY static ./static
 
 # RUNPOD_API_KEY and RUNPOD_ENDPOINT_ID stay server-side and are never returned
