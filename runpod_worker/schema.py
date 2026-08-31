@@ -534,8 +534,8 @@ _REF2VA_MODEL_DEF: dict[str, Any] = {
     # the cap message can still cite the model's own number, but WANGP_MAX_FRAMES
     # is now the ONLY real bound for Ref2VA as well as FL2VA.
     "frames_selection_maximum": 737,
-    # minimax_h3_handler.py:265-279 -- "PDEV+-" for the guide, "KI" for refs.
-    "guide_custom_choices": {"letters_filter": "PDEV+-", "default": ""},
+    # minimax_h3_handler.py -- "UGPDEV+-" for the guide, "KI" for refs.
+    "guide_custom_choices": {"letters_filter": "UGPDEV+-", "default": ""},
     "image_ref_choices": {"letters_filter": "KI", "default": ""},
     "audio_prompt_type_sources": {"letters_filter": "ABK", "default": ""},
     "reference_image_enabled": True,
@@ -708,7 +708,7 @@ _FALLBACK_LETTERS: dict[str, dict[str, str]] = {
     },
     "ref2va": {
         "image_prompt_type": "TSEVL",
-        "video_prompt_type": "KIPDEV+-",
+        "video_prompt_type": "KIUGPDEV+-",
         "audio_prompt_type": "ABK",
     },
 }

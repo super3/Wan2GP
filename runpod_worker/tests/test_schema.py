@@ -239,7 +239,7 @@ def test_letter_whitelists_match_the_handler_source():
         pytest.skip(f"{HANDLER_PY} not found")
     source = _read(HANDLER_PY)
     upstream = set(re.findall(r'"letters_filter"\s*:\s*"([^"]*)"', source))
-    assert upstream == {"KI", "PDEV+-", "ABK", "GVKFI", "AK2"}, (
+    assert upstream == {"KI", "UGPDEV+-", "ABK", "GVKFI", "AK2"}, (
         f"minimax_h3_handler.py letters_filter set changed to {sorted(upstream)}; "
         "update _FALLBACK_LETTERS / _FL2VA_MODEL_DEF / _REF2VA_MODEL_DEF in schema.py"
     )
@@ -263,7 +263,7 @@ def test_letter_whitelists_match_the_handler_source():
         fl2va["video_prompt_type"]
     )
     assert set(fl2va["audio_prompt_type"]) == set("AK2")
-    assert set(ref2va["video_prompt_type"]) == set("PDEV+-") | set("KI")
+    assert set(ref2va["video_prompt_type"]) == set("UGPDEV+-") | set("KI")
     assert set(ref2va["audio_prompt_type"]) == set("ABK")
     for letters in (fl2va, ref2va):
         assert set(letters["image_prompt_type"]) == set("TSEVL")
