@@ -1,0 +1,58 @@
+{
+  "__comment__": "Baked template for wgp_config.json, rendered by runpod_worker/config.py:ensure_wgp_config() with string.Template. Every placeholder below is UNQUOTED on purpose: config.py substitutes a json.dumps()'d value, so quoting and escaping are handled uniformly for strings, numbers and arrays alike. Consequently this file must contain no other dollar sign, or Template.substitute() raises. Keys starting with a double underscore are stripped before the rendered config is written.",
+
+  "attention_mode": ${ATTENTION_MODE},
+
+  "profile": ${PROFILE},
+  "video_profile": ${PROFILE},
+  "image_profile": ${PROFILE},
+  "audio_profile": 3.5,
+
+  "transformer_types": [],
+  "transformer_quantization": ${TRANSFORMER_QUANT},
+  "transformer_dtype_policy": "",
+  "text_encoder_quantization": ${TEXT_ENCODER_QUANT},
+  "lm_decoder_engine": "",
+
+  "checkpoints_paths": ${CHECKPOINTS_PATHS},
+  "loras_root": ${LORA_ROOT},
+  "last_model_type": ${MODEL_TYPE},
+
+  "preload_model_policy": [],
+
+  "save_path": ${OUTPUT_DIR},
+  "image_save_path": ${OUTPUT_DIR},
+  "audio_save_path": ${OUTPUT_DIR},
+
+  "video_container": "mp4",
+  "video_output_codec": "libx264_8",
+  "image_output_codec": "jpeg_95",
+  "audio_output_codec": "aac_128",
+  "audio_stand_alone_output_codec": "wav",
+  "hdr_video_crf": 8,
+  "embed_source_images": false,
+
+  "compile": "",
+  "boost": 1,
+  "enable_int8_kernels": 1,
+  "vae_config": 0,
+  "metadata_type": "metadata",
+  "clear_file_list": 5,
+  "keep_intermediate_sliding_windows": 1,
+  "keep_resolution_on_model_switch": true,
+  "enable_4k_resolutions": 0,
+  "max_reserved_loras": -1,
+  "model_hierarchy_type": 1,
+  "multi_prompts_gen_type": "PG",
+
+  "notification_sound_enabled": 0,
+  "save_queue_if_crash": 0,
+  "process_queues_when_browser_unfocused": 1,
+  "queue_color_scheme": "pastel",
+  "UI_theme": "default",
+
+  "prompt_enhancer_quantization": "quanto_int8",
+  "prompt_enhancer_temperature": 0.6,
+  "prompt_enhancer_top_p": 0.9,
+  "prompt_enhancer_randomize_seed": true
+}

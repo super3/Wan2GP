@@ -1,0 +1,514 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WanGP MiniMax H3 — endpoint tester</title>
+<style>
+  :root {
+    --bg: #12131a; --panel: #1b1d27; --line: #2c2f3d; --ink: #e7e9f3;
+    --dim: #9aa0b8; --accent: #6c8cff; --ok: #4ec98b; --bad: #ff6b6b; --warn: #ffc46b;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  header {
+    padding: 18px 22px; border-bottom: 1px solid var(--line);
+    display: flex; gap: 14px; align-items: baseline; flex-wrap: wrap;
+  }
+  h1 { font-size: 17px; margin: 0; font-weight: 620; }
+  header .sub { color: var(--dim); font-size: 12.5px; }
+  main { display: grid; grid-template-columns: minmax(340px, 440px) 1fr; gap: 0; align-items: start; }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+  .col { padding: 20px 22px; }
+  .col + .col { border-left: 1px solid var(--line); }
+  @media (max-width: 900px) { .col + .col { border-left: 0; border-top: 1px solid var(--line); } }
+  fieldset { border: 1px solid var(--line); border-radius: 10px; padding: 14px 14px 16px; margin: 0 0 16px; background: var(--panel); }
+  legend { padding: 0 6px; color: var(--dim); font-size: 12px; text-transform: uppercase; letter-spacing: .06em; }
+  label { display: block; margin: 10px 0 4px; color: var(--dim); font-size: 12.5px; }
+  input, textarea, select, button {
+    font: inherit; color: var(--ink); background: #14161f;
+    border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; width: 100%;
+  }
+  textarea { min-height: 132px; resize: vertical; font-size: 13px; }
+  input:focus, textarea:focus, select:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+  .row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .row3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; }
+  button {
+    cursor: pointer; background: var(--accent); border-color: var(--accent);
+    color: #0d1020; font-weight: 640; padding: 11px; margin-top: 14px;
+  }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  button.ghost { background: transparent; color: var(--dim); border-color: var(--line); font-weight: 500; margin-top: 8px; padding: 7px; }
+  .hint { color: var(--dim); font-size: 11.5px; margin-top: 5px; }
+  .hint code { background: #0d0f16; padding: 1px 4px; border-radius: 4px; }
+  .queue {
+    display: flex; align-items: center; gap: 9px; margin: 0 0 10px;
+    padding: 8px 12px; border: 1px solid var(--line); border-radius: 9px;
+    background: var(--panel); font-size: 12.5px; color: var(--dim);
+    font-variant-numeric: tabular-nums;
+  }
+  .queue .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--dim); flex: none; }
+  .queue.busy .dot { background: var(--warn); }
+  .queue.free .dot { background: var(--ok); }
+  .queue.err  .dot { background: var(--bad); }
+  .queue .ago { margin-left: auto; opacity: .65; font-size: 11.5px; }
+  #status { margin: 0 0 14px; padding: 11px 13px; border-radius: 9px; border: 1px solid var(--line); background: var(--panel); min-height: 44px; }
+  #status.run { border-color: var(--accent); }
+  #status.ok { border-color: var(--ok); }
+  #status.bad { border-color: var(--bad); }
+  .phase { color: var(--dim); font-size: 12.5px; margin-top: 4px; }
+  .bar { height: 5px; background: #0d0f16; border-radius: 3px; margin-top: 9px; overflow: hidden; }
+  .bar > i { display: block; height: 100%; width: 0; background: var(--accent); transition: width .35s ease; }
+  video { width: 100%; border-radius: 10px; background: #000; display: none; }
+  table { width: 100%; border-collapse: collapse; font-size: 12.5px; margin-top: 12px; }
+  td { padding: 4px 0; border-bottom: 1px solid var(--line); color: var(--dim); }
+  td:last-child { text-align: right; color: var(--ink); font-variant-numeric: tabular-nums; }
+  pre { background: #0d0f16; border: 1px solid var(--line); border-radius: 8px; padding: 11px; overflow: auto; max-height: 320px; font-size: 11.5px; color: var(--dim); }
+  details { margin-top: 14px; }
+  summary { cursor: pointer; color: var(--dim); font-size: 12.5px; }
+  .warnbox { border-color: var(--warn); }
+</style>
+</head>
+<body>
+<header>
+  <h1>MiniMax H3 — serverless endpoint tester</h1>
+  <span class="sub">832×480 · 4-step turbo · video + synchronized audio</span>
+</header>
+
+<main>
+  <div class="col">
+    <fieldset>
+      <legend>Endpoint</legend>
+      <label for="ep">Endpoint ID</label>
+      <input id="ep" value="59kne66vo58331" placeholder="s3415s3i4c0q2w" autocomplete="off" spellcheck="false">
+      <label for="key">RunPod API key</label>
+      <input id="key" type="password" placeholder="rpa_…" autocomplete="off" spellcheck="false">
+      <p class="hint">
+        Stored in this browser only, and sent nowhere except <code>api.runpod.ai</code>.
+        Where the browser blocks storage — a sandboxed frame, Safari private mode — it is
+        held in memory for this tab instead, so you re-enter it next time. Anyone with the
+        page open can read it: use a key scoped to this endpoint and revoke it after.
+      </p>
+      <button type="button" class="ghost" id="check">Check endpoint health</button>
+    </fieldset>
+
+    <fieldset>
+      <legend>Prompt</legend>
+      <textarea id="prompt" spellcheck="false">integrated_multimodal_description: [Shot 1] A five-second cinematic close-up of a brass desk lamp switching on in a dark study, dust drifting through the beam. The camera pushes in slowly.
+overall_soundscape: A single click, a low electrical hum, faint room tone.
+non_diegetic_music: One soft sustained cello note.</textarea>
+      <p class="hint">
+        H3 wants the three-part form: <code>integrated_multimodal_description:</code>,
+        <code>overall_soundscape:</code>, <code>non_diegetic_music:</code>. Spoken lines go in
+        <code>&lt;d&gt;[English] …&lt;/d&gt;</code>.
+      </p>
+      <button type="button" class="ghost" id="shuffle">Load another example</button>
+    </fieldset>
+
+    <fieldset>
+      <legend>Settings</legend>
+      <div class="row">
+        <div>
+          <label for="len">Length</label>
+          <select id="len">
+            <option value="107">107 frames · 4.5 s</option>
+            <option value="124" selected>124 frames · 5.2 s</option>
+            <option value="175">175 frames · 7.3 s</option>
+            <option value="243">243 frames · 10.1 s</option>
+          </select>
+        </div>
+        <div>
+          <label for="seed">Seed</label>
+          <input id="seed" type="number" value="-1">
+        </div>
+      </div>
+      <p class="hint">Frames are on a lattice: ≥107 and ≡5 (mod 17). −1 seeds randomly.</p>
+      <button type="button" id="go">Generate</button>
+      <button type="button" class="ghost" id="cancel" style="display:none">Cancel job</button>
+    </fieldset>
+  </div>
+
+  <div class="col">
+    <div id="queue" class="queue" hidden>
+      <span class="dot" id="qdot"></span>
+      <span id="qtext">checking…</span>
+      <span class="ago" id="qago"></span>
+    </div>
+    <div id="status">Idle. Enter an endpoint ID and API key to begin.</div>
+    <div class="bar"><i id="fill"></i></div>
+    <video id="vid" controls playsinline></video>
+    <table id="metrics"></table>
+    <details>
+      <summary>Raw response</summary>
+      <pre id="raw">—</pre>
+    </details>
+  </div>
+</main>
+
+<script>
+const API = "https://api.runpod.ai/v2";
+const $ = (id) => document.getElementById(id);
+
+// Prefilled so the page is usable the moment it opens. The endpoint id is not a
+// secret. DEFAULT_KEY is deliberately empty in the repo copy -- putting a live
+// RunPod key in a tracked file would publish it to anyone who clones. Paste your
+// key into the field (it persists where the browser allows storage), or fill
+// this in on a local copy you never commit.
+const DEFAULT_ENDPOINT = "59kne66vo58331";   // wangp-h3-sage2-fp8vae, PRO 6000 Blackwell
+const DEFAULT_KEY = "";
+
+const EXAMPLES = [
+  `integrated_multimodal_description: [Shot 1] A five-second cinematic close-up of a brass desk lamp switching on in a dark study, dust drifting through the beam. The camera pushes in slowly.
+overall_soundscape: A single click, a low electrical hum, faint room tone.
+non_diegetic_music: One soft sustained cello note.`,
+  `integrated_multimodal_description: [Shot 1] A rain-lashed glass observatory at midnight. An astronomer leans toward a brass receiver and says clearly (S1) <d>[English] If you can hear me, follow this signal.</d>
+overall_soundscape: Rain on the dome, a low electrical hum, three clean receiver tones, and her synchronized voice.
+non_diegetic_music: One quiet bowed-glass chord rising and fading.`,
+  `integrated_multimodal_description: [Shot 1] Slow push through a neon-lit ramen stall in the rain at night. Steam curls off a bowl; the cook wipes the counter without looking up.
+overall_soundscape: Rain on the awning, broth simmering, distant traffic, the clink of a ladle.
+non_diegetic_music: A slow brushed-drum jazz loop, low in the mix.`,
+  `integrated_multimodal_description: [Shot 1] A hawk lifts from a fencepost across an empty wheat field at golden hour, wings catching the low sun. The camera tracks with it.
+overall_soundscape: Wind through dry wheat, two wingbeats, a single distant cry.
+non_diegetic_music: One rising string swell.`,
+];
+
+// ---- persistence -----------------------------------------------------------
+// localStorage is not always reachable: a sandboxed iframe throws SecurityError
+// on the property GETTER itself, and so does Safari in private mode. This ran at
+// top level and took the whole script down with it -- the fields stayed empty and
+// no handler below was ever wired, which looked like "the buttons do nothing".
+// Nothing outside this shim may reach the storage global directly.
+const store = (() => {
+  const memory = new Map();
+  let backing = null;
+  try {
+    const probe = window.localStorage;
+    probe.setItem("wangp.probe", "1");
+    probe.removeItem("wangp.probe");
+    backing = probe;
+  } catch { /* sandboxed or blocked: fall back to memory for this session */ }
+  return {
+    get(k) { try { return backing ? backing.getItem(k) : memory.get(k) ?? null; } catch { return null; } },
+    set(k, v) { try { backing ? backing.setItem(k, v) : memory.set(k, v); } catch { /* full or blocked */ } },
+    persistent: backing !== null,
+  };
+})();
+
+// The markup already carries the defaults, so a saved value only ever OVERLAYS
+// them -- and a saved blank never wins.
+if (DEFAULT_KEY && !$("key").value) $("key").value = DEFAULT_KEY;
+for (const id of ["ep", "key", "prompt", "seed"]) {
+  const saved = store.get("wangp." + id);
+  if (saved) $(id).value = saved;
+  $(id).addEventListener("change", () => store.set("wangp." + id, $(id).value));
+}
+$("shuffle").addEventListener("click", () => {
+  const cur = $("prompt").value.trim();
+  const pool = EXAMPLES.filter((e) => e.trim() !== cur);
+  const next = pool[Math.floor(Math.random() * pool.length)] || EXAMPLES[0];
+  $("prompt").value = next;
+  store.set("wangp.prompt", next);
+});
+
+// ---- ui helpers ------------------------------------------------------------
+let t0 = 0, timer = null, currentJob = null, cancelled = false;
+
+function say(msg, cls, phase) {
+  $("status").className = cls || "";
+  const secs = t0 ? ` · ${((Date.now() - t0) / 1000).toFixed(1)}s` : "";
+  $("status").innerHTML = `<strong>${msg}</strong>${secs ? `<span class="phase">${secs.slice(3)}</span>` : ""}` +
+    (phase ? `<div class="phase">${phase}</div>` : "");
+}
+function fill(pct) { $("fill").style.width = Math.max(0, Math.min(100, pct)) + "%"; }
+
+function creds() {
+  const ep = $("ep").value.trim(), key = $("key").value.trim();
+  if (!ep || !key) { say("Enter an endpoint ID and API key first.", "bad"); return null; }
+  // Content-Type belongs only on the request that has a body. It is sent on the
+  // POST below; a GET that declares it is just a larger preflight to get wrong.
+  return { ep, key, h: { Authorization: "Bearer " + key },
+           hp: { "Content-Type": "application/json", Authorization: "Bearer " + key } };
+}
+
+// Every network call goes through this. Without a timeout a stalled request
+// leaves the UI on "Checking…" forever with nothing to click -- which is
+// indistinguishable, to the person looking at it, from the button being dead.
+async function call(url, opts = {}, timeoutMs = 15000) {
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...opts, signal: ctl.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// fetch rejects with a bare "TypeError: Failed to fetch" for every network-layer
+// refusal, so name the causes that actually happen instead of echoing that.
+function diagnose(e) {
+  if (e && e.name === "AbortError") {
+    return "Timed out after 15s with no reply. RunPod may be slow, or the network is blocking it.";
+  }
+  if (location.protocol === "file:") {
+    return "The browser refused the request. Safari and Firefox block cross-origin " +
+           "requests from file:// pages; Chrome allows them. Either open this in Chrome, " +
+           "or serve the folder over http — run <code>python3 -m http.server 8000</code> " +
+           "in this file's directory and open <code>http://localhost:8000</code>.";
+  }
+  // An embedded preview (a chat file viewer, a docs sandbox) serves the page
+  // under a Content-Security-Policy that permits no external host. Nothing the
+  // page does can lift that, and the endpoint and key are not the problem --
+  // saying "check your key" here sends people to debug something that is fine.
+  if (window.top !== window.self) {
+    return "This page is running inside an embedded preview, which blocks requests to " +
+           "any external site. The endpoint and key are almost certainly fine. " +
+           "Download this file and open it directly in Chrome, or serve it over http.";
+  }
+  return "Network request failed — check the endpoint id, the key, and your connection. " +
+         "(" + String(e) + ")";
+}
+
+// RunPod returns plain text for some errors (403/404 from the gateway), so never
+// assume the body is JSON.
+async function readBody(res) {
+  const text = await res.text();
+  try { return JSON.parse(text); } catch { return { _raw: text }; }
+}
+
+// ---- health ----------------------------------------------------------------
+$("check").addEventListener("click", async () => {
+  const c = creds(); if (!c) return;
+  say("Checking…", "run", "contacting api.runpod.ai");
+  try {
+    const res = await call(`${API}/${c.ep}/health`, { headers: c.h });
+    const body = await readBody(res);
+    if (!res.ok) return say(`Health check failed — HTTP ${res.status}`, "bad",
+      typeof body._raw === "string" ? body._raw.slice(0, 200) : JSON.stringify(body));
+    const w = body.workers || {}, j = body.jobs || {};
+    say("Endpoint reachable", "ok",
+      `workers — ready ${w.ready ?? 0}, idle ${w.idle ?? 0}, running ${w.running ?? 0}, ` +
+      `initializing ${w.initializing ?? 0}, throttled ${w.throttled ?? 0}<br>` +
+      `jobs — in queue ${j.inQueue ?? 0}, in progress ${j.inProgress ?? 0}, ` +
+      `completed ${j.completed ?? 0}, failed ${j.failed ?? 0}`);
+    $("raw").textContent = JSON.stringify(body, null, 2);
+  } catch (e) {
+    say("Could not reach RunPod", "bad", diagnose(e));
+  }
+});
+
+// ---- live queue ------------------------------------------------------------
+// The health endpoint is the only view of the queue, and it is exactly what you
+// want while waiting for a job that is not yours to finish. Polled quietly: a
+// failure here must never take over the status box the job flow is using.
+let healthTimer = null, lastHealth = 0;
+
+function renderQueue(body, error) {
+  const box = $("queue");
+  box.hidden = false;
+  if (error) {
+    box.className = "queue err";
+    $("qtext").textContent = "queue unavailable";
+    return;
+  }
+  const j = body.jobs || {}, w = body.workers || {};
+  const pending = (j.inQueue || 0) + (j.inProgress || 0);
+  box.className = "queue " + (pending ? "busy" : "free");
+  const workers = [
+    w.running ? `${w.running} running` : "",
+    w.idle ? `${w.idle} idle` : "",
+    w.initializing ? `${w.initializing} starting` : "",
+    w.throttled ? `${w.throttled} throttled` : "",
+  ].filter(Boolean).join(", ") || "no workers";
+  $("qtext").textContent = pending
+    ? `${pending} job${pending === 1 ? "" : "s"} pending (${j.inQueue || 0} queued, ` +
+      `${j.inProgress || 0} running) — ${workers}`
+    : `queue empty — ${workers}`;
+  lastHealth = Date.now();
+}
+
+async function pollHealth() {
+  const ep = $("ep").value.trim(), key = $("key").value.trim();
+  if (!ep || !key) { $("queue").hidden = true; return; }
+  try {
+    const res = await call(`${API}/${ep}/health`, { headers: { Authorization: "Bearer " + key } }, 10000);
+    renderQueue(await readBody(res), !res.ok);
+  } catch { renderQueue(null, true); }
+}
+
+function startHealthPolling() {
+  if (healthTimer) return;
+  pollHealth();
+  healthTimer = setInterval(pollHealth, 10000);
+}
+setInterval(() => {
+  if (!lastHealth || $("queue").hidden) return;
+  const secs = Math.round((Date.now() - lastHealth) / 1000);
+  $("qago").textContent = secs < 2 ? "just now" : `${secs}s ago`;
+}, 1000);
+startHealthPolling();
+$("ep").addEventListener("change", pollHealth);
+$("key").addEventListener("change", pollHealth);
+
+// ---- generate --------------------------------------------------------------
+$("go").addEventListener("click", async () => {
+  const c = creds(); if (!c) return;
+  const prompt = $("prompt").value.trim();
+  if (!prompt) return say("Write a prompt first.", "bad");
+
+  const seedRaw = parseInt($("seed").value, 10);
+  const settings = {
+    prompt,
+    resolution: "832x480",
+    video_length: parseInt($("len").value, 10),
+    sample_solver: "euler",
+    image_prompt_type: "",
+    video_prompt_type: "",
+    audio_prompt_type: "",
+  };
+  // -1 means "let the worker pick"; it echoes the resolved seed back so a run
+  // can be reproduced. Only send a seed when the user actually chose one.
+  if (Number.isInteger(seedRaw) && seedRaw >= 0) settings.seed = seedRaw;
+
+  const payload = {
+    input: {
+      model_type: "minimax_h3_fl2va_pruned",
+      profile: "Turbo Lightx2v FL2V 4 Steps v1.1 768p",
+      settings,
+      output: { mode: "auto" },
+      runtime: { timeout_s: 900 },
+    },
+  };
+
+  cancelled = false; currentJob = null;
+  $("go").disabled = true; $("cancel").style.display = "block";
+  $("vid").style.display = "none"; $("metrics").innerHTML = ""; $("raw").textContent = "—";
+  t0 = Date.now(); fill(2);
+  timer = setInterval(() => { if (currentJob) say(lastMsg, "run", lastPhase); }, 250);
+
+  try {
+    const res = await call(`${API}/${c.ep}/run`, {
+      method: "POST", headers: c.hp, body: JSON.stringify(payload),
+    }, 30000);
+    const body = await readBody(res);
+    if (!res.ok || !body.id) {
+      return finish(`Submit failed — HTTP ${res.status}`, "bad",
+        typeof body._raw === "string" ? body._raw.slice(0, 300) : JSON.stringify(body));
+    }
+    currentJob = body.id;
+    pollHealth();
+    await poll(c, body.id);
+  } catch (e) {
+    finish("Request failed", "bad", diagnose(e));
+  }
+});
+
+$("cancel").addEventListener("click", async () => {
+  const c = creds(); if (!c || !currentJob) return;
+  cancelled = true;
+  try { await call(`${API}/${c.ep}/cancel/${currentJob}`, { method: "POST", headers: c.h }); } catch {}
+  finish("Cancelled", "bad", "");
+});
+
+let lastMsg = "Working…", lastPhase = "";
+
+async function poll(c, id) {
+  // A cold worker loads ~20 GB of weights before the first step, so the first
+  // request of the day can sit IN_QUEUE for minutes. That is normal, not a hang.
+  let delay = 1000;
+  while (!cancelled) {
+    await new Promise((r) => setTimeout(r, delay));
+    delay = Math.min(delay * 1.2, 3000);
+    let body;
+    try {
+      const res = await call(`${API}/${c.ep}/status/${id}`, { headers: c.h });
+      body = await readBody(res);
+      if (!res.ok) return finish(`Status check failed — HTTP ${res.status}`, "bad", JSON.stringify(body).slice(0, 300));
+    } catch (e) { lastMsg = "Network blip, retrying…"; continue; }
+
+    if (body.status === "IN_QUEUE") {
+      lastMsg = "Queued"; lastPhase = "waiting for a worker — a cold start loads ~20 GB of weights"; fill(6);
+    } else if (body.status === "IN_PROGRESS") {
+      const p = body.output || {};
+      if (p.pct != null) fill(Math.max(10, p.pct));
+      else fill(20);
+      lastMsg = "Generating";
+      lastPhase = p.status ? `${p.status}${p.step ? ` — step ${p.step}/${p.total_steps}` : ""}`
+                           : "worker is running";
+    } else if (body.status === "COMPLETED") {
+      return done(body);
+    } else if (body.status === "FAILED" || body.status === "CANCELLED" || body.status === "TIMED_OUT") {
+      const out = body.output || {};
+      const msg = out.message || body.error || body.status;
+      const details = [].concat(out.details || []).join(" · ");
+      $("raw").textContent = JSON.stringify(body, null, 2);
+      return finish(`Job ${body.status.toLowerCase()}`, "bad",
+        `${msg}${details ? `<br>${details}` : ""}${out.code ? `<br>code: ${out.code}` : ""}`);
+    }
+  }
+}
+
+function done(body) {
+  $("raw").textContent = JSON.stringify(body, null, 2).slice(0, 20000);
+  const out = body.output || {};
+  const v = out.video || {};
+  fill(100);
+
+  if (v.kind === "base64" && v.data) {
+    // Build a Blob rather than assigning a data: URI — a multi-MB data URI in
+    // src makes the browser re-parse the whole string on every seek.
+    const bin = atob(v.data);
+    const buf = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) buf[i] = bin.charCodeAt(i);
+    const blob = new Blob([buf], { type: v.content_type || "video/mp4" });
+    show(URL.createObjectURL(blob));
+  } else if (v.kind === "url" && v.url) {
+    show(v.url);
+  } else {
+    finish("Completed, but no playable video came back", "bad",
+      `transport: ${v.transport || "none"} — see the raw response`);
+    return;
+  }
+
+  const m = out.metrics || {}, r = out.resolved || {};
+  const rows = [
+    ["seed", out.seed ?? r.seed ?? "—"],
+    ["frames", r.video_length ?? "—"],
+    ["resolution", r.resolution ?? "—"],
+    ["steps", r.num_inference_steps ?? "—"],
+    ["generate", m.generate_s != null ? m.generate_s.toFixed(2) + " s" : "—"],
+    ["total (worker)", m.total_s != null ? m.total_s.toFixed(2) + " s" : "—"],
+    ["queue + run (client)", ((Date.now() - t0) / 1000).toFixed(1) + " s"],
+    ["cold start", m.boot_ms ? (m.boot_ms / 1000).toFixed(1) + " s" : "warm"],
+    ["delivery", v.transport ?? "—"],
+    ["size", v.size_bytes ? (v.size_bytes / 1048576).toFixed(2) + " MB" : "—"],
+    ["duration", v.duration_s ? v.duration_s.toFixed(2) + " s" : "—"],
+    ["audio", v.has_audio ? `${v.audio_codec} ${v.audio_sample_rate} Hz` : "none"],
+    ["VRAM peak", m.vram_peak_mb ? (m.vram_peak_mb / 1024).toFixed(1) + " GB" : "—"],
+    ["worker", out.worker_id ?? "—"],
+  ];
+  $("metrics").innerHTML = rows.map(([k, val]) => `<tr><td>${k}</td><td>${val}</td></tr>`).join("");
+
+  const warns = out.warnings || [];
+  finish("Done", "ok", warns.length ? warns.join("<br>") : "");
+}
+
+function show(src) {
+  const vid = $("vid");
+  vid.src = src; vid.style.display = "block";
+  vid.play().catch(() => {});   // autoplay may be blocked; controls still work
+}
+
+function finish(msg, cls, phase) {
+  clearInterval(timer); timer = null;
+  $("go").disabled = false; $("cancel").style.display = "none";
+  currentJob = null;
+  say(msg, cls, phase);
+  if (cls !== "ok") fill(0);
+  pollHealth();
+}
+</script>
+</body>
+</html>
