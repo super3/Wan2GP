@@ -88,10 +88,11 @@ ATTENTION_MODES = CLI_ATTENTION_MODES + ("sol",)
 #
 # wgp.py:2575  ->  if the config file is ABSENT, wgp builds its full default
 #                  dict (wgp.py:2576-2616) and writes it (wgp.py:2618-2619).
-# wgp.py:2620-2623 -> if the file EXISTS, wgp does `server_config = json.loads(text)`
+# wgp.py:2677  ->  if the file EXISTS, wgp does `server_config = read_config(...)`,
+#                  a plain json.load (shared/utils/config_store.py:12),
 #                  and REPLACES the defaults wholesale. Only two keys are
 #                  setdefault'ed afterwards (wgp.py:2625, 2631).
-# wgp.py:3301  ->  attention_mode = server_config["attention_mode"]   # BARE READ
+# wgp.py:3383  ->  attention_mode = server_config["attention_mode"]   # BARE READ
 #
 # I grepped every bare subscript of server_config
 # (`grep -nP 'server_config\["[^"]+"\](?!\s*=)' wgp.py`). It reports lines

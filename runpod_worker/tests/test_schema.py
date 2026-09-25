@@ -239,7 +239,9 @@ def test_letter_whitelists_match_the_handler_source():
         pytest.skip(f"{HANDLER_PY} not found")
     source = _read(HANDLER_PY)
     upstream = set(re.findall(r'"letters_filter"\s*:\s*"([^"]*)"', source))
-    assert upstream == {"KI", "UGPDEV+-", "ABK", "GVKFI", "AK2"}, (
+    # "AB" (H3 TTS dialogue) and "I" / "V-U" / "AK" (Viggle Animate) belong to
+    # model types the handler file also defines but this worker does not serve.
+    assert upstream == {"KI", "GPDEV+-U", "ABK", "GVKFI", "AK2", "AB", "I", "V-U", "AK"}, (
         f"minimax_h3_handler.py letters_filter set changed to {sorted(upstream)}; "
         "update _FALLBACK_LETTERS / _FL2VA_MODEL_DEF / _REF2VA_MODEL_DEF in schema.py"
     )
@@ -263,7 +265,7 @@ def test_letter_whitelists_match_the_handler_source():
         fl2va["video_prompt_type"]
     )
     assert set(fl2va["audio_prompt_type"]) == set("AK2")
-    assert set(ref2va["video_prompt_type"]) == set("UGPDEV+-") | set("KI")
+    assert set(ref2va["video_prompt_type"]) == set("GPDEV+-U") | set("KI")
     assert set(ref2va["audio_prompt_type"]) == set("ABK")
     for letters in (fl2va, ref2va):
         assert set(letters["image_prompt_type"]) == set("TSEVL")
@@ -1099,7 +1101,7 @@ def test_caller_may_not_reroute_a_profile_lora(env):
     env.delenv("WANGP_ALLOWED_LORAS", raising=False)
     cfg = C.WorkerConfig()
     profile_url = json.loads(
-        (Path(__file__).resolve().parents[2] / "profiles" / "minimax_h3"
+        (Path(__file__).resolve().parents[2] / "profiles" / "minimax_h3_fl2va"
          / f"{PROFILE_NAME}.json").read_text(encoding="utf-8")
     )["activated_loras"][0]
     payload = example_a()

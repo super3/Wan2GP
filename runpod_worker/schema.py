@@ -391,7 +391,8 @@ _PRIMARY_SETTINGS_KEYS: tuple[str, ...] = (
     "sliding_window_color_correction_strength",
     "sliding_window_discard_last_frames",
     "sliding_window_overlap",
-    "spatial_upsampler_face_count",
+    "spatial_upsampler_param",
+    "spatial_upsampler_param2",
     "spatial_upsampler_prompt",
     "spatial_upsampler_reference_images",
     "sliding_window_overlap_noise",
@@ -482,7 +483,6 @@ _MINIMAX_H3_COMMON: dict[str, Any] = {
     "no_negative_prompt": True,
     "returns_audio": True,
     "multimedia_generation": True,
-    "profiles_dir": ["minimax_h3"],
     "keep_frames_video_guide_not_supported": True,
     "sliding_window": True,
     "video_continuation": True,
@@ -517,6 +517,9 @@ _FL2VA_MODEL_DEF: dict[str, Any] = {
     # anywhere in the headless path, which is why WANGP_MAX_FRAMES exists.
     "guide_custom_choices": {"letters_filter": "GVKFI", "default": ""},
     "audio_prompt_type_sources": {"letters_filter": "AK2", "default": ""},
+    # minimax_h3_handler.py:516 -- profiles moved from profiles/minimax_h3/ to
+    # per-variant folders; the shared folder is still searched first.
+    "profiles_dir": ["minimax_h3", "minimax_h3_fl2va"],
     "mask_preprocessing": {"selection": ["", "A", "NA"]},
     "custom_frames_injection": True,
     "one_image_ref_only": True,
@@ -534,10 +537,11 @@ _REF2VA_MODEL_DEF: dict[str, Any] = {
     # the cap message can still cite the model's own number, but WANGP_MAX_FRAMES
     # is now the ONLY real bound for Ref2VA as well as FL2VA.
     "frames_selection_maximum": 737,
-    # minimax_h3_handler.py -- "UGPDEV+-" for the guide, "KI" for refs.
-    "guide_custom_choices": {"letters_filter": "UGPDEV+-", "default": ""},
+    # minimax_h3_handler.py:581 -- "GPDEV+-U" for the guide, "KI" for refs.
+    "guide_custom_choices": {"letters_filter": "GPDEV+-U", "default": ""},
     "image_ref_choices": {"letters_filter": "KI", "default": ""},
     "audio_prompt_type_sources": {"letters_filter": "ABK", "default": ""},
+    "profiles_dir": ["minimax_h3", "minimax_h3_ref2va"],
     "reference_image_enabled": True,
     "any_image_refs_relative_size": True,
     "image_refs_relative_size": {"min": 50, "max": 400, "step": 1},
@@ -708,7 +712,7 @@ _FALLBACK_LETTERS: dict[str, dict[str, str]] = {
     },
     "ref2va": {
         "image_prompt_type": "TSEVL",
-        "video_prompt_type": "KIUGPDEV+-",
+        "video_prompt_type": "KIGPDEV+-U",
         "audio_prompt_type": "ABK",
     },
 }
@@ -966,8 +970,9 @@ def load_profile_fragment(
     """Read an accelerator-profile settings fragment off disk.
 
     Profiles live at ``<profile_root>/<profiles_dir>/<name>.json``
-    (``wgp.py:8891-8907``); ``profiles_dir`` for MiniMax H3 is ``["minimax_h3"]``
-    (``minimax_h3_handler.py:220``) and the profile roots come from
+    (``wgp.py:8891-8907``); ``profiles_dir`` for MiniMax H3 is
+    ``["minimax_h3", "minimax_h3_fl2va"]`` or ``[..., "minimax_h3_ref2va"]``
+    (``minimax_h3_handler.py:516``) and the profile roots come from
     ``model_def["_profile_roots"]`` (``wgp.py:3205``, default ``["profiles"]``).
     The six shipped files are plain settings fragments -- ``activated_loras``,
     ``loras_multipliers``, ``num_inference_steps``, ``guidance_scale``,
@@ -991,7 +996,7 @@ def load_profile_fragment(
     profile_roots = md.get("_profile_roots") or ["profiles"]
     if isinstance(profile_roots, str):
         profile_roots = [profile_roots]
-    profile_dirs = md.get("profiles_dir") or ["minimax_h3"]
+    profile_dirs = md.get("profiles_dir") or ["minimax_h3", "minimax_h3_fl2va"]
     if isinstance(profile_dirs, str):
         profile_dirs = [profile_dirs]
 

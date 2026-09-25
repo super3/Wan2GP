@@ -32,9 +32,9 @@
 #   build pass -- that just moves the breakage to cold start.
 
 # --- the three the plan calls out: the pydantic blast radius -----------------
-pydantic==2.10.6          # requirements.txt:78
+pydantic==2.11.10          # requirements.txt:78
 gradio==5.29.0            # requirements.txt:40  (gradio_rangeslider rides along)
-mcp==1.10.1               # requirements.txt:79
+mcp==1.30.0                # requirements.txt:79
 # tomlkit: NOT in requirements.txt directly -- gradio 5.29.0 requires
 # tomlkit<0.14.0,>=0.12.0 and requirements.txt resolves it to 0.13.3. The runpod
 # closure pulls 0.15.1, which uninstalls 0.13.3 and breaks gradio. Caught by the
@@ -57,7 +57,7 @@ torchaudio==2.11.0        # verified 2026-08-19
 # --- the rest of the exactly-pinned WanGP stack, in requirements.txt order ---
 # Inert unless something in the runpod closure tries to move them, which is
 # exactly when you want them to be here.
-mmgp==3.7.14              # requirements.txt:2   -- the offloading engine; the
+mmgp==3.8.1               # requirements.txt:2   -- the offloading engine; the
                           #   entire reason to build on WanGP rather than
                           #   diffusers. A bump here changes VRAM behaviour.
 diffusers==0.36.0         # requirements.txt:4

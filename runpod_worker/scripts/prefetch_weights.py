@@ -430,8 +430,8 @@ def profile_paths(model_def: dict[str, Any], root: Path) -> list[Path]:
 
     Mirrors ``_get_builtin_lset_groups`` (``wgp.py:8891-8907``): the roots come
     from ``model_def["_profile_roots"]`` (``wgp.py:3205``, default ``["profiles"]``)
-    and the sub-directories from ``profiles_dir`` (``["minimax_h3"]`` for H3,
-    ``minimax_h3_handler.py:220``).
+    and the sub-directories from ``profiles_dir`` (``["minimax_h3", "minimax_h3_fl2va"]`` for H3
+    FL2VA, ``minimax_h3_handler.py:516``).
     """
     roots = model_def.get("_profile_roots") or ["profiles"]
     if isinstance(roots, str):

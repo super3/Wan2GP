@@ -1041,8 +1041,9 @@ docker run --rm --gpus all --env-file .env.staging \
 
 The hardest-won fact in this deployment. If `wgp_config.json` is **absent**, wgp builds
 its own defaults and writes them. If it **exists**, wgp does
-`server_config = json.loads(text)` and *replaces* its defaults wholesale, then reads
-`server_config["attention_mode"]` as a bare subscript at module scope (`wgp.py:3301`). A
+`server_config = read_config(...)` (a plain `json.load`) and *replaces* its defaults
+wholesale, then reads `server_config["attention_mode"]` as a bare subscript at module
+scope (`wgp.py:3383`). A
 hand-written config that omits one key kills `import wgp` with a stack trace that looks
 nothing like a config problem.
 
