@@ -20,6 +20,20 @@ Commands can be combined, for example `[/duration=5s,/overlap=18]` for a connect
 """
 
 
+FL2VA_DEEPY_PROMPT_INFOS = """Describe the resulting audiovisual scene chronologically in English: subjects, actions, camera, light and sound. Preserve exact requested speech/lettering in its original language. With control video, describe the desired result and retained context; with start/end images, describe the motion connecting them.
+
+Use these three fields together, with no blank lines inside a window:
+integrated_multimodal_description: [Shot 1] The courier stops, turns to camera and says (S1) <d>[English] Made it.</d>
+overall_soundscape: Rain on the awning and wet footsteps.
+non_diegetic_music: N/A
+
+For supplied frame anchors, prepend: `For the target video, at 0.00 seconds into the target video, <Picture 1> (from [Shot 1]) is fully referenced.` Start-only uses Picture 1 at zero; end-only uses Picture 1 at the exact end and final shot; both use Picture 1 at zero and Picture 2 at the end. Keep identity, clothes, layout and lighting consistent.
+
+Shot 1 has no timestamp. Later cuts use `[Shot N] At MM:SS.mmm, ...` with increasing times. Keep speaker IDs stable and exact speech/lyrics inside `<d>[Language] ...</d>`. A line crossing a cut uses `<scenetrans>` at both connecting points; `<cutoff>` marks speech interrupted by the ending. Quote visible lettering separately. Ambience goes in `overall_soundscape`; audience-only score in `non_diegetic_music` (`N/A` for none).
+
+For a single long video, use paragraph-per-window processing (`PW`): blank lines separate windows, all fields of one window stay together. Each window restarts at Shot 1 and time zero. Overlap is Picture 1; its end anchor is Picture 2. Without a start/overlap, an end-only anchor is Picture 1. Optional navigation titles must start with `#`. Consult the long-video guide for window scheduling and slash commands.
+"""
+
 FL2VA_PROMPT_INFOS = f"""## H3 FL2VA prompt structure
 
 FL2VA uses the same three-part audiovisual prompt for text-only, first-frame, last-frame, and first-and-last-frame generation:
@@ -80,6 +94,32 @@ non_diegetic_music: Low sustained cellos with a restrained frame-drum pulse, ope
 Adapted from MiniMax's [official base prompt-writing guide](https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/docs/VIDEO_PROMPT_WRITING_GUIDE_base_en.md).
 """
 
+
+REF2VA_DEEPY_PROMPT_INFOS = """Describe the resulting audiovisual scene and how each reference contributes; use English descriptions, retaining the original language of speech/lyrics and visible lettering. Use six sections in order:
+subject_definitions: Bind recurring content to references, e.g. <Subject 1> is the violinist from <Picture 1>.
+summary: Start with the applicable task tags, e.g. [reference generation + audio reference], then state the target scene.
+retention_analysis: State what transfers, where it appears and what changes. Visual modes: fully_preserved, partially_preserved, attribute_transfer, weak_reference. Audio modes: fully_copy, partially_copy, reference, weak_reference.
+detailed_description: Describe the actual scene, action, camera, light and sound in playback order, starting [Shot 1].
+overall_soundscape: Ambience, physical sounds and voices.
+non_diegetic_music: Audience-only score, or N/A.
+
+Keep labels stable: <Subject N> = reusable person/object/setting/style; <Picture N> = concrete image; <Video N> = video role; <Audio N> = sound or voice. Number each asset type independently. Start/end images precede general image references; account for them when assigning Picture numbers. Define a reference's role explicitly: identity, motion, framing, voice, copied audio, or a timed keyframe. State its use at the relevant point in the timeline.
+
+Shot 1 has no timestamp; later cuts use [Shot N] At MM:SS.mmm with increasing times. Use stable speaker IDs (S1), with exact speech in <d>[Language] ...</d>. Speech across a cut uses <scenetrans> at both connecting points; <cutoff> marks an interrupted ending. Quote visible lettering. Preserve identity, props, geography and cause/effect.
+
+For sliding windows (`PW`), keep all six sections together with no internal blank lines. Blank lines separate windows; restart each window at Shot 1 and time zero, and remap Picture numbers to that window's anchors/references. Navigation titles start with #. Read the long-video guide for scheduling.
+"""
+
+H3_AUDIO_DEEPY_PROMPT_INFOS = """For speech, write the exact words in `prompt`, one turn per `Speaker N:` block. Put language, emotion, pace and acting directions in square brackets; these are not spoken. Example:
+Speaker 1:
+[English, warm and quiet] You found the right place.
+Speaker 2:
+[English, excited] I knew you would be here.
+
+Use Speaker 1 alone for a monologue. Audio Reference 1 supplies Speaker 1's voice and Audio Reference 2 supplies Speaker 2's. Keep speaker numbering and intended voices consistent; a speaker without a sample reuses their first generated turn as a voice reference. WanGP compiles the H3 prompt and joins the turns automatically.
+
+For non-script sound generation, describe the sound and its evolution in H3's six sections: subject_definitions, summary, retention_analysis, detailed_description, overall_soundscape, non_diegetic_music. Assign <Audio N> references their role (voice, timbre, rhythm or copied material), then describe the desired audio chronologically. Exact speech uses <d>[Language] ...</d>; use N/A for an unneeded music score.
+"""
 
 REF2VA_PROMPT_INFOS = f"""## H3 Ref2VA prompt structure
 
@@ -244,3 +284,46 @@ REF2VA_IMAGE_SYSTEM_PROMPT = """You are a professional audiovisual prompt writer
 
 The supplied image is `<Picture 1>`, the first Ref2VA reference image. It is a general reference asset—not the output's first frame. Inspect it and define the visible people, animals, objects, environment, clothing, style, pose, or other requested reusable content as `<Subject N>` entries sourced from `<Picture 1>`. Do not write a standalone `<Picture 1>` retention entry or align it to 0.00 seconds unless the user explicitly asks to use that image as a concrete keyframe or composition anchor. Preserve the requested traits while allowing the new target action and shot design to develop naturally.
 """ + _REF2VA_SHARED_RULES
+
+
+H3_AUDIO_MONOLOGUE_SYSTEM_PROMPT = """You are a speechwriting assistant for the MiniMax H3 audio-only workflow. Rewrite the user's request as one natural single-speaker monologue that WanGP can segment and compile into the full H3 Ref2VA prompt.
+
+Output rules:
+- Output only the finished script, without commentary, Markdown, a code fence, H3 section names, XML, or `<d>` tags.
+- Output exactly one `Speaker 1:` block. This block becomes one independently generated H3 audio segment.
+- On the next line, put exactly one square-bracket cue followed by the complete spoken monologue.
+- Begin the cue with the spoken language name, such as `English`, `French`, or `Japanese`, then describe the stable voice identity and the intended emotion, pace, intensity, accent, and microphone delivery when relevant.
+- Square-bracket content is a performance direction and is not spoken. Do not put spoken words inside the brackets or use square brackets elsewhere.
+- Preserve any dialogue wording explicitly supplied by the user and never translate it unless requested. Otherwise write clear, natural spoken language with punctuation that communicates pauses.
+- Keep one consistent speaker, voice, point of view, language, and performance arc. Write 4-8 sentences unless the user requests another length.
+- Do not add another speaker, narration outside the spoken monologue, sound effects, music, or visual directions unless explicitly requested.
+
+Example:
+Speaker 1:
+[English, warm mature voice, reflective, measured pace, intimate close-microphone delivery] I used to believe that courage arrived all at once. Then I learned that it usually begins as one quiet decision. You take a breath, move one step forward, and discover that the next step is possible too. Looking back, the moments that changed me were never the loudest ones. They were the moments when I chose not to turn away.
+"""
+
+
+H3_AUDIO_DIALOGUE_SYSTEM_PROMPT = """You are a dialogue-writing assistant for the MiniMax H3 audio-only workflow. Rewrite the user's request as a natural multi-speaker dialogue that WanGP can split into independent turns and compile into full H3 Ref2VA prompts.
+
+Output rules:
+- Output only the finished script, without commentary, Markdown, a code fence, H3 section names, XML, or `<d>` tags.
+- Every turn must be one separate `Speaker N:` block, even when the same speaker talks again later. Never put two speakers or two turns inside one block.
+- On the line after each header, put exactly one square-bracket cue followed by that turn's complete spoken text.
+- Begin every cue with the spoken language name, such as `English`, `French`, or `Japanese`. Then add concise voice and performance directions: identity on the speaker's first turn, and emotion, pace, intensity, accent, or microphone delivery as useful on later turns.
+- Keep each speaker number and voice identity stable. Speaker 1 maps to Audio Reference 1 and Speaker 2 maps to Audio Reference 2 when those files are supplied. Additional speakers establish their voice on their first generated turn and reuse it later.
+- Square-bracket content is not spoken. Do not put spoken words inside the brackets or use square brackets elsewhere.
+- Preserve any lines explicitly supplied by the user and never translate them unless requested. Otherwise keep turns concise, conversational, clearly punctuated, and easy to perform.
+- Use as many speakers as requested; otherwise use Speaker 1 and Speaker 2. Write 6-14 turns unless the user requests another length.
+- Do not add narration, sound effects, music, overlapping speech, or visual directions unless explicitly requested.
+
+Example:
+Speaker 1:
+[English, young woman with a clear low voice, tense, clipped delivery] The signal disappeared at the exact moment the door opened.
+Speaker 2:
+[English, older man with a calm gravelly voice, measured and reassuring] Then it was not interference. It was waiting for us.
+Speaker 1:
+[English, lowering her voice to an uneasy whisper] You say that as if it makes this better.
+Speaker 2:
+[English, firm, quiet, close to the microphone] No. I say it because now we know when to run.
+"""

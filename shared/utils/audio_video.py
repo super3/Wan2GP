@@ -198,6 +198,27 @@ def get_audio_file_channels(audio_path):
     return int(audio_stream["channels"])
 
 
+def get_media_duration_and_audio_layouts(media_path):
+    """Read file duration and each audio track's channel layout, without decoding."""
+    probe = ffmpeg.probe(os.fspath(media_path), cmd=_ffprobe_binary())
+    duration = probe.get("format", {}).get("duration")
+    duration = float(duration) if duration not in (None, "", "N/A") else None
+    layouts = []
+    for stream in probe.get("streams", []):
+        if stream.get("codec_type") != "audio":
+            continue
+        channels = int(stream.get("channels", 0))
+        layout = stream.get("channel_layout", "")
+        if channels in (1, 2):
+            label = "Mono" if channels == 1 else "Stereo"
+        elif channels:
+            label = f"{layout} ({channels} channels)" if layout and layout != "unknown" else f"{channels} channels"
+        else:
+            label = "Unknown channel layout"
+        layouts.append(label)
+    return duration, layouts
+
+
 def resolve_mux_audio_sampling_rate(default_rate, source_audio_metadata=None, audio_paths=None):
     sample_rates = [int(default_rate)]
     for meta in source_audio_metadata or []:
@@ -253,9 +274,11 @@ def normalize_audio_pair_volumes(audio1, audio2, active_mask1=None, active_mask2
     return np.clip(audio1 * float(gain1), -1.0, 1.0), np.clip(audio2 * float(gain2), -1.0, 1.0), stats
 
 
-def normalize_audio_pair_volumes_to_temp_files(audio_path1, audio_path2, output_dir=None, prefix="audio_norm_", active_mask1=None, active_mask2=None):
-    audio1, sr1 = sf.read(os.fspath(audio_path1), dtype="float32", always_2d=False)
-    audio2, sr2 = sf.read(os.fspath(audio_path2), dtype="float32", always_2d=False)
+def normalize_audio_pair_volumes_to_temp_files(audio_path1, audio_path2, output_dir=None, prefix="audio_norm_", active_mask1=None, active_mask2=None, max_duration_seconds=None):
+    frames1 = -1 if max_duration_seconds is None else round(float(max_duration_seconds) * sf.info(os.fspath(audio_path1)).samplerate)
+    frames2 = -1 if max_duration_seconds is None else round(float(max_duration_seconds) * sf.info(os.fspath(audio_path2)).samplerate)
+    audio1, sr1 = sf.read(os.fspath(audio_path1), frames=frames1, dtype="float32", always_2d=False)
+    audio2, sr2 = sf.read(os.fspath(audio_path2), frames=frames2, dtype="float32", always_2d=False)
     norm1, norm2, stats = normalize_audio_pair_volumes(audio1, audio2, active_mask1=active_mask1, active_mask2=active_mask2)
 
     if output_dir is not None:
@@ -835,11 +858,9 @@ def save_image(tensor,
     """Save tensor as image with configurable format and quality."""
 
     RGBA = tensor.shape[0] == 4
-    if RGBA:
-        quality = "png"
 
     # Get format and quality settings
-    format_info = _get_format_info(quality)
+    format_info = get_image_format(quality, rgba=RGBA)
     
     # Rename file extension to match requested format
     save_file = osp.splitext(save_file)[0] + format_info['ext']
@@ -870,13 +891,15 @@ def save_image(tensor,
             error = e
             continue
     else:
-        print(f'cache_image failed, error: {error}', flush=True)
+        raise OSError(f"Failed to save image '{save_file}' after {retry} attempts: {error}") from error
     
     return save_file
 
 
-def _get_format_info(quality):
-    """Get format extension and parameters."""
+def get_image_format(quality, rgba=False):
+    """Get the saved format and parameters; transparent images require PNG."""
+    if rgba:
+        quality = "png"
     formats = {
         # JPEG with PIL (so 'quality' works)
         'jpeg_95': {'ext': '.jpg', 'params': {'quality': 95}, 'use_pil': True},
@@ -996,10 +1019,27 @@ def save_image_metadata(image_path, metadata_dict, **save_kwargs):
 def read_image_metadata(image_path):
     try:
         ext = os.path.splitext(image_path)[1].lower()
+        if ext == ".png":
+            # Read text chunks without inflating IDAT (including text after IDAT).
+            with open(image_path, "rb") as fp:
+                if fp.read(8) != _PNG_SIGNATURE:
+                    raise ValueError("Invalid PNG signature")
+                png = PngImagePlugin.PngStream(fp)
+                try:
+                    while True:
+                        cid, pos, length = png.read()
+                        if cid == b"IEND":
+                            break
+                        if cid in (b"tEXt", b"zTXt", b"iTXt"):
+                            data = png.call(cid, pos, length)
+                            png.crc(cid, data)
+                        else:
+                            fp.seek(length + 4, 1)
+                    val = png.im_text.get("comment")
+                    return json.loads(val) if val else None
+                finally:
+                    png.close()
         with Image.open(image_path) as im:
-            if ext == ".png":
-                val = (getattr(im, "text", {}) or {}).get("comment") or im.info.get("comment")
-                return json.loads(val) if val else None
             if ext in (".jpg", ".jpeg"):
                 import piexif
                 try:

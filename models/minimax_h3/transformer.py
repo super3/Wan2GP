@@ -25,6 +25,8 @@ import torch.nn.functional as F
 from shared.attention import pay_attention
 
 from .interrupt import GenerationInterrupted
+from . import denoiser_kernels
+from shared.kernels import int8_backend
 from .pdd import MiniMaxH3ParallelHead
 from .sol_attention import MiniMaxH3SolAttention
 from .components.packing import (
@@ -148,20 +150,48 @@ class MLP(nn.Module):
         self.fc1 = nn.Linear(hidden, 2 * ffn, bias=False, dtype=dtype, device=device)
         self.fc2 = nn.Linear(ffn, hidden, bias=False, dtype=dtype, device=device)
 
-    def _project(self, x_list):
+    def _project(self, x_list, residual=None, residual_scale=None):
         x = _take(x_list)
         expanded = self.fc1(x)
         del x
+        return self._finish(expanded, residual, residual_scale)
+
+    def _finish(self, expanded, residual=None, residual_scale=None):
+        if denoiser_kernels.can_linear(self.fc2, expanded):
+            return int8_backend.linear_with_fusion(self.fc2, expanded, input_act="swiglu",
+                                                   residual=residual, residual_scale=residual_scale,
+                                                   out=residual if denoiser_kernels.DEEP_FUSIONS else None)
         gate, value = expanded.chunk(2, dim=-1)
         F.silu(gate, inplace=True).mul_(value)
         del expanded, value
-        return self.fc2(gate)
+        output = self.fc2(gate)
+        if residual is not None:
+            output.mul_(residual_scale).add_(residual)
+        return output
 
-    def forward(self, x_list):
+    def forward(self, x_list, residual=None, gate=None, segments=None):
         x = _take(x_list)
         chunk_size = self.chunk_size
         if chunk_size > 0:
             chunk_size = max(1, x.shape[0] * self.hidden // (2 * self.ffn))
+        if residual is not None:
+            if denoiser_kernels.DEEP_FUSIONS:
+                for offset in range(0, x.shape[0], chunk_size or x.shape[0]):
+                    end = min(x.shape[0], offset + (chunk_size or x.shape[0]))
+                    expanded = self.fc1(x[offset:end])
+                    for start, stop, row in segments:
+                        lo, hi = max(start, offset), min(stop, end)
+                        if hi > lo:
+                            output = self._finish(expanded[lo-offset:hi-offset], residual[lo:hi], gate[row].to(x.dtype))
+                            residual[lo:hi].copy_(output)
+                    del expanded
+            else:
+                for start, stop, row in segments:
+                    for offset in range(start, stop, chunk_size or max(1, stop-start)):
+                        end = min(stop, offset + (chunk_size or stop-start))
+                        output = self._project([x[offset:end]], residual[offset:end], gate[row].to(x.dtype))
+                        residual[offset:end].copy_(output)
+            return residual
         if chunk_size <= 0 or x.shape[0] <= chunk_size:
             return self._project([x])
         for start in range(0, x.shape[0], chunk_size):
@@ -172,7 +202,7 @@ class MLP(nn.Module):
 
 
 class Attention(nn.Module):
-    def __init__(self, hidden, heads, head_dim, eps, sol_attention=None, dtype=None, device=None):
+    def __init__(self, hidden, heads, head_dim, eps, sol_attention=None, vdn=False, dtype=None, device=None):
         super().__init__()
         self.heads = heads
         self.head_dim = head_dim
@@ -182,20 +212,33 @@ class Attention(nn.Module):
         self.q_norm = nn.RMSNorm(head_dim, eps=eps, dtype=dtype, device=device)
         self.k_norm = nn.RMSNorm(head_dim, eps=eps, dtype=dtype, device=device)
         self.out_proj = nn.Linear(inner, hidden, bias=False, dtype=dtype, device=device)
+        if vdn:
+            from .vdn_attention import VDNHybridAttention
+            self.vdn = VDNHybridAttention(hidden, heads, head_dim, dtype=dtype, device=device)
 
-    def forward(self, x_list, rope=None, transformer_options=None):
+    def forward(self, x_list, rope=None, transformer_options=None, residual=None, gate=None, segments=None):
         x = _take(x_list)
+        vdn_input = x if hasattr(self, "vdn") else None
         seq_len = x.shape[0]
-        use_sol = self.sol_attention is not None and self.sol_attention.use_for_layer(seq_len)
+        use_sol = not hasattr(self, "vdn") and self.sol_attention is not None and self.sol_attention.use_for_layer(seq_len)
+        packed_rope = None
+        if isinstance(rope, tuple):
+            rope, packed_rope = rope
+        fused_rms = rope is not None and not use_sol and not hasattr(self, "vdn") and denoiser_kernels.can_rms(x, packed_rope, self.q_norm, self.k_norm)
         split_qkv = hasattr(self, "q_proj")
         if split_qkv:
-            query = self.q_proj(x).view(1, seq_len, self.heads, self.head_dim)
-            if not use_sol:
+            projections = (self.q_proj, self.k_proj, self.v_proj)
+            if denoiser_kernels.DEEP_FUSIONS and all(denoiser_kernels.can_linear(layer, x) for layer in projections):
+                query, key, value = int8_backend.linear_multi(projections, x)
+            else:
+                query, key, value = (layer(x) for layer in projections)
+            query = query.view(1, seq_len, self.heads, self.head_dim)
+            key = key.view(1, seq_len, self.heads, self.head_dim)
+            value = value.view(1, seq_len, self.heads, self.head_dim)
+            raw_qkv = (query[0], key[0], value[0]) if hasattr(self, "vdn") else None
+            if not use_sol and not fused_rms:
                 query = self.q_norm(query)
-            key = self.k_proj(x).view(1, seq_len, self.heads, self.head_dim)
-            if not use_sol:
                 key = self.k_norm(key)
-            value = self.v_proj(x).view(1, seq_len, self.heads, self.head_dim)
         else:
             qkv = self.qkv_proj(x)
             query, key, value = qkv.split(self.heads * self.head_dim, dim=-1)
@@ -205,16 +248,19 @@ class Attention(nn.Module):
             query, key, value = query.unsqueeze(0), key.unsqueeze(0), value.unsqueeze(0)
             if not use_sol:
                 value = value.clone()
+            raw_qkv = (query[0], key[0], value[0]) if hasattr(self, "vdn") else None
             del qkv
-        del x
+        x = None
         if use_sol:
             from shared.sol_attn import qk_rms_norm_rope_
             qk_rms_norm_rope_(query, key, self.q_norm.weight, self.k_norm.weight, rope, self.q_norm.eps)
+        elif fused_rms:
+            query, key = denoiser_kernels.rms_rope(query, key, rope, packed_rope, self.q_norm, self.k_norm)
         elif not split_qkv:
             query, key = self.q_norm(query), self.k_norm(key)
         qkv_list = [query, key, value]
         del query, key, value
-        if rope is not None and not use_sol:
+        if rope is not None and not use_sol and not fused_rms:
             pairs = rope.shape[-2]
             cosine, sine = rope[..., 0], rope[..., 1]
             scratch = torch.empty_like(qkv_list[0][..., :pairs])
@@ -225,8 +271,14 @@ class Attention(nn.Module):
                 first.mul_(cosine).addcmul_(second, sine, value=-1)
                 second.mul_(cosine).addcmul_(scratch, sine)
             del scratch, tensor, first, second
+        if hasattr(self, "vdn"):
+            x_handoff, raw_handoff, softmax_handoff = [vdn_input], list(raw_qkv), qkv_list
+            vdn_input = raw_qkv = qkv_list = query = key = value = None
+            return self.vdn(x_handoff, raw_handoff, softmax_handoff, self.out_proj)
         attention = pay_attention(qkv_list, recycle_q=True) if self.sol_attention is None else self.sol_attention(qkv_list, use_sol)
         output = attention.reshape(seq_len, -1)
+        if residual is not None:
+            return denoiser_kernels.gated_linear(self.out_proj, output, residual, gate, segments)
         return self.out_proj(output)
 
 
@@ -292,6 +344,11 @@ def _modulate(hidden, shift_scale_list, segments):
     return hidden
 
 
+def _norm_modulate(norm, hidden, shift_scale, segments):
+    output = denoiser_kernels.norm_modulate(hidden, norm, *shift_scale, segments)
+    return _modulate(norm(hidden), shift_scale, segments) if output is None else output
+
+
 def _gated_residual(hidden_list, gate_list, branch_list, segments):
     hidden = _take(hidden_list)
     gate, branch = gate_list[0].to(hidden.dtype), _take(branch_list)
@@ -304,10 +361,10 @@ def _gated_residual(hidden_list, gate_list, branch_list, segments):
 
 class DiTBlock(nn.Module):
     def __init__(self, hidden, heads, head_dim, ffn, time_dim, eps, qk_eps, apply_silu=True,
-                 adaln_dtype=None, ffn_chunk_size=2048, sol_attention=None, dtype=None, device=None):
+                 adaln_dtype=None, ffn_chunk_size=2048, sol_attention=None, vdn=False, dtype=None, device=None):
         super().__init__()
         self.norm1 = nn.RMSNorm(hidden, eps=eps, dtype=dtype, device=device)
-        self.attn = Attention(hidden, heads, head_dim, qk_eps, sol_attention=sol_attention, dtype=dtype, device=device)
+        self.attn = Attention(hidden, heads, head_dim, qk_eps, sol_attention=sol_attention, vdn=vdn, dtype=dtype, device=device)
         self.norm2 = nn.RMSNorm(hidden, eps=eps, dtype=dtype, device=device)
         self.mlp = MLP(hidden, ffn, ffn_chunk_size, dtype=dtype, device=device)
         self.adaln_proj = AdalnProj(time_dim, hidden, 6, apply_silu=apply_silu,
@@ -333,10 +390,16 @@ class DiTBlock(nn.Module):
     def forward(self, x_list, temb, segments, rope, residual_signature_elements=0):
         residual_list = [_take(x_list)]
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaln_proj(temb)
-        h_list = [_modulate(self.norm1(residual_list[0]), [shift_msa, scale_msa], segments)]
+        h_list = [_norm_modulate(self.norm1, residual_list[0], [shift_msa, scale_msa], segments)]
+        if (not residual_signature_elements and not hasattr(self.attn, 'vdn')
+                and denoiser_kernels.can_linear(self.attn.out_proj, residual_list[0])
+                and denoiser_kernels.can_linear(self.mlp.fc2, residual_list[0])):
+            hidden = self.attn(h_list, rope=rope, residual=residual_list[0], gate=gate_msa, segments=segments)
+            h_list = [_norm_modulate(self.norm2, hidden, [shift_mlp, scale_mlp], segments)]
+            return self.mlp(h_list, residual=hidden, gate=gate_mlp, segments=segments)
         if not residual_signature_elements:
             residual_list = [_gated_residual(residual_list, [gate_msa], [self.attn(h_list, rope=rope)], segments)]
-            h_list = [_modulate(self.norm2(residual_list[0]), [shift_mlp, scale_mlp], segments)]
+            h_list = [_norm_modulate(self.norm2, residual_list[0], [shift_mlp, scale_mlp], segments)]
             return _gated_residual(residual_list, [gate_mlp], [self.mlp(h_list)], segments)
 
         hidden = _take(residual_list)
@@ -344,7 +407,7 @@ class DiTBlock(nn.Module):
         branch = self.attn(h_list, rope=rope)
         hidden, signature = self._gated_branch(hidden, gate_msa.to(hidden.dtype), branch, segments, signature_stride)
         del branch
-        h_list = [_modulate(self.norm2(hidden), [shift_mlp, scale_mlp], segments)]
+        h_list = [_norm_modulate(self.norm2, hidden, [shift_mlp, scale_mlp], segments)]
         branch = self.mlp(h_list)
         hidden, signature = self._gated_branch(hidden, gate_mlp.to(hidden.dtype), branch, segments, signature_stride, signature)
         return hidden, signature
@@ -413,6 +476,7 @@ class MiniMaxH3Model(nn.Module):
                                for key in state_dict)
         converted = {}
         for key, value in state_dict.items():
+            key = key.replace(".lora_A.turbo.weight", ".lora_A.weight").replace(".lora_B.turbo.weight", ".lora_B.weight")
             if key.startswith("lora_unet_"):
                 path, suffix = key[len("lora_unet_"):].split(".", 1)
                 key = path.replace("blocks_", "blocks.", 1).replace("_attn_", ".attn.").replace("_mlp_", ".mlp.") + "." + suffix
@@ -433,6 +497,8 @@ class MiniMaxH3Model(nn.Module):
                         key = target + key[len(source):]
                         break
                 for source, target in ((".attn.norm_q.", ".attn.q_norm."), (".attn.norm_k.", ".attn.k_norm."),
+                                       (".attn.orig.to_out.0.", ".attn.out_proj."), (".attn.orig.to_q.", ".attn.q_proj."),
+                                       (".attn.orig.to_k.", ".attn.k_proj."), (".attn.orig.to_v.", ".attn.v_proj."),
                                        (".attn.to_out.0.", ".attn.out_proj."), (".attn.to_q.", ".attn.q_proj."),
                                        (".attn.to_k.", ".attn.k_proj."), (".attn.to_v.", ".attn.v_proj."),
                                        (".ff.net.0.proj.", ".mlp.fc1."), (".ff.net.2.", ".mlp.fc2.")):
@@ -488,7 +554,7 @@ class MiniMaxH3Model(nn.Module):
                  rope_inv_freq_len=16, rope_theta=10000.0, norm_eps=1e-5, qk_norm_eps=1e-5,
                  final_norm_eps=1e-5, sigma_shift_video=12.0, sigma_shift_audio=3.0,
                  ffn_chunk_size=2048, adaln_curve_grid=None, adaln_dtype=torch.float32, image_model=None,
-                 hybrid_ref2va_blocks=None, pdd_num_steps=None, pdd_block_size=None,
+                 hybrid_ref2va_blocks=None, pdd_num_steps=None, pdd_block_size=None, vdn=False,
                  dtype=None, device=None, **kwargs):
         super().__init__()
         self._interrupt = False
@@ -523,7 +589,7 @@ class MiniMaxH3Model(nn.Module):
                  "adaln_dtype": adaln_dtype if self.use_adaln_curves else dtype}
         self.blocks = nn.ModuleList([DiTBlock(hidden_size, num_attention_heads, attention_head_dim, ffn_hidden_size,
                                                time_embed_dim, norm_eps, qk_norm_eps, **curve,
-                                               ffn_chunk_size=ffn_chunk_size, sol_attention=self.sol_attention,
+                                               ffn_chunk_size=ffn_chunk_size, sol_attention=self.sol_attention, vdn=vdn,
                                                dtype=dtype, device=device) for _ in range(num_layers)])
         self.final_layer = FinalLayer(hidden_size, time_embed_dim, video_dim, audio_latents_dim,
                                       final_norm_eps, **curve, pdd_num_steps=pdd_num_steps, dtype=dtype, device=device)
@@ -720,6 +786,11 @@ class MiniMaxH3Model(nn.Module):
         target_audio_rows = audio_t * 2
         audio_start = video_start - target_audio_rows
         self.sol_attention.begin_forward(layout, device, dtype, payload["attention_sparsity"], target_video_order is not None)
+        if not self.sol_attention.enabled and not hasattr(self.blocks[0].attn, "vdn"):
+            rope = denoiser_kernels.prepare_rope(rope)
+        if vdn := getattr(self.blocks[0].attn, "vdn", None):
+            for block in self.blocks:
+                block.attn.vdn.begin_forward(layout, latent_t, latent_h, latent_w, self.patch_size)
 
         if first_block_cache is None:
             for block_index, block in enumerate(self.blocks):

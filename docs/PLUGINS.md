@@ -2,6 +2,8 @@
 
 This system allows you to extend and customize the Wan2GP user interface and functionality without modifying the core application code. This document will guide you through the process of creating and installing your own plugins.
 
+For configuration forms shared across browser windows, use the [shared form synchronization API](FORM_SYNC.md), including draft preservation and conflict handling. Generation drafts, such as the Sample plugin's Prompt Copy, stay local to the invoking browser.
+
 ## Table of Contents
 1.  [Plugin Structure](#plugin-structure)
     *   [Reference Plugins and Specialized APIs](#reference-plugins-and-specialized-apis)
@@ -62,7 +64,8 @@ Example:
 
 Reference plugins:
 *   [Stable Diffusion 1.4 Model Plugin](https://github.com/deepbeepmeep/wan2gp-stable-diffusion-1-4): compact model plugin template that adds Stable Diffusion 1.4 using MMGP-managed UNet, text encoder, and VAE components.
-*   [Pixel Upsampler Template](https://github.com/deepbeepmeep/wan2gp-pixel-upsampler): compact spatial upsampler template that duplicates pixels and documents the upsampler handler contract.
+*   [Spatial Pixel Duplicate](https://github.com/deepbeepmeep/wan2gp-pixel-upsampler): compact reference spatial upsampler that performs exact nearest-neighbor pixel duplication and documents the handler contract.
+*   [Temporal Blend](https://github.com/deepbeepmeep/wan2gp-blender-upsampler): compact reference temporal upsampler that averages neighboring frames for model-free x2 interpolation and documents the handler contract.
 
 Specialized plugin APIs:
 *   Spatial upsamplers are documented in [Spatial Upsampler Plugin API](SPATIAL_UPSAMPLERS.md). Use this guide for post-processing upsamplers, VAE upsampler capability declarations, plugin-discovered `spatial_upsampler_handlers`, and extension offload object registration.
@@ -557,3 +560,7 @@ Some common `elem_id`s include:
 *   `main_tabs`
 *   `gallery`
 *   `family_list`, `model_base_types_list`, `model_list`
+
+---
+
+> Applies to: Installing and developing WanGP plugins. Registration and handler examples are Python code; exposed tools depend on the plugins enabled in the installation.
