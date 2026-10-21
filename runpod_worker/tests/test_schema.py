@@ -539,7 +539,7 @@ def test_unknown_setting_is_its_own_code(cfg):
         ("masking_strength", 0.5),
         ("skip_steps_cache_type", ""),
         ("negative_prompt", ""),
-        ("override_attention", ""),
+        ("overrides", ""),
         ("config", ""),
     ],
 )
@@ -555,6 +555,23 @@ def test_keys_absent_from_get_default_settings_are_still_accepted(cfg, key, valu
     assert key in S.PRIMARY_SETTINGS
     req = parse({"settings": {"prompt": DEMO_PROMPT, key: value}}, cfg=cfg)
     assert req.settings.get(key) == value
+
+
+def test_overrides_allow_only_what_the_old_override_settings_did(cfg):
+    """Upstream folded ``override_attention`` / ``override_profile`` into one
+    ``overrides`` string (shared/utils/generation_overrides.py). The worker
+    keeps exactly the old surface: attention mode (Sol is reachable only
+    this way) and memory profile; quantization / compilation overrides would
+    reload -- and possibly download -- per request."""
+    sol = "attention_mode='sol', memory_profile=4"
+    assert parse({"settings": {"prompt": DEMO_PROMPT, "overrides": sol}}, cfg=cfg).settings["overrides"] == sol
+    for refused in ("transformer_quantization='bf16'", "attention_mode='sdpa', compilation='transformer'"):
+        error = raises("invalid_setting", {"settings": {"prompt": DEMO_PROMPT, "overrides": refused}}, cfg=cfg)
+        assert "may only set" in error.message
+    for malformed in ("attention_mode=", "sol", "attention_mode='sol', attention_mode='sdpa'", 4):
+        raises("invalid_setting", {"settings": {"prompt": DEMO_PROMPT, "overrides": malformed}}, cfg=cfg)
+    # The pre-2.81 spellings are no longer settings upstream; they are refused, not passed through.
+    raises("unknown_setting", {"settings": {"prompt": DEMO_PROMPT, "override_attention": "sol"}}, cfg=cfg)
 
 
 def test_settings_must_be_an_object(cfg):
