@@ -11,10 +11,12 @@ the clip is still decoding.
 
 `activate()` monkeypatches `_decode` with a copy whose only additions are
 recorder callbacks; the returned tensor is bit-identical to the original.
-Finalized slices are normalized exactly the way `MiniMaxH3VideoVAE.decode`
-would (ImageNet de-normalization, clamp to [0, 1]) and handed to the recorder
-as uint8 CPU frames, which is also the copy a real streaming mux would need,
-so the timestamps include the device-to-host cost. The audio VAE decode is
+`_decode` converts every finalized chunk with `_prepare_decoded_chunk` (in
+`MiniMaxH3VideoVAE`: ImageNet de-normalization, clamp, and uint8 rounding when
+the pipeline asks for it) and copies it into a CPU output buffer with a
+blocking copy; the recorder reads its uint8 CPU frames from that buffer, so
+they match the frames `MiniMaxH3VideoVAE.decode` returns and the timestamps
+include the device-to-host cost. The audio VAE decode is
 wrapped for timing and output capture: audio decoding is independent of video
 decoding, so a streaming pipeline reorders it first and every video chunk
 shifts later by its duration (serial execution makes that shift exact).
@@ -37,6 +39,8 @@ import wave
 from pathlib import Path
 
 import torch
+
+from shared.utils.phase_progress import PhaseProgress
 
 from .components import video_autoencoder as _va
 
@@ -86,18 +90,10 @@ class StreamRecorder:
     def on_chunk(self, vae, decoded: torch.Tensor, frame_start: int, frame_end: int, chunk_index: int) -> None:
         if frame_end <= frame_start:
             return
-        # .float() is a no-op view when decoded is already float32, so clone
-        # explicitly: the in-place normalization below must never touch the
-        # tensor the decode loop is still building.
-        sl = decoded[:, :, frame_start:frame_end].detach().float().clone()
-        std = getattr(vae, "pixel_std", None)
-        mean = getattr(vae, "pixel_mean", None)
-        if std is not None and mean is not None:
-            sl.mul_(std.to(sl)).add_(mean.to(sl))
-        u8 = sl.clamp_(0.0, 1.0).mul_(255.0).round_().to(torch.uint8)
-        u8 = u8[0].permute(1, 2, 3, 0).contiguous().cpu()  # (frames, H, W, 3)
-        # .cpu() synchronizes this stream's work: the timestamp includes the
-        # decode of this chunk AND the host copy a streaming mux would need.
+        u8 = _to_uint8_frames(vae, decoded[:, :, frame_start:frame_end])  # (frames, H, W, 3)
+        # `decoded` is the CPU buffer `_decode` fills with a blocking copy per
+        # finalized chunk: the timestamp includes the decode of this chunk AND
+        # the host copy a streaming mux would need.
         now = time.monotonic()
         meta = {"chunk": chunk_index, "frame_start": frame_start, "frame_end": frame_end, "t": now}
         self.chunks.append(meta)
@@ -120,6 +116,32 @@ class StreamRecorder:
         return [c["t"] - t0 for c in self.chunks]
 
 
+def _to_uint8_frames(vae, sl: torch.Tensor) -> torch.Tensor:
+    """A finalized slice of the `_decode` output as uint8 CPU frames (frames, H, W, 3).
+
+    The output buffer holds whatever `_prepare_decoded_chunk` returned: uint8
+    frames when the pipeline passes `uint8_rounding` (the normal video path:
+    these are the exact output frames), [-1, 1] floats from the WanGP adapter
+    (`MiniMaxH3VideoVAE`) otherwise, or the raw ImageNet-normalized decoder
+    output when the base class's identity `_prepare_decoded_chunk` is in use.
+    The result never aliases the buffer, which the caller may edit afterwards.
+    """
+    if sl.dtype != torch.uint8:
+        # .float() is a no-op view when the buffer is already float32, so clone
+        # explicitly: the in-place ops below must never touch the output buffer.
+        sl = sl.detach().float().clone()
+        if type(vae)._prepare_decoded_chunk is _va.AutoencoderKLMiniMaxH3._prepare_decoded_chunk:
+            std = getattr(vae, "pixel_std", None)
+            mean = getattr(vae, "pixel_mean", None)
+            if std is not None and mean is not None:
+                sl.mul_(std.to(sl)).add_(mean.to(sl))
+            sl.clamp_(0.0, 1.0).mul_(255.0)
+        else:
+            sl.clamp_(-1.0, 1.0).add_(1.0).mul_(127.5)
+        sl = sl.round_().to(torch.uint8)
+    return sl[0].permute(1, 2, 3, 0).cpu().clone(memory_format=torch.contiguous_format)
+
+
 _STATE: dict = {"active": False, "recorder": None, "orig_decode": None,
                 "orig_audio_decode": None, "orig_video_decode": None}
 
@@ -132,15 +154,19 @@ def _maybe_prefetch_audio(caller_locals: dict, rec: StreamRecorder) -> bool:
     """Audio-first hook: decode audio before the video decode starts.
 
     The pipeline decodes video before audio (`decoded_video = self.vae.decode(
-    video)` then `self.audio_vae.decode(audio)`), which would leave live
-    segments silent until the whole clip is decoded. At the moment the video
-    decode is entered, the caller's frame already holds both the pipeline
-    (`self`) and the audio latents (`audio`), so decode them now; the audio
-    wrapper caches the result by latents identity and the pipeline's own later
-    call returns it without paying twice. Every check fails closed: any
-    mismatch with the expected call site just keeps the original ordering.
+    video, uint8_rounding)` then `self.audio_vae.decode(audio)`), which would
+    leave live segments silent until the whole clip is decoded. At the moment
+    the video decode is entered, the caller's frame already holds both the
+    pipeline (`self`) and the audio latents (`audio`), so decode them now; the
+    audio wrapper caches the result by latents identity and the pipeline's own
+    later call returns it without paying twice. Image outputs (`image_outputs`)
+    return before any audio decode, so they are skipped. Every check fails
+    closed: any mismatch with the expected call site just keeps the original
+    ordering.
     """
     try:
+        if caller_locals.get("image_outputs"):
+            return False  # image generations never decode their audio latents
         pipe = caller_locals.get("self")
         audio = caller_locals.get("audio")
         audio_vae = getattr(pipe, "audio_vae", None)
@@ -154,12 +180,14 @@ def _maybe_prefetch_audio(caller_locals: dict, rec: StreamRecorder) -> bool:
         return False
 
 
-def _instrumented_decode(self, z: torch.Tensor) -> torch.Tensor:
+def _instrumented_decode(self, z: torch.Tensor, uint8_rounding: str | None = None) -> torch.Tensor:
     """`AutoencoderKLMiniMaxH3._decode` with recorder callbacks.
 
-    The chunk loop is copied verbatim from components/video_autoencoder.py;
-    the callbacks only read finalized regions, so the returned tensor is
-    bit-identical to the original implementation's.
+    The body is copied verbatim from components/video_autoencoder.py (upstream
+    dee6635: single-latent still path, CPU output buffer filled by
+    `write_chunk`, `PhaseProgress`); the callbacks only read finalized regions
+    of that buffer, so the returned tensor is bit-identical to the original
+    implementation's.
     """
     rec: StreamRecorder = _STATE["recorder"]
     rec.on_decode_start()
@@ -169,57 +197,81 @@ def _instrumented_decode(self, z: torch.Tensor) -> torch.Tensor:
     temporal_ratio = self.temporal_compression_ratio
     chunk_num_frames = tokens_chunk_size * temporal_ratio
 
-    num_tokens = z.shape[2] + token_drop
-    pad_tokens = (-num_tokens) % tokens_chunk_size
-    num_chunks = (num_tokens + pad_tokens) // tokens_chunk_size - int(token_drop > 0)
-    if pad_tokens > 0:
-        z = torch.cat([z, z[:, :, -1:].repeat(1, 1, pad_tokens, 1, 1)], dim=2)
+    if z.shape[2] == 1:
+        # Fizgig H3 Still's decode recipe: five identical latents, then keep pixel frame 3.
+        # https://github.com/shootthesound/ComfyUI-Fizgig-H3-Still (MIT)
+        z = z.repeat(1, 1, tokens_chunk_size, 1, 1)
+        num_chunks, output_frames = 0, 1
+    else:
+        num_tokens = z.shape[2] + token_drop
+        pad_tokens = (-num_tokens) % tokens_chunk_size
+        num_chunks = (num_tokens + pad_tokens) // tokens_chunk_size - int(token_drop > 0)
+        if pad_tokens > 0:
+            z = torch.cat([z, z[:, :, -1:].repeat(1, 1, pad_tokens, 1, 1)], dim=2)
 
-    intra_tail = self.config.clip_length % temporal_ratio
-    num_tokens_before_pad = z.shape[2] - pad_tokens
-    pad_frames = sum(
-        intra_tail if intra_tail and (num_tokens_before_pad + k) % tokens_chunk_size == 0 else temporal_ratio
-        for k in range(pad_tokens)
-    )
-    output_frames = num_chunks * (chunk_num_frames - self.frame_pre_padding) + self.frame_overlap - pad_frames
-    decoded = None
-    write_position = 0
-    overlap = None
-    for i in range(num_chunks):
-        start = i * tokens_chunk_size
-        clip = self._decode_clip(z[:, :, start : start + tokens_chunk_size + self.token_overlap])
-        for j in range(int(token_drop > 0) + 1):
-            frame_start = j * chunk_num_frames
-            chunk = clip[:, :, frame_start : frame_start + chunk_num_frames]
-            chunk = chunk[:, :, self.frame_pre_padding :]
-            if j == 0:
-                if overlap is not None:
-                    chunk = self._blend(overlap, chunk, self.frame_overlap, dim=-3)
+        intra_tail = self.config.clip_length % temporal_ratio
+        num_tokens_before_pad = z.shape[2] - pad_tokens
+        pad_frames = sum(
+            intra_tail if intra_tail and (num_tokens_before_pad + k) % tokens_chunk_size == 0 else temporal_ratio
+            for k in range(pad_tokens)
+        )
+        output_frames = num_chunks * (chunk_num_frames - self.frame_pre_padding) + self.frame_overlap - pad_frames
+    spatial_tiles = 1
+    if self.use_tiling:
+        height, width = z.shape[-2] * self.spatial_compression_ratio, z.shape[-1] * self.spatial_compression_ratio
+        rows = self._split_tiles(height, self.tile_sample_min_height, self.tile_sample_min_overlap_height)[0]
+        cols = self._split_tiles(width, self.tile_sample_min_width, self.tile_sample_min_overlap_width)[0]
+        spatial_tiles = len(rows) * len(cols)
+    with PhaseProgress(max(1, num_chunks) * spatial_tiles) as progress, progress.track(self.decoder, spatial_tiles):
+        decoded = None
+        write_position = 0
+        overlap = None
+        reported = 0  # end of the frame range already handed to the recorder
+
+        def write_chunk(chunk):
+            # finalized pixels converted and copied to the CPU output by groups of frames (no full-clip conversion copies)
+            nonlocal decoded, write_position
+            copy_frames = min(chunk.shape[2], output_frames - write_position)
+            for start in range(0, copy_frames, 4):
+                part = self._prepare_decoded_chunk(chunk[:, :, start : min(start + 4, copy_frames)], uint8_rounding)
                 if decoded is None:
-                    decoded = torch.empty(*chunk.shape[:2], output_frames, *chunk.shape[3:],
-                                          dtype=chunk.dtype, device=chunk.device)
-                copy_frames = min(chunk.shape[2], output_frames - write_position)
-                if copy_frames > 0:
-                    decoded[:, :, write_position : write_position + copy_frames].copy_(chunk[:, :, :copy_frames])
-                    previous_position = write_position
-                    write_position += copy_frames
-                    if i < num_chunks - 1:
-                        rec.on_chunk(self, decoded, previous_position, write_position, i)
-            else:
-                overlap = chunk.contiguous()
-        del clip
-    final_start = len(rec.chunks) and rec.chunks[-1]["frame_end"] or 0
-    if overlap is not None:
-        copy_frames = min(overlap.shape[2], output_frames - write_position)
-        if copy_frames > 0:
-            decoded[:, :, write_position : write_position + copy_frames].copy_(overlap[:, :, :copy_frames])
-            write_position += copy_frames
-    if write_position != output_frames:
-        raise RuntimeError(f"MiniMax H3 VAE decoded {write_position} frames, expected {output_frames}")
-    # The last chunk's frames plus the trailing overlap finalize together.
-    rec.on_chunk(self, decoded, final_start, write_position, num_chunks - 1)
-    rec.on_decode_end()
-    return decoded
+                    decoded = torch.empty(*part.shape[:2], output_frames, *part.shape[3:], dtype=part.dtype, device="cpu")
+                decoded[:, :, write_position : write_position + part.shape[2]].copy_(part, non_blocking=False)
+                write_position += part.shape[2]
+                del part
+
+        if num_chunks == 0:
+            # Short videos still need one decode, without an overlapping temporal chunk.
+            write_chunk(self._decode_clip(z)[:, :, self.frame_pre_padding : self.frame_pre_padding + output_frames])
+            rec.on_chunk(self, decoded, 0, write_position, 0)
+            rec.on_decode_end()
+            return decoded
+
+        for i in range(num_chunks):
+            start = i * tokens_chunk_size
+            clip = self._decode_clip(z[:, :, start : start + tokens_chunk_size + self.token_overlap])
+            for j in range(int(token_drop > 0) + 1):
+                frame_start = j * chunk_num_frames
+                chunk = clip[:, :, frame_start : frame_start + chunk_num_frames]
+                chunk = chunk[:, :, self.frame_pre_padding :]
+                if j == 0:
+                    if overlap is not None:
+                        chunk = self._blend(overlap, chunk, self.frame_overlap, dim=-3)
+                    write_chunk(chunk)
+                    if i < num_chunks - 1 and write_position > reported:
+                        rec.on_chunk(self, decoded, reported, write_position, i)
+                        reported = write_position
+                else:
+                    overlap = chunk.contiguous()
+            del chunk, clip
+        if overlap is not None:
+            write_chunk(overlap)
+        if write_position != output_frames:
+            raise RuntimeError(f"MiniMax H3 VAE decoded {write_position} frames, expected {output_frames}")
+        # The last chunk's frames plus the trailing overlap finalize together.
+        rec.on_chunk(self, decoded, reported, write_position, num_chunks - 1)
+        rec.on_decode_end()
+        return decoded
 
 
 def activate(store_frames: bool = True, live_dir: str | None = None,
@@ -265,10 +317,12 @@ def activate(store_frames: bool = True, live_dir: str | None = None,
 
     orig_video_decode = _video_mod.MiniMaxH3VideoVAE.decode
 
-    def audio_first_video_decode(self, latents):
+    def audio_first_video_decode(self, latents, *args, **kwargs):
+        # The pipeline calls `self.vae.decode(video, uint8_rounding)`: forward
+        # every extra argument untouched.
         if rec.audio_first:
             rec.audio_first_effective = _maybe_prefetch_audio(sys._getframe(1).f_locals, rec)
-        return orig_video_decode(self, latents)
+        return orig_video_decode(self, latents, *args, **kwargs)
 
     _STATE["orig_video_decode"] = orig_video_decode
     _video_mod.MiniMaxH3VideoVAE.decode = audio_first_video_decode
