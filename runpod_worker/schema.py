@@ -87,7 +87,7 @@ __all__ = [
 # Attachment vocabulary
 # ---------------------------------------------------------------------------
 
-#: Verified against ``wgp.py:167-168`` -- 15 keys, same order. CI re-derives this
+#: Verified against ``wgp.py:211-212`` -- 17 keys, same order. CI re-derives this
 #: by ``ast.literal_eval``ing the list literal out of ``wgp.py`` (no import, no
 #: torch); see ``tests/test_schema.py::test_attachment_keys_match``.
 #: ``engine._assert_attachment_keys`` makes the same comparison at boot against
@@ -101,10 +101,12 @@ ATTACHMENT_KEYS: tuple[str, ...] = (
     "image_mask",
     "video_guide",
     "video_guide2",
+    "video_guide3",
     "video_mask",
     "video_source",
     "audio_guide",
     "audio_guide2",
+    "audio_guide3",
     "audio_source",
     "replace_voice_sample",
     "replace_voice_sample2",
@@ -116,12 +118,12 @@ ATTACHMENT_KEYS: tuple[str, ...] = (
 # ``has_audio_file_extension`` accept, and WanGP dispatches on the *extension*,
 # never on content -- which is exactly why media_in.py sniffs magic bytes and
 # then names the temp file itself.
-# NOTE: ``.webm`` is NOT accepted; ``.avi`` IS. ``.flac``/``.ogg``/``.m4a`` are
-# NOT accepted either -- the audio list is only wav/mp3/aac.
+# NOTE: ``.webm`` is NOT accepted; ``.avi`` IS. ``.ogg``/``.m4a`` are NOT
+# accepted either -- the audio list is wav/mp3/aac/flac.
 IMAGE_EXTS: frozenset[str] = frozenset(
     {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp", ".tif", ".tiff", ".jfif", ".pjpeg"}
 )
-AUDIO_EXTS: frozenset[str] = frozenset({".wav", ".mp3", ".aac"})
+AUDIO_EXTS: frozenset[str] = frozenset({".wav", ".mp3", ".aac", ".flac"})
 VIDEO_EXTS: frozenset[str] = frozenset({".mp4", ".mkv", ".avi", ".mov"})
 
 EXTS_BY_KIND: dict[str, frozenset[str]] = {
@@ -137,7 +139,7 @@ MEDIA_KIND.update(
     {k: "image" for k in ("image_start", "image_end", "image_refs", "image_guide", "image_mask")}
 )
 MEDIA_KIND.update(
-    {k: "video" for k in ("video_guide", "video_guide2", "video_mask", "video_source")}
+    {k: "video" for k in ("video_guide", "video_guide2", "video_guide3", "video_mask", "video_source")}
 )
 MEDIA_KIND.update(
     {
@@ -145,6 +147,7 @@ MEDIA_KIND.update(
         for k in (
             "audio_guide",
             "audio_guide2",
+            "audio_guide3",
             "audio_source",
             "replace_voice_sample",
             "replace_voice_sample2",
@@ -206,7 +209,7 @@ DEFAULT_MODEL_TYPE = "minimax_h3_fl2va_pruned"
 # let a caller name an arbitrary local file. ``mode`` in particular flips
 # ``_is_edit_task_params`` / ``validate_task`` into the edit branch
 # (``wgp.py:1871-1872``, ``wgp.py:8567``) which reads ``video_source`` straight
-# off disk. All 15 ATTACHMENT_KEYS are here because media may arrive ONLY through
+# off disk. All 17 ATTACHMENT_KEYS are here because media may arrive ONLY through
 # ``input.media``, where it is materialized into a job-scoped temp directory --
 # ``settings.image_start = "/etc/hostname"`` would otherwise sail through
 # ``_absolutize_setting_path`` (``shared/api.py:1028-1043``) into WanGP.
@@ -1216,8 +1219,10 @@ _REQUIRED_MEDIA: tuple[tuple[str, str, str, str, str], ...] = (
     ("video_prompt_type", "I", "image_refs", "wgp.py:1330-1331", ""),
     ("video_prompt_type", "V", "video_guide", "wgp.py:1341-1346", ""),
     ("video_prompt_type", "+", "video_guide2", "wgp.py:1347-1348", "V"),
+    ("video_prompt_type", "*", "video_guide3", "wgp.py:1449-1450", "V"),
     ("audio_prompt_type", "A", "audio_guide", "wgp.py:1302-1304", ""),
     ("audio_prompt_type", "B", "audio_guide2", "wgp.py:1310-1312", ""),
+    ("audio_prompt_type", "D", "audio_guide3", "wgp.py:1407-1411", ""),
 )
 
 
@@ -1261,11 +1266,11 @@ def check_cross_variant(
     n_refs = _media_count(media, "image_refs")
 
     if model_type in FL2VA_TYPES:
-        for key in ("video_guide2", "audio_guide2"):
+        for key in ("video_guide2", "video_guide3", "audio_guide2", "audio_guide3"):
             if media.get(key):
                 raise WorkerError(
                     BAD_REQUEST,
-                    "video_guide2/audio_guide2 are Ref2VA-only",
+                    "video_guide2/3 and audio_guide2/3 are Ref2VA-only",
                     details=[f"'{key}' was supplied for {model_type}"],
                 )
         # minimax_h3_handler.py:355-359
