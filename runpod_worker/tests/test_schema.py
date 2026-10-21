@@ -1098,7 +1098,7 @@ def test_caller_may_not_reroute_a_profile_lora(env):
     env.delenv("WANGP_ALLOWED_LORAS", raising=False)
     cfg = C.WorkerConfig()
     profile_url = json.loads(
-        (Path(__file__).resolve().parents[2] / "profiles" / "minimax_h3"
+        (Path(__file__).resolve().parents[2] / "profiles" / "minimax_h3_fl2va"
          / f"{PROFILE_NAME}.json").read_text(encoding="utf-8")
     )["activated_loras"][0]
     payload = example_a()
