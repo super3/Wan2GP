@@ -360,10 +360,18 @@ def test_wgp_still_replaces_the_default_config_wholesale():
     relaxed. Until then it must stay.
     """
     source = _wgp_source()
-    assert re.search(r"^\s*server_config\s*=\s*json\.loads\(text\)", source, re.M), (
-        "wgp.py no longer does `server_config = json.loads(text)`. Re-read "
-        "wgp.py:2620-2631 and re-derive the guarantees documented in "
-        "runpod_worker/config.py before touching this test."
+    assert re.search(r"^\s*server_config\s*=\s*read_config\(config_load_filename\)", source, re.M), (
+        "wgp.py no longer does `server_config = read_config(config_load_filename)`. "
+        "Re-read the config load block in wgp.py and re-derive the guarantees "
+        "documented in runpod_worker/config.py before touching this test."
+    )
+    # read_config must stay a plain parse: any merge with defaults there would
+    # make the missing-key failure mode disappear without this test noticing.
+    store = (REPO_ROOT / "shared" / "utils" / "config_store.py").read_text(encoding="utf-8")
+    body = re.search(r"^def read_config\(filename\):\n((?:[ \t]+.*\n|\n)+)", store, re.M)
+    assert body and re.search(r"return json\.load\(reader\)\s*$", body.group(1)), (
+        "shared/utils/config_store.read_config no longer returns json.load(reader) "
+        "as-is; re-derive the guarantees documented in runpod_worker/config.py."
     )
 
 
