@@ -108,13 +108,13 @@ __all__ = [
 # Keys and whitelists. Deliberately duplicated from schema.py rather than
 # imported: schema.py reads models/_settings.json at import time, which would
 # make this module unimportable wherever WANGP_ROOT is not populated.
-# Verified against wgp.py:167-168 (ATTACHMENT_KEYS, 15 keys, same order) and
+# Verified against wgp.py:211-212 (ATTACHMENT_KEYS, 17 keys, same order) and
 # shared/utils/utils.py:36-49 (the extension whitelists).
 # ---------------------------------------------------------------------------
 ATTACHMENT_KEYS: tuple[str, ...] = (
     "image_start", "image_end", "image_refs", "image_guide", "image_mask",
-    "video_guide", "video_guide2", "video_mask", "video_source",
-    "audio_guide", "audio_guide2", "audio_source",
+    "video_guide", "video_guide2", "video_guide3", "video_mask", "video_source",
+    "audio_guide", "audio_guide2", "audio_guide3", "audio_source",
     "replace_voice_sample", "replace_voice_sample2", "custom_guide",
 )
 
@@ -122,7 +122,7 @@ ATTACHMENT_KEYS: tuple[str, ...] = (
 IMAGE_EXTS: frozenset[str] = frozenset(
     {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp", ".tif", ".tiff", ".jfif", ".pjpeg"}
 )
-AUDIO_EXTS: frozenset[str] = frozenset({".wav", ".mp3", ".aac"})
+AUDIO_EXTS: frozenset[str] = frozenset({".wav", ".mp3", ".aac", ".flac"})
 VIDEO_EXTS: frozenset[str] = frozenset({".mp4", ".mkv", ".avi", ".mov"})
 EXTS_BY_KIND: dict[str, frozenset[str]] = {
     "image": IMAGE_EXTS,
@@ -137,9 +137,9 @@ MEDIA_KIND: dict[str, str] = {k: "image" for k in
                               ("image_start", "image_end", "image_refs",
                                "image_guide", "image_mask")}
 MEDIA_KIND.update({k: "video" for k in
-                   ("video_guide", "video_guide2", "video_mask", "video_source")})
+                   ("video_guide", "video_guide2", "video_guide3", "video_mask", "video_source")})
 MEDIA_KIND.update({k: "audio" for k in
-                   ("audio_guide", "audio_guide2", "audio_source",
+                   ("audio_guide", "audio_guide2", "audio_guide3", "audio_source",
                     "replace_voice_sample", "replace_voice_sample2")})
 
 #: Keys WanGP expects to hold a *list* of paths.
@@ -175,8 +175,7 @@ class SniffResult:
 #: Formats we can identify but WanGP will not accept for any slot. Recognising
 #: them explicitly turns "unsupported media" into a message that says *why*.
 _KNOWN_UNSUPPORTED: tuple[tuple[bytes, str, str], ...] = (
-    (b"OggS", "ogg", "ogg/opus/vorbis is not in WanGP's whitelist (use .wav/.mp3/.aac)"),
-    (b"fLaC", "flac", "flac is not in WanGP's whitelist (use .wav/.mp3/.aac)"),
+    (b"OggS", "ogg", "ogg/opus/vorbis is not in WanGP's whitelist (use .wav/.mp3/.aac/.flac)"),
     (b"FLV\x01", "flv", "flv is not in WanGP's whitelist (use .mp4/.mkv/.avi/.mov)"),
     (b"\x00\x00\x01\xba", "mpeg-ps", "mpeg program stream is not in WanGP's whitelist"),
     (b"\x1f\x8b", "gzip", "this is a gzip archive, not media"),
@@ -234,6 +233,13 @@ def _sniff_matroska(head: bytes) -> SniffResult | None:
     )
 
 
+def _sniff_flac(head: bytes) -> SniffResult | None:
+    """Native FLAC stream marker (shared/utils/utils.py:51 accepts .flac)."""
+    if head[:4] == b"fLaC":
+        return SniffResult("audio", ".flac", "audio/flac", "flac")
+    return None
+
+
 def _sniff_mpeg_audio(head: bytes) -> SniffResult | None:
     """MPEG audio frame sync, plus ID3 and ADTS/ADIF AAC.
 
@@ -289,7 +295,7 @@ def sniff(head: bytes) -> SniffResult | None:
     """
     if not head:
         return None
-    for probe in (_sniff_isobmff, _sniff_matroska, _sniff_riff, _sniff_image):
+    for probe in (_sniff_isobmff, _sniff_matroska, _sniff_riff, _sniff_flac, _sniff_image):
         result = probe(head)
         if result is not None:
             return result
