@@ -28,10 +28,13 @@ if _ROOT not in sys.path:
 # models/minimax_h3/__init__.py drags in mmgp, which asserts on CPU-only
 # torch at import time. streaming.py needs none of that, so register the
 # package path without executing __init__ and import the submodules directly.
+# The VAE now imports real `shared` submodules (shared.utils.phase_progress,
+# shared.kernels), so `shared` is registered the same way instead of as an
+# empty module.
 import importlib
 import types
 
-for name, rel in (("models", "models"), ("models.minimax_h3", "models/minimax_h3")):
+for name, rel in (("models", "models"), ("models.minimax_h3", "models/minimax_h3"), ("shared", "shared")):
     if name not in sys.modules:
         pkg = types.ModuleType(name)
         pkg.__path__ = [str(Path(_ROOT) / rel)]
@@ -52,9 +55,37 @@ if "shared.attention" not in sys.modules:
             q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=causal)
         return out.transpose(1, 2)
 
+    # shared/attention_kit.py (imported lazily by the VAE's CPU norm path for
+    # rows_) also imports these two names. No SageAttention on CPU: staged
+    # quantization is unavailable (None, as the real helper reports), and the
+    # VAE never builds a Sage attention mask.
+    def _no_sage_staged(*_args, **_kw):
+        return None
+
+    def _sage_attention_mask(*_args, **_kw):
+        raise NotImplementedError("Sage attention masks are not stubbed in tests/test_streaming.py")
+
     attn_mod.pay_attention = _sdpa_pay_attention
+    attn_mod.sage_staged = _no_sage_staged
+    attn_mod.sage_attention_mask = _sage_attention_mask
     sys.modules["shared.attention"] = attn_mod
     shared_pkg.attention = attn_mod
+
+# models/minimax_h3/video_vae.py (imported by streaming.activate) pulls
+# shared.utils.utils for guide_to_float, and that module imports cv2, rembg,
+# torchvision and more at import time. Only the encode path calls it, which
+# these tests never exercise, so stand in for it when those are not installed.
+if "shared.utils.utils" not in sys.modules:
+    try:
+        importlib.import_module("shared.utils.utils")
+    except ImportError:
+        utils_mod = types.ModuleType("shared.utils.utils")
+
+        def _guide_to_float(_video):
+            raise RuntimeError("shared.utils.utils is stubbed by tests/test_streaming.py")
+
+        utils_mod.guide_to_float = _guide_to_float
+        sys.modules["shared.utils.utils"] = utils_mod
 
 streaming = importlib.import_module("models.minimax_h3.streaming")
 AutoencoderKLMiniMaxH3 = importlib.import_module(
@@ -75,6 +106,36 @@ def _tiny_vae() -> AutoencoderKLMiniMaxH3:
         decoder_num_register_tokens=1,
         decoder_ffn_mult=1,
     ).eval()
+
+
+def _tiny_adapter_vae() -> AutoencoderKLMiniMaxH3:
+    """`_tiny_vae` with the WanGP adapter's finalized-chunk conversion.
+
+    `MiniMaxH3VideoVAE._prepare_decoded_chunk` (ImageNet de-normalization,
+    [-1, 1] or uint8 rounding) is what the production decode stores in its
+    CPU output buffer; the full adapter is too large to build on CPU.
+    """
+    video_vae = importlib.import_module("models.minimax_h3.video_vae")
+
+    class TinyAdapterVAE(AutoencoderKLMiniMaxH3):
+        upsampling = False
+        _prepare_decoded_chunk = video_vae.MiniMaxH3VideoVAE._prepare_decoded_chunk
+
+    torch.manual_seed(0)
+    vae = TinyAdapterVAE(
+        latent_channels=4,
+        block_out_channels=(8, 8, 8, 8, 8, 8),
+        layers_per_block=1,
+        norm_num_groups=4,
+        decoder_num_layers=1,
+        decoder_num_attention_heads=1,
+        decoder_attention_head_dim=8,
+        decoder_num_register_tokens=1,
+        decoder_ffn_mult=1,
+    ).eval()
+    vae.register_buffer("pixel_mean", torch.tensor(video_vae.IMAGENET_MEAN).view(1, 3, 1, 1, 1), persistent=False)
+    vae.register_buffer("pixel_std", torch.tensor(video_vae.IMAGENET_STD).view(1, 3, 1, 1, 1), persistent=False)
+    return vae
 
 
 @pytest.mark.parametrize("z_tokens", [5, 12, 37])
@@ -113,6 +174,91 @@ def test_deactivate_restores_original():
     assert AutoencoderKLMiniMaxH3._decode is not original
     streaming.deactivate()
     assert AutoencoderKLMiniMaxH3._decode is original
+
+
+@pytest.mark.parametrize("uint8_rounding", ["truncate", "round", None])
+def test_instrumented_decode_adapter_frames_match_output(uint8_rounding):
+    """The production path: `decode(z, ..., uint8_rounding)` forwards the
+    rounding positionally to `_decode`, and the recorder's uint8 frames are
+    exactly the frames of the (converted) decode output."""
+    vae = _tiny_adapter_vae()
+    z = torch.randn(1, 4, 12, 8, 8)
+    with torch.no_grad():
+        expected = AutoencoderKLMiniMaxH3.decode(vae, z, False, uint8_rounding)[0]
+    rec = streaming.activate(store_frames=True)
+    try:
+        rec.reset()
+        with torch.no_grad():
+            got = AutoencoderKLMiniMaxH3.decode(vae, z, False, uint8_rounding)[0]
+    finally:
+        streaming.deactivate()
+    assert torch.equal(expected, got), "instrumented decode diverged from original"
+    assert expected.dtype == (torch.float32 if uint8_rounding is None else torch.uint8)
+    assert len(rec.chunks) > 1 and rec.chunks[-1]["frame_end"] == expected.shape[2]
+    if uint8_rounding is None:
+        reference = expected.clamp(-1.0, 1.0).add(1.0).mul(127.5).round().to(torch.uint8)
+    else:
+        reference = expected
+    assert torch.equal(torch.cat(rec.frames), reference[0].permute(1, 2, 3, 0))
+
+
+def test_instrumented_decode_single_latent_still():
+    vae = _tiny_vae()
+    z = torch.randn(1, 4, 1, 8, 8)
+    with torch.no_grad():
+        expected = AutoencoderKLMiniMaxH3._decode(vae, z)
+    rec = streaming.activate(store_frames=True)
+    try:
+        rec.reset()
+        with torch.no_grad():
+            got = AutoencoderKLMiniMaxH3._decode(vae, z)
+    finally:
+        streaming.deactivate()
+    assert torch.equal(expected, got)
+    assert expected.shape[2] == 1
+    assert [(c["frame_start"], c["frame_end"]) for c in rec.chunks] == [(0, 1)]
+    assert rec.frames[0].shape[0] == 1
+
+
+def test_audio_first_video_decode_forwards_arguments(monkeypatch):
+    """The audio-first wrapper sits on `MiniMaxH3VideoVAE.decode`, which the
+    pipeline calls as `self.vae.decode(video, uint8_rounding)`."""
+    video_vae = importlib.import_module("models.minimax_h3.video_vae")
+    calls = []
+
+    def fake_video_decode(self, latents, uint8_rounding=None):
+        calls.append(("video", uint8_rounding))
+        return latents
+
+    monkeypatch.setattr(video_vae.MiniMaxH3VideoVAE, "decode", fake_video_decode)
+
+    class DummyAudioVAE:
+        def decode(self, latents):
+            calls.append(("audio",))
+            return latents
+
+    class DummyPipe:
+        audio_vae = DummyAudioVAE()
+
+        def generate(self, video, audio, image_outputs=False):
+            uint8_rounding = "truncate"
+            return video_vae.MiniMaxH3VideoVAE.decode(None, video, uint8_rounding)
+
+    rec = streaming.activate(store_frames=False, audio_first=True)
+    try:
+        rec.reset()
+        DummyPipe().generate(torch.zeros(1), torch.zeros(2))
+        assert calls == [("audio",), ("video", "truncate")]
+        assert rec.audio_first_effective
+        # image outputs never decode their audio: no prefetch
+        calls.clear()
+        rec.reset()
+        DummyPipe().generate(torch.zeros(1), torch.zeros(2), image_outputs=True)
+        assert calls == [("video", "truncate")]
+        assert not rec.audio_first_effective
+    finally:
+        streaming.deactivate()
+    assert video_vae.MiniMaxH3VideoVAE.decode is fake_video_decode
 
 
 def _ffprobe_frames(path: str) -> tuple[int, float]:
