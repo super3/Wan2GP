@@ -55,7 +55,11 @@ def test_usp_module_stays_torch_lazy_for_this_suite():
 
 
 #: sha256 of AutoencoderKLMiniMaxH3._decode at the revision last_frame.py reasons about.
-MIRRORED_DECODE_SHA256 = "b68e95d66cbbf48af74fa29a2d021c51322fe66cb6e7840e406871bd2c003afd"
+#: Re-verified at upstream dee6635 (runpod_worker/scripts/test_last_frame_cpu.py:
+#: last frame bit-identical for 107-362 frames): the chunk loop is unchanged;
+#: finalized frames now go to a CPU buffer via _prepare_decoded_chunk(uint8_rounding)
+#: and a single latent frame takes a separate still-image path.
+MIRRORED_DECODE_SHA256 = "57c6f669ed43592cd74d3a15e74f9aa7c1ee488f9dd25d9a75f38eb2d5760467"
 
 
 def _decode_source() -> str:
