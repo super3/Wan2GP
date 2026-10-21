@@ -133,7 +133,8 @@ def main() -> int:
 
     # Measured: a "sol" leg ran at SDPA speed and never printed
     # "[MiniMax H3] Sol-Attn enabled" -- WanGP ignores sol as a global mode and
-    # takes it only from the per-job override_attention setting.
+    # takes it only from the per-job override (now the `overrides` setting:
+    # "attention_mode='sol'", shared/utils/generation_overrides.py).
     override_attention = None
     if args.attention in OVERRIDE_ONLY_MODES:
         override_attention = args.attention
@@ -292,7 +293,7 @@ def main() -> int:
                         "seed": seed,
                     },
                     **({"num_inference_steps": args.steps} if args.steps > 0 else {}),
-                    **({"override_attention": override_attention} if override_attention else {}),
+                    **({"overrides": f"attention_mode={override_attention!r}"} if override_attention else {}),
                 ),
                 "output": {"mode": "b64"},
                 "runtime": {"timeout_s": 2400},
