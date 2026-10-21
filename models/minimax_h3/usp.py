@@ -14,7 +14,12 @@ no ray. The method mirrors komikndr/raylight's ComfyUI port of this model:
   ``heads / world_size`` heads — plain ``pay_attention`` runs unchanged,
   and a second all-to-all trades back (Ulysses attention). 56 heads and
   contiguous uneven shards mean no padding is ever needed:
-  ``torch.distributed.all_to_all`` takes ragged tensor lists;
+  ``torch.distributed.all_to_all`` takes ragged tensor lists. A block's
+  attention reaches ``pay_attention`` by one of two routes, and both are
+  hooked: with split q/k/v projections (``qkv_splitting``, the default)
+  through ``shared.attention_kit.qkv_attention``, which takes the Ulysses
+  exchange as its ``attention_fn``; with the fused ``qkv_proj`` (the "Lower
+  RAM" config, GGUF) through ``MiniMaxH3SolAttention.__call__``;
 - after the block loop the shards are all-gathered, so the final layer and
   everything downstream is identical on every rank.
 
@@ -24,10 +29,15 @@ generator seeded by the task seed, so ranks stay in lockstep without a
 command channel. Rank 0's outputs are the ones to keep.
 
 Not supported under USP (assert loudly rather than silently corrupt):
-- Sol sparse attention (its sink-token offsets are global-sequence-based);
-  run ``--attention sdpa`` or ``sage2``.
+- Sol, Veda and VSA sparse attention, and VDN hybrid attention: they plan
+  their work over the global sequence / video grid; run ``--attention sdpa``
+  or ``sage2`` on a standard H3 variant.
 - ``skip_steps_cache`` variants (Spectrum / FirstBlockCache): their
   full-sequence signatures diverge per shard.
+- ControlNet-Union control streams (``payload["control_rows"]``): the control
+  stream and its skip row ranges are full-sequence.
+- CUDA graphs of the DiT blocks: collectives run inside every block, so
+  :func:`activate` registers an mmgp graph gate that keeps the blocks eager.
 
 Launch each rank as its own process (``torchrun --nproc-per-node=N`` or
 manual env: RANK / WORLD_SIZE / MASTER_ADDR / MASTER_PORT / LOCAL_RANK),
@@ -175,16 +185,13 @@ def _assert_ranks_agree(hidden: torch.Tensor) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _usp_attention_call(self, qkv_list, use_sol):
-    """Class-level wrapper for MiniMaxH3SolAttention.__call__ (every DiT block
-    routes through the model's singleton instance)."""
+def _usp_heads_attention(qkv_list):
+    """Ulysses attention of this rank's shard: q/k/v ``[1, shard, H, D]`` (handed
+    off in ``qkv_list``) -> ``[1, shard, H, D]``. Between the two all-to-alls the
+    rank holds the FULL sequence for ``H / world`` heads, so ``pay_attention``
+    computes exact full-sequence attention for those heads."""
     from shared.attention import pay_attention
 
-    if not is_active() or _S.bounds is None:
-        return _ORIG_SOL_CALL(self, qkv_list, use_sol)
-    if use_sol:
-        raise RuntimeError("Sol sparse attention is global-sequence-based and unsupported "
-                           "under USP; run --attention sdpa or sage2.")
     bounds = _S.bounds
     query, key, value = qkv_list
     qkv_list.clear()
@@ -196,79 +203,193 @@ def _usp_attention_call(self, qkv_list, use_sol):
     return _heads_to_seq(output, bounds)
 
 
+def _usp_attention_call(self, qkv_list, use_sol):
+    """Class-level wrapper for MiniMaxH3SolAttention.__call__: the DiT blocks'
+    route to attention when their q/k/v come from the fused ``qkv_proj``."""
+    if not is_active() or _S.bounds is None:
+        return _ORIG_SOL_CALL(self, qkv_list, use_sol)
+    if use_sol:
+        raise RuntimeError("Sol sparse attention is global-sequence-based and unsupported "
+                           "under USP; run --attention sdpa or sage2.")
+    return _usp_heads_attention(qkv_list)
+
+
+def _usp_qkv_attention(x_list, q_proj, k_proj, v_proj, heads, head_dim, norm_rope, extra_proj=None, **kwargs):
+    """Wrapper for ``shared.attention_kit.qkv_attention``: the DiT blocks' route
+    to attention when MMGP split ``qkv_proj`` into q/k/v (``qkv_splitting``, the
+    MiniMax H3 default). That path projects, normalizes and rotates the shard's
+    rows itself and never reaches MiniMaxH3SolAttention.__call__, so without
+    this hook each rank would attend over its own shard only -- plausible-looking
+    garbage, not an error. Outside a USP block loop (the TokenRefiner, any other
+    model) it is a passthrough."""
+    if not is_active() or _S.bounds is None:
+        return _ORIG_QKV_ATTENTION(x_list, q_proj, k_proj, v_proj, heads, head_dim, norm_rope,
+                                   extra_proj=extra_proj, **kwargs)
+    if extra_proj is not None or kwargs.get("attention_fn") is not None:
+        raise RuntimeError("Veda / VSA sparse attention is global-sequence-based and unsupported "
+                           "under USP; run --attention sdpa or sage2 on a standard H3 variant.")
+    # The all-to-all splits the heads across ranks itself and needs all of them at
+    # once: an Attention Head Split group (e.g. 7 of 56 heads) would not divide by
+    # the world size. head_split_level=0 keeps one group of all heads.
+    kwargs["attention_fn"] = lambda qkv_list, group: _usp_heads_attention(qkv_list)
+    kwargs["head_split_level"] = 0
+    return _ORIG_QKV_ATTENTION(x_list, q_proj, k_proj, v_proj, heads, head_dim, norm_rope, **kwargs)
+
+
+def _usp_graph_gate():
+    """mmgp CUDA-graph gate (``cuda_graphs.register_gate``): the blocks run
+    collectives, so they stay eager while USP is active."""
+    return "USP sequence parallelism runs collectives inside the DiT blocks" if is_active() else None
+
+
+def _refuse_global_attention(model):
+    """Sparse attentions plan their work over the global sequence / video grid."""
+    if model.sol_attention.enabled:
+        raise RuntimeError("Sol sparse attention is global-sequence-based and unsupported "
+                           "under USP; run --attention sdpa or sage2.")
+    for name in ("veda_attention", "vsa_attention"):
+        policy = getattr(model, name, None)
+        if policy is not None and policy.enabled:
+            raise RuntimeError(f"{name.split('_')[0].upper()} sparse attention is global-sequence-based "
+                               "and unsupported under USP; run a standard H3 variant.")
+
+
 def _usp_forward(self, video_x, audio_x, sigma_video, sigma_audio, context, payload,
                  spectrum=None, first_block_cache=None):
-    """Rank-aware copy of MiniMaxH3Model.forward (transformer.py:542-662).
+    """Rank-aware copy of MiniMaxH3Model.forward (transformer.py:753-948).
 
     Kept as close to upstream as possible; the USP deltas are marked. Pinned to
-    the upstream revision this branch tracks — re-diff on upstream bumps."""
+    the upstream revision this branch tracks (dee6635) — re-diff on upstream
+    bumps; runpod_worker/tests/test_usp_drift.py fails when the original moves.
+    Upstream paths this copy drops are refused up front instead of ported: the
+    Spectrum forecast branch and the FirstBlockCache loop (step caches), the
+    ControlNet-Union control stream, and VDN's per-block planning."""
+    from mmgp import cuda_graphs
+    from shared.kernels import ops as kernels
+
     from . import transformer as T
 
     if not is_active():
         return _ORIG_FORWARD(self, video_x, audio_x, sigma_video, sigma_audio, context,
                              payload, spectrum=spectrum, first_block_cache=first_block_cache)
+    # ---- USP delta: refuse what this copy does not shard ----------------
     if spectrum is not None or first_block_cache is not None:
         raise RuntimeError("skip_steps_cache (spectrum/first_block) is unsupported under USP; "
                            "disable the step cache.")
+    if payload.get("control_rows") is not None:
+        raise RuntimeError("ControlNet-Union control streams are unsupported under USP: the control "
+                           "stream and its skip row ranges are full-sequence.")
+    if hasattr(self.blocks[0].attn, "vdn"):
+        raise RuntimeError("VDN hybrid attention is global-sequence-based and unsupported under USP.")
+    # ---- end USP delta ----------------------------------------------------
 
     device, dtype = video_x.device, self.dtype or next(self.blocks.parameters()).dtype
     video_dtype, audio_dtype = video_x.dtype, audio_x.dtype
     _, _, latent_t, latent_h, latent_w = video_x.shape
+    sigma_video = sigma_video.flatten()
+    if sigma_video.numel() not in (1, latent_t):
+        raise ValueError(f"MiniMax H3 received {sigma_video.numel()} video sigmas for {latent_t} latent frames")
+    if not self.control_layers and sigma_video.numel() > 1 and not bool((sigma_video == sigma_video[0]).all()):
+        raise ValueError("MiniMax H3 requires one uniform video sigma")
+    # A clean first-frame ControlNet anchor must not set the text/audio prefix's noise level.
+    base_video_sigma = sigma_video.max() if self.control_layers else sigma_video[0]
     audio_t = audio_x.shape[-1]
     text_tags = payload["text_token_tags"].view(-1).cpu()
     layout = self._layout(text_tags, latent_t, latent_h, latent_w, audio_t, payload)
+    target_video_order = payload.get("target_video_order")
+    target_video_inverse_order = payload.get("target_video_inverse_order")
+    target_video_fixed_rows = payload.get("target_video_fixed_rows", 0)
+    target_video_mask_active = payload.get("target_video_mask_active", False)
 
-    video_rows = T.patchify_video(video_x.to(torch.float32), self.patch_size)
-    audio_rows = T.pack_audio(audio_x.to(torch.float32))
-    cond_video, cond_audio = payload.get("cond_video_rows"), payload.get("cond_audio_rows")
-    if cond_video is not None:
-        video_rows = torch.cat((cond_video.to(device), video_rows))
-    if cond_audio is not None:
-        audio_rows = torch.cat((cond_audio.to(device), audio_rows))
-    video_embeds = self.video_patch_proj(video_rows).to(dtype)
-    del video_rows
-    audio_embeds = self.audio_patch_proj(audio_rows).to(dtype)
-    del audio_rows
+    # (USP delta: no Spectrum forecast branch here -- spectrum is refused above.)
+    hidden = self._prepare_graph_input(video_x, audio_x, context, payload, layout, dtype)
+    if hidden is None:
+        video_x = video_x.to(torch.float32)
+        video_rows = T.patchify_video(video_x, self.patch_size)
+        video_x= None
+        if target_video_order is not None:
+            video_rows = video_rows.index_select(0, target_video_order)
+        audio_x = audio_x.to(torch.float32)
+        audio_rows = T.pack_audio(audio_x)
+        audio_x = None
+        cond_video, cond_audio = payload.get("cond_video_rows"), payload.get("cond_audio_rows")
+        if cond_video is not None:
+            video_rows = torch.cat((cond_video.to(device), video_rows))
+        if cond_audio is not None:
+            audio_rows = torch.cat((cond_audio.to(device), audio_rows))
+        video_embeds = self.video_patch_proj(video_rows).to(dtype)
+        del video_rows
+        audio_embeds = self.audio_patch_proj(audio_rows).to(dtype)
+        del audio_rows
 
-    text_embeds = context[0]
-    if text_embeds.shape[-1] != self.hidden_size:
-        text_embeds = self.preprocess_text_embeds(context)[0]
-    hidden = torch.empty(layout.sequence_length, self.hidden_size, dtype=dtype, device=device)
-    hidden.index_copy_(0, layout.text_indices.to(device), text_embeds)
-    hidden.index_copy_(0, layout.video_indices.to(device), video_embeds)
-    hidden.index_copy_(0, layout.audio_indices.to(device), audio_embeds)
-    del text_embeds, video_embeds, audio_embeds
+        text_embeds = context[0]
+        if text_embeds.shape[-1] != self.hidden_size:
+            text_embeds = self.preprocess_text_embeds(context)[0]
+        hidden = torch.empty(layout.sequence_length, self.hidden_size, dtype=dtype, device=device)
+        hidden.index_copy_(0, layout.text_indices.to(device), text_embeds)
+        hidden.index_copy_(0, layout.video_indices.to(device), video_embeds)
+        hidden.index_copy_(0, layout.audio_indices.to(device), audio_embeds)
+        del text_embeds, video_embeds, audio_embeds
+    else:
+        video_x = audio_x = None
 
     timestep, timestep_indices = T.build_row_timesteps(
         layout,
-        float(1.0 - sigma_video.flatten()[0]),
+        float(1.0 - base_video_sigma),
         float(1.0 - sigma_audio.flatten()[0]),
-        max(float(1.0 - sigma_video.flatten()[0]), T.VISUAL_COND_TIMESTEP),
+        max(float(1.0 - base_video_sigma), T.VISUAL_COND_TIMESTEP),
         T.AUDIO_COND_TIMESTEP,
+        keyframe_timesteps=T._keyframe_timesteps(payload.get("keyframes"), latent_h // self.patch_size[1] * (latent_w // self.patch_size[2])),
     )
     timestep, timestep_indices = timestep.to(device), timestep_indices.to(device)
+    target_video_rows = latent_t * (latent_h // self.patch_size[1]) * (latent_w // self.patch_size[2])
+    video_start = layout.sequence_length - target_video_rows
+    video_head_row = int(timestep_indices[video_start])
+    frame_rows = grouped_segments = None
+    if target_video_order is not None:
+        timestep, timestep_indices, video_head_row, grouped_segments = T._grouped_video_timestep_rows(
+            timestep, timestep_indices, video_start, target_video_rows,
+            target_video_fixed_rows, target_video_mask_active)
+    elif sigma_video.numel() == latent_t:
+        timestep, timestep_indices, video_head_row, frame_rows = T._frame_video_timestep_rows(timestep, timestep_indices, sigma_video, target_video_rows)
     adaln_indices = timestep_indices * 3 + layout.token_tags.to(device).clamp_min(0)
-    changes = torch.cat((torch.ones(1, dtype=torch.bool, device=device),
-                         adaln_indices[1:] != adaln_indices[:-1],
+    changes = torch.cat((torch.ones(1, dtype=torch.bool, device=device), adaln_indices[1:] != adaln_indices[:-1],
                          torch.ones(1, dtype=torch.bool, device=device))).nonzero().flatten()
     segments = [(int(changes[index]), int(changes[index + 1]), int(adaln_indices[changes[index]]))
                 for index in range(changes.numel() - 1)]
+    if frame_rows is not None:
+        segments = [segment for segment in segments if segment[0] < video_start]
+        rows_per_frame = target_video_rows // latent_t
+        segments.extend((video_start + index * rows_per_frame, video_start + (index + 1) * rows_per_frame,
+                         int(row) * 3 + T.MINIMAX_H3_VIDEO_TAG) for index, row in enumerate(frame_rows))
+    elif grouped_segments is not None:
+        segments = [segment for segment in segments if segment[0] < video_start]
+        segments.extend(grouped_segments)
     temb = self._time_embedding(timestep)
+    ref2va_temb = self._time_embedding(timestep, self.ref2va_adaln_t_table) if self.hybrid_ref2va_blocks is not None else None
     rope = payload.get("rope")
     if rope is None:
         positions = layout.position_ids.to(torch.float32)
         frequencies = positions.unsqueeze(-1) * self.rope.inv_freq.detach().cpu().view(1, 1, -1)
         rope = T._rope_table(torch.cat(frequencies.unbind(dim=1), dim=-1), dtype).to(device)
+        if target_video_order is not None:
+            target_rope = rope[:, video_start:].index_select(1, target_video_order)
+            rope[:, video_start:].copy_(target_rope)
+            del target_rope
         payload["rope"] = rope
         del positions, frequencies
     del adaln_indices, changes
-    target_video_rows = latent_t * (latent_h // self.patch_size[1]) * (latent_w // self.patch_size[2])
     target_audio_rows = audio_t * 2
-    video_start = layout.sequence_length - target_video_rows
     audio_start = video_start - target_audio_rows
-    # upstream 238e25f ("added sol attn 0.6.2") made tau a required positional:
-    # sol_attention.py:23 begin_forward(self, layout, device, dtype, tau).
-    self.sol_attention.begin_forward(layout, device, dtype, payload["attention_sparsity"])
+    self.sol_attention.begin_forward(layout, device, dtype, payload["attention_sparsity"], target_video_order is not None)
+    if hasattr(self, "veda_attention"):
+        self.veda_attention.begin_forward(layout, (latent_t, latent_h // self.patch_size[1], latent_w // self.patch_size[2]), payload, device, dtype)
+    if hasattr(self, "vsa_attention"):
+        self.vsa_attention.begin_forward(layout, (latent_t, latent_h // self.patch_size[1], latent_w // self.patch_size[2]), payload, device, dtype)
+    _refuse_global_attention(self)  # USP delta
+    # VDN is refused above, so upstream's `if not hasattr(self.blocks[0].attn, "vdn")` always holds.
+    rope = kernels.prepare_split_half_rope(rope)
+    # (USP delta: no control stream setup -- control_rows is refused above.)
 
     # ---- USP delta: shard the sequence across ranks --------------------
     _assert_ranks_agree(hidden)
@@ -276,27 +397,33 @@ def _usp_forward(self, video_x, audio_x, sigma_video, sigma_audio, context, payl
     lo, hi = bounds[_S.rank], bounds[_S.rank + 1]
     hidden = hidden[lo:hi].contiguous()
     shard_segments = _shard_segments(segments, lo, hi)
-    shard_rope = rope[:, lo:hi] if rope is not None else None
+    # rope is [1, seq, 1, pairs, 2], or (that, its Kitchen-packed twin [1, seq, 1, pairs, 2, 2]).
+    shard_rope = tuple(table[:, lo:hi] for table in rope) if isinstance(rope, tuple) else rope[:, lo:hi]
     _S.bounds = bounds
     try:
-        for block in self.blocks:
-            self._check_interrupt()
-            h_list = [hidden]
-            hidden = None
-            hidden = block(h_list, temb, shard_segments, shard_rope)
+        with cuda_graphs.scope():  # _usp_graph_gate keeps every block eager
+            for block_index in range(len(self.blocks)):
+                self._check_interrupt()
+                block = self.blocks[block_index]
+                block_temb = ref2va_temb if ref2va_temb is not None and self.hybrid_ref2va_blocks[0] <= block_index <= self.hybrid_ref2va_blocks[1] else temb
+                h_list = [hidden]
+                hidden = None
+                hidden = block(h_list, block_temb, shard_segments, shard_rope)
     finally:
         _S.bounds = None
+    del shard_rope
     hidden = _gather_seq(hidden, bounds)
     # ---- end USP delta: from here identical on every rank --------------
 
-    video_row = int(timestep_indices[video_start])
     audio_row = int(timestep_indices[audio_start + min(layout.num_target_condition_audio_latents,
                                                        max(audio_t - 1, 0))])
     h_list = [hidden]
     hidden = None
-    video, audio = self.final_layer(h_list, temb, (video_start, layout.sequence_length, video_row),
+    video, audio = self.final_layer(h_list, temb, (video_start, layout.sequence_length, video_head_row),
                                     (audio_start, video_start, audio_row))
-    del temb, rope, timestep_indices
+    del temb, ref2va_temb, rope, timestep_indices
+    if target_video_inverse_order is not None:
+        video = video.index_select(0, target_video_inverse_order)
     video = T._to_dtype([video], video_dtype)
     audio = T._to_dtype([audio], audio_dtype)
     return (T.unpatchify_video_tokens(video, latent_t, latent_h, latent_w, self.latents_dim, self.patch_size),
@@ -305,6 +432,7 @@ def _usp_forward(self, video_x, audio_x, sigma_video, sigma_audio, context, payl
 
 _ORIG_FORWARD = None
 _ORIG_SOL_CALL = None
+_ORIG_QKV_ATTENTION = None
 
 
 def activate() -> int:
@@ -313,7 +441,7 @@ def activate() -> int:
     Call BEFORE the model loads (class-level patch — instances inherit it).
     Returns this process's rank. Safe to call when WORLD_SIZE is unset or 1:
     patches become passthroughs."""
-    global _ORIG_FORWARD, _ORIG_SOL_CALL
+    global _ORIG_FORWARD, _ORIG_SOL_CALL, _ORIG_QKV_ATTENTION
 
     world = int(os.environ.get("WORLD_SIZE", "1"))
     _S.world = world
@@ -328,6 +456,9 @@ def activate() -> int:
             raise RuntimeError(f"world size {world} must divide {heads} attention heads")
     _S.enabled = world > 1
 
+    from mmgp import cuda_graphs
+    from shared import attention_kit
+
     from . import transformer as T
     from .sol_attention import MiniMaxH3SolAttention
     if _ORIG_FORWARD is None:
@@ -336,4 +467,10 @@ def activate() -> int:
     if _ORIG_SOL_CALL is None:
         _ORIG_SOL_CALL = MiniMaxH3SolAttention.__call__
         MiniMaxH3SolAttention.__call__ = _usp_attention_call
+    if _ORIG_QKV_ATTENTION is None:
+        # transformer.py calls attention_kit.qkv_attention through the module, so
+        # rebinding the module attribute reaches every block.
+        _ORIG_QKV_ATTENTION = attention_kit.qkv_attention
+        attention_kit.qkv_attention = _usp_qkv_attention
+    cuda_graphs.register_gate(_usp_graph_gate)
     return _S.rank

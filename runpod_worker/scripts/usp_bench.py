@@ -214,11 +214,17 @@ def main() -> int:
         ``self.sol_attention(qkv_list, use_sol)`` branch, and that lands on the
         SEPARATE reference bound in sol_attention.py. Wrapping only the first
         one probed the TokenRefiner instead of the 50 DiT blocks -- which is
-        how a sage2 leg came back reporting "sdpa"."""
+        how a sage2 leg came back reporting "sdpa".
+
+        Since upstream's attention_kit rework, blocks whose qkv_proj MMGP split
+        into q/k/v (``qkv_splitting``, the MiniMax H3 default) call
+        ``attention_kit.qkv_attention`` instead (transformer.py:220), which may
+        attend through staged Sage kernels and never touch either
+        ``pay_attention`` reference -- so that entry point is wrapped too."""
         from mmgp import offload  # noqa: PLC0415
 
-        def wrap(module, label):
-            original = getattr(module, "pay_attention", None)
+        def wrap(module, label, attr="pay_attention"):
+            original = getattr(module, attr, None)
             if original is None:
                 return
 
@@ -232,24 +238,28 @@ def main() -> int:
                 )
                 return original(qkv_list, *a, **kw)
 
-            module.pay_attention = probing
+            setattr(module, attr, probing)
 
         try:
+            from shared import attention_kit as K  # noqa: PLC0415
             from models.minimax_h3 import sol_attention as S  # noqa: PLC0415
             from models.minimax_h3 import transformer as T  # noqa: PLC0415
 
-            wrap(S, "sol_attention")   # the real DiT path for this model
+            wrap(K, "attention_kit", "qkv_attention")  # split q/k/v DiT path (default)
+            wrap(S, "sol_attention")   # fused qkv_proj DiT path ("Lower RAM" config)
             wrap(T, "transformer")     # TokenRefiner / any non-sol block
         except Exception as exc:  # noqa: BLE001 - never fail a bench over a probe
             _kernel["mode"] = f"probe_failed: {exc!r}"
 
     def probe_attention():
-        """The DiT's kernel, not the TokenRefiner's: sol_attention.py is the
-        module MiniMax H3's 50 blocks route through."""
+        """The DiT's kernel, not the TokenRefiner's: attention_kit (split q/k/v)
+        or sol_attention.py (fused qkv_proj) is what MiniMax H3's 50 blocks
+        route through."""
         if "mode" in _kernel:          # probe_failed sentinel
             return _kernel["mode"]
         by_module = _kernel.get("by_module") or {}
-        return by_module.get("sol_attention") or by_module.get("transformer")
+        return (by_module.get("attention_kit") or by_module.get("sol_attention")
+                or by_module.get("transformer"))
 
     effective = installed = supported = None
     try:
