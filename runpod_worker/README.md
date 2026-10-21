@@ -468,8 +468,8 @@ The findings behind that table, in the order they cost time to learn:
   `--attention` overwrite `server_config`, and the image bakes
   `--attention sdpa`. Setting only `WANGP_ATTENTION=sage2` silently runs sdpa
   (see (a)); set `WANGP_CLI_ARGS` to match. SageAttention also needs a wheel
-  built for the target architecture -- the one in `artifacts/` is sm_120
-  (Blackwell) only.
+  built for the target architecture; the image compiles one with
+  `--build-arg WITH_SAGE=1`.
 - **`libx264_23` exists for API delivery.** WanGP's `libx264_8` is CRF 10,
   near-lossless: measured clips ran 2.6 MB (static) to 9.2 MB (high motion),
   base64 inflates by 4/3, and RunPod caps payloads at 10 MB -- so base64
@@ -1325,6 +1325,5 @@ in this repo**; a Ref2VA endpoint runs at 20 steps.
 | `scripts/test_usp_gloo.py` | 2-process gloo proof that Ulysses SP is numerically exact vs full SDPA. Needs torch, so it is not in the CPU suite. |
 | `webdemo/index.html` | Single-file browser tester for a live endpoint: paste endpoint id + API key, submit, poll, play. No build step and no server — `api.runpod.ai` sends `access-control-allow-origin: *`. The tracked copy keeps `DEFAULT_KEY` empty on purpose. |
 | `webdemo/serve.py` | Serves `webdemo/` over http. Safari and Firefox refuse cross-origin requests from `file://` pages while Chrome allows them, so the same file works or silently does nothing depending on the browser; http has no such special case. |
-| `artifacts/*.whl` | **Temporary.** An sm_120-only SageAttention build, installed at boot until the image carries it. Delete before merge — see `artifacts/README.md`. |
 | `tests/` | CPU-only test suite: `test_schema.py`, `test_media.py`, `test_wgp_config_drift.py`, `test_handler.py` (end-to-end `run_job` with a stubbed engine), `test_engine.py` (the drain loop with a fake job), `test_obs.py`, `test_usp_drift.py` (hash-pins the `MiniMaxH3Model.forward` that `usp.py` mirrors). No GPU, no torch, no weights, no network. |
 | `../.github/workflows/worker-ci.yml` | The Tier-1 suite plus hadolint, on every PR touching this directory. |
