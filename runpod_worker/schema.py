@@ -27,6 +27,7 @@ loading 20-33B of weights. Every rule below is cited to the line it mirrors.
 
 from __future__ import annotations
 
+import ast
 import copy
 import json
 import math
@@ -294,8 +295,8 @@ FIRST_BLOCK_CACHE_THRESHOLDS: tuple[float, ...] = (0.06, 0.08, 0.10, 0.12, 0.14)
 # ``resolution``/``flow_shift`` (``wgp.py:3155-3164``) -- 18-20 keys. ``seed``,
 # ``activated_loras``, ``frames_positions``, ``masking_strength``,
 # ``skip_steps_cache_type``, ``negative_prompt``, ``config`` and
-# ``override_attention`` are all ABSENT from it. The real universe is
-# ``models/_settings.json`` (112 keys), merged in by ``clean_settings``
+# ``overrides`` are all ABSENT from it. The real universe is
+# ``models/_settings.json`` (118 keys), merged in by ``clean_settings``
 # (``wgp.py:1747-1760``).
 #
 # The list is baked rather than read at import so this module does zero I/O and
@@ -315,6 +316,7 @@ _PRIMARY_SETTINGS_KEYS: tuple[str, ...] = (
     "audio_guidance_scale",
     "audio_guide",
     "audio_guide2",
+    "audio_guide3",
     "audio_prompt_type",
     "audio_scale",
     "audio_source",
@@ -351,7 +353,6 @@ _PRIMARY_SETTINGS_KEYS: tuple[str, ...] = (
     "input_video_strength",
     "keep_frames_video_guide",
     "keep_frames_video_source",
-    "keep_intermediate_sliding_windows",
     "loras_multipliers",
     "mask_expand",
     "masking_strength",
@@ -363,9 +364,9 @@ _PRIMARY_SETTINGS_KEYS: tuple[str, ...] = (
     "multi_prompts_gen_type",
     "negative_prompt",
     "num_inference_steps",
+    "num_inference_steps2",
     "output_filename",
-    "override_attention",
-    "override_profile",
+    "overrides",
     "pause_seconds",
     "perturbation_end_perc",
     "perturbation_layers",
@@ -397,6 +398,10 @@ _PRIMARY_SETTINGS_KEYS: tuple[str, ...] = (
     "sliding_window_overlap_noise",
     "sliding_window_size",
     "sliding_window_trim_first_frames",
+    "spatial_upsampler_param",
+    "spatial_upsampler_param2",
+    "spatial_upsampler_prompt",
+    "spatial_upsampler_reference_images",
     "spatial_upsampling",
     "speakers_locations",
     "sub_parallel_window_overlap",
@@ -409,6 +414,7 @@ _PRIMARY_SETTINGS_KEYS: tuple[str, ...] = (
     "top_p",
     "video_guide",
     "video_guide2",
+    "video_guide3",
     "video_guide_outpainting",
     "video_guide_outpainting_ratio",
     "video_length",
@@ -1649,6 +1655,7 @@ def parse(
         )
 
     _apply_config_selection(settings, user, cfg, mdef)
+    _validate_overrides(user)
     _validate_frames(settings, user, mdef, cfg, warnings)
     _validate_resolution(settings, mdef)
     _validate_solver_and_steps(settings, user, mdef, warnings)
@@ -1703,6 +1710,57 @@ def parse(
 _DEFAULT_VIDEO_LENGTH = 124
 #: ``wgp.py:3159`` -- "1280x720" if the model name says 720, else "832x480".
 _DEFAULT_RESOLUTION = "832x480"
+
+
+#: The ``overrides`` names a caller may set. Upstream folded the per-generation
+#: ``override_attention`` / ``override_profile`` settings into one ``overrides``
+#: string (``shared/utils/generation_overrides.py``: ``name=value`` pairs, e.g.
+#: ``"attention_mode='sol', memory_profile=4"``); these two are exactly what the
+#: worker accepted before. The string can also name ``compilation``,
+#: ``transformer_quantization`` and ``text_encoder_quantization``, which reload
+#: the model per request (and a quantization switch can mean a weight download
+#: on the billed request path) -- those stay refused until someone decides to
+#: expose them.
+OVERRIDE_NAMES_ALLOWED: frozenset[str] = frozenset({"attention_mode", "memory_profile"})
+
+
+def _validate_overrides(user: Mapping[str, Any]) -> None:
+    """Parse a caller's ``overrides`` the way ``generation_overrides.parse_overrides``
+    does (``f(<text>)`` keyword arguments of literals) and allow only
+    :data:`OVERRIDE_NAMES_ALLOWED`. Mirrored, not imported: ``shared.utils``
+    pulls diffusers in at package import."""
+    if "overrides" not in user:
+        return
+    text = user["overrides"]
+    if text is None:
+        return
+    if not isinstance(text, str):
+        raise WorkerError(INVALID_SETTING, "settings.overrides must be a string of name=value pairs")
+    if not text.strip():
+        return
+    try:
+        call = ast.parse(f"f({text})", mode="eval").body
+        if not isinstance(call, ast.Call) or call.args or any(kw.arg is None for kw in call.keywords):
+            raise SyntaxError
+        names = [kw.arg for kw in call.keywords]
+        for kw in call.keywords:
+            ast.literal_eval(kw.value)
+        if len(set(names)) < len(names):
+            raise SyntaxError
+    except (SyntaxError, ValueError):
+        raise WorkerError(
+            INVALID_SETTING,
+            "settings.overrides must be name=value pairs separated by commas, "
+            "such as \"attention_mode='sol'\"",
+            details=[f"got {text!r}"],
+        ) from None
+    refused = sorted(set(names) - OVERRIDE_NAMES_ALLOWED)
+    if refused:
+        raise WorkerError(
+            INVALID_SETTING,
+            f"settings.overrides may only set {sorted(OVERRIDE_NAMES_ALLOWED)} on this endpoint",
+            details=[f"refused: {refused}"],
+        )
 
 
 def _apply_config_selection(

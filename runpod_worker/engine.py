@@ -655,7 +655,9 @@ def warm(model_type: str | None = None, *, config_id: str | None = None) -> dict
     The gate also compares ``profile`` and ``config``, so both are computed the
     same way ``generate_media`` computes them: ``output_type`` from
     ``get_profile_type_for_model(model_type, image_mode=0)`` and
-    ``override_profile`` from the model's own default settings.
+    ``override_profile`` from the model's own default settings (the
+    ``memory_profile`` of their ``overrides`` string, ``wgp.py:7213-7214``; older
+    defaults carried a separate ``override_profile`` key).
     """
     global _WARMED_TYPE
     sess = _boot_locked()
@@ -673,8 +675,13 @@ def warm(model_type: str | None = None, *, config_id: str | None = None) -> dict
         # filesystem is a boot-time failure, not a request-time one.
         defaults = sess.get_default_settings(model_type)
         try:
-            override_profile = int(defaults.get("override_profile", -1))
-        except (TypeError, ValueError):
+            if "override_profile" in defaults:  # defaults saved before upstream folded it into overrides
+                override_profile = int(defaults["override_profile"])
+            else:
+                from shared.utils.generation_overrides import get_override  # noqa: PLC0415
+
+                override_profile = int(get_override(defaults.get("overrides") or "", "memory_profile"))
+        except (ImportError, TypeError, ValueError):
             override_profile = -1
         selection = config_id if config_id is not None else (
             C.CONFIG.model_config or defaults.get("config") or ""
