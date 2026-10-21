@@ -3,7 +3,7 @@
 
 Why this is exact rather than an approximation
 ----------------------------------------------
-``AutoencoderKLMiniMaxH3._decode`` (components/video_autoencoder.py:895) is a
+``AutoencoderKLMiniMaxH3._decode`` (components/video_autoencoder.py:939) is a
 loop over INDEPENDENT temporal chunks::
 
     for i in range(num_chunks):
@@ -65,7 +65,9 @@ def activate() -> None:
         return
     _ORIGINAL_DECODE = MiniMaxH3VideoVAE.decode
 
-    def decode(self, latents):
+    # MiniMaxH3VideoVAE.decode(latents, uint8_rounding=None): the pipeline passes
+    # uint8_rounding positionally (pipeline.py:1737), so forward whatever follows.
+    def decode(self, latents, *args, **kwargs):
         need = _tail_tokens(self)
         # Guard the assumption rather than trusting it: a latent length that is
         # not 2 (mod 5) means the geometry changed upstream and the tail slice
@@ -76,8 +78,8 @@ def activate() -> None:
                                       / int(self.temporal_compression_ratio))
         aligned = (available + int(self.config.token_drop)) % tokens_chunk_size == 0
         if available <= need or not aligned:
-            return _ORIGINAL_DECODE(self, latents)
-        return _ORIGINAL_DECODE(self, latents[:, :, -need:])
+            return _ORIGINAL_DECODE(self, latents, *args, **kwargs)
+        return _ORIGINAL_DECODE(self, latents[:, :, -need:], *args, **kwargs)
 
     MiniMaxH3VideoVAE.decode = decode
 
