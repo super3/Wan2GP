@@ -15,13 +15,19 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
 
-#: sha256 of MiniMaxH3Model.forward's source at the revision usp.py mirrors.
-MIRRORED_FORWARD_SHA256 = "93f9a95b5e6297b2b337a38d592944a9c28a5da58370456119f7de2ab6763f69"
+#: sha256 of MiniMaxH3Model.forward's source at the revision usp.py mirrors
+#: (upstream dee6635).
+MIRRORED_FORWARD_SHA256 = "c7ff3a3d9124eaa78dc79f739b8ad5720d7d8c41986527de42be59ec65bfd429"
 
 
 def _forward_source() -> str:
     src = (REPO / "models" / "minimax_h3" / "transformer.py").read_text()
-    match = re.search(r"    def forward\(self, video_x.*?(?=\n\n__all__|\nclass |\Z)", src, re.S)
+    # Search from the class, not the file start: upstream added
+    # InputPreparation.forward(self, video_x, ...) above it, which a file-wide
+    # search matches first -- the guard would then pin the wrong function.
+    start = src.find("\nclass MiniMaxH3Model(")
+    assert start >= 0, "class MiniMaxH3Model not found — the anchor needs updating"
+    match = re.compile(r"    def forward\(self, video_x.*?(?=\n\n__all__|\nclass |\Z)", re.S).search(src, start)
     assert match, "MiniMaxH3Model.forward not found — the anchor regex needs updating"
     return match.group(0)
 
