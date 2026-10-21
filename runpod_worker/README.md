@@ -369,7 +369,8 @@ inferred.
   `get_attention_modes()` lists it), and **sol is not a global attention mode
   at all** -- `shared/attention.py:28-33` keeps it in
   `ATTENTION_MODE_AVAILABILITY`, "exposed only by per-generation overrides",
-  so it must be passed as the per-job `override_attention` setting; set
+  so it must be passed per job (since upstream folded `override_attention`
+  into one `overrides` string: `"overrides": "attention_mode='sol'"`); set
   globally it is ignored without warning. `usp_bench.py` now probes
   `offload.shared_state["_attention"]` after a generation and reports
   `attention_ok` so a fallback can never be reported as a measurement.
