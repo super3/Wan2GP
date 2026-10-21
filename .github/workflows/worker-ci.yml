@@ -42,6 +42,8 @@ on:
       - 'models/**'
       - 'defaults/**'
       - 'profiles/minimax_h3/**'
+      - 'profiles/minimax_h3_fl2va/**'
+      - 'profiles/minimax_h3_ref2va/**'
       - '.github/workflows/worker-ci.yml'
   push:
     paths:
@@ -54,6 +56,8 @@ on:
       - 'models/**'
       - 'defaults/**'
       - 'profiles/minimax_h3/**'
+      - 'profiles/minimax_h3_fl2va/**'
+      - 'profiles/minimax_h3_ref2va/**'
       - '.github/workflows/worker-ci.yml'
 
 permissions:
