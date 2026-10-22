@@ -341,8 +341,9 @@ def board_prompt(plan: dict, board: dict) -> str:
     if anchored:
         lines.append("<Picture 1> is the first frame of the target video at 0.00 seconds.")
     lines += definitions or ["N/A"]
-    tags = " + ".join((["keyframe completion"] if anchored else []) + ["reference generation"])
-    lines += ["summary:", f"[{tags}] A storyboard of {len(shots)} separate moments from one story in one consistent world, "
+    tags = (["keyframe completion"] if anchored else []) + (["reference generation"] if ids else [])
+    tag = f"[{' + '.join(tags)}] " if tags else ""  # a text-only board has no reference relationship to declare
+    lines += ["summary:", f"{tag}A storyboard of {len(shots)} separate moments from one story in one consistent world, "
               "joined by hard cuts. Each shot is a held, nearly still frame with a locked-off camera."]
     lines.append("retention_analysis:")
     if anchored:
@@ -466,6 +467,21 @@ def build_jobs(plan: dict, out: Path, soundtrack_seconds: float | None = None) -
     return jobs, boards
 
 
+WARMUP_PROMPT = "\n".join([
+    "subject_definitions:", "N/A", "summary:", "A short shot of a calm sea.", "retention_analysis:", "N/A", "detailed_description:",
+    "The target video is a calm grey sea under an overcast sky, small waves rolling slowly toward the camera.",
+    "overall_soundscape: Soft waves.", "non_diegetic_music: N/A"])
+
+
+def warmup_job(plan: dict, out: Path, worker: int) -> dict:
+    """The shortest text-only generation: loads the model on a GPU that would otherwise idle (while a storyboard
+    renders), so its first clip does not pay the model load."""
+    rule = plan["frames_rule"]
+    return {"id": f"warmup{worker}", "kind": "warmup", "index": worker, "priority": [2, worker], "deps": [], "label": "warmup",
+            "seconds": rule["minimum"] / rule["fps"], "settings": _base_settings(plan, WARMUP_PROMPT, rule["minimum"], plan["seed"]),
+            "output": str(Path(out) / "workers" / f"worker{worker}" / "warmup.mp4"), "extract": []}
+
+
 # ------------------------------------------------------------------------------------------------------- scheduling
 class Scheduler:
     """Dependency-aware dispatch order shared by the live run and the --dry-run estimate: storyboards first (they gate
@@ -493,25 +509,34 @@ class Scheduler:
         return [job_id for job_id, state in self.state.items() if state == "running"]
 
 
-def simulate(jobs: list[dict], workers: int, job_seconds, load_s: float = 0.0, serial_first: bool = True) -> dict[str, float]:
-    """When every job would finish on `workers` GPUs, `job_seconds(job)` each, plus `load_s` on a GPU's first job;
-    `serial_first` holds the other GPUs until the first job finishes, as run() does."""
+def simulate(jobs: list[dict], workers: int, job_seconds, load_s: float = 0.0, serial_first: bool = True,
+             warmup_s: float | None = None) -> dict[str, float]:
+    """When every job would finish on `workers` GPUs, `job_seconds(job)` each, plus `load_s` on a GPU's first job.
+    As in run(): `serial_first` holds the other GPUs until the first job finishes, and with `warmup_s` a cold GPU with
+    nothing to run spends load_s + warmup_s loading the model."""
     scheduler, idle, warm, running, now, done_at = Scheduler(jobs), list(range(workers)), set(), [], 0.0, {}
     while True:
         while idle and not (serial_first and not done_at and running):
             job = scheduler.next_ready()
             if job is None:
                 break
+            idle.sort(key=lambda w: (w not in warm, w))  # a loaded model first, as run() does
             worker = idle.pop(0)
             scheduler.mark(job["id"], "running")
             cost = job_seconds(job) + (0.0 if worker in warm else load_s)
             warm.add(worker)
             heapq.heappush(running, (now + cost, job["id"], worker))
+        if warmup_s is not None and not (serial_first and not done_at) and scheduler.next_ready() is None:
+            for worker in [w for w in idle if w not in warm]:
+                idle.remove(worker)
+                warm.add(worker)
+                heapq.heappush(running, (now + load_s + warmup_s, f"warmup{worker}", worker))
         if not running:
             return done_at
         now, job_id, worker = heapq.heappop(running)
-        scheduler.mark(job_id, "done")
-        done_at[job_id] = now
+        if not job_id.startswith("warmup"):
+            scheduler.mark(job_id, "done")
+            done_at[job_id] = now
         idle.append(worker)
 
 
@@ -533,12 +558,14 @@ def playback(ready_at: list[float], durations: list[float], prebuffer: int = 1) 
     return {"first_frame_s": first, "stall_s": stall, "stalls": stalls, "end_s": clock, "starts": starts}
 
 
-def estimate(jobs: list[dict], gpu_counts, scale: float = 1.0, load_s: float = 0.0, prebuffer: int = 1) -> list[dict]:
+def estimate(jobs: list[dict], gpu_counts, scale: float = 1.0, load_s: float = 0.0, prebuffer: int = 1,
+             parallel_start: bool = False, warmup: bool = True, warmup_frames: int = H3_FRAMES["minimum"]) -> list[dict]:
     clips = [job for job in jobs if job["kind"] == "clip"]
     durations = [job["seconds"] for job in clips]
+    warmup_s = estimate_gen_s(warmup_frames / H3_FRAMES["fps"], scale) if warmup else None
     rows = []
     for count in gpu_counts:
-        done_at = simulate(jobs, count, lambda job: estimate_gen_s(job["seconds"], scale), load_s)
+        done_at = simulate(jobs, count, lambda job: estimate_gen_s(job["seconds"], scale), load_s, not parallel_start, warmup_s)
         play = playback([done_at[job["id"]] for job in clips], durations, prebuffer)
         rows.append({"gpus": count, "first_frame_s": play["first_frame_s"], "stall_s": play["stall_s"],
                      "render_s": max(done_at.values()), "video_s": sum(durations)})
@@ -858,7 +885,8 @@ def prepare_audio(plan: dict, out: Path, ffmpeg: str) -> tuple[float | None, str
 
 
 def run(plan: dict, out: Path, gpus: list[str], backend: str = "wangp", wangp_root: Path = WANGP_ROOT, retries: int = 1,
-        hls: bool = True, prebuffer: int = 1, fake_seconds: float = 0.0, parallel_start: bool = False, log=print) -> dict:
+        hls: bool = True, prebuffer: int = 1, fake_seconds: float = 0.0, parallel_start: bool = False, warmup: bool = True,
+        log=print) -> dict:
     out = Path(out).resolve()
     if plan["missing_files"] and backend != "fake":
         raise PlanError("missing files:\n  " + "\n  ".join(plan["missing_files"]))
@@ -891,6 +919,8 @@ def run(plan: dict, out: Path, gpus: list[str], backend: str = "wangp", wangp_ro
     # downloads into the shared checkpoint folder would collide. Every clip waits for the first storyboard anyway.
     gated = not parallel_start
 
+    known = dict(scheduler.jobs)  # graph jobs plus the warmups sent below
+
     def stamp() -> str:
         return f"[{time.monotonic() - started:7.1f}s]"
 
@@ -903,7 +933,8 @@ def run(plan: dict, out: Path, gpus: list[str], backend: str = "wangp", wangp_ro
 
     try:
         while not scheduler.finished():
-            for info in workers.values():
+            # warm workers (model already loaded) take the most urgent job first
+            for info in sorted(workers.values(), key=lambda item: (not item.get("warm"), item["name"])):
                 if gated and scheduler.running():
                     break
                 if info["ready"] and info["job"] is None:
@@ -914,6 +945,13 @@ def run(plan: dict, out: Path, gpus: list[str], backend: str = "wangp", wangp_ro
                     info["job"], info["started"] = job["id"], time.monotonic()
                     info["inbox"].put(job)
                     log(f"{stamp()} {info['name']} starts {job['label']} ({job['seconds']:.1f} s)")
+            if warmup and not gated and scheduler.next_ready() is None:
+                for worker, info in workers.items():
+                    if info["ready"] and info["job"] is None and not info.get("warm"):
+                        job = known.setdefault(f"warmup{worker}", warmup_job(plan, out, worker))
+                        info["job"] = job["id"]
+                        info["inbox"].put(job)
+                        log(f"{stamp()} {info['name']} loads the model (warmup)")
             try:
                 message = outbox.get(timeout=1.0)
             except queue.Empty:
@@ -928,11 +966,17 @@ def run(plan: dict, out: Path, gpus: list[str], backend: str = "wangp", wangp_ro
                     info["ready"] = True
                     log(f"{stamp()} {info['name']} worker ready")
                 elif kind == "progress":
-                    log(f"{stamp()} {info['name']} {scheduler.jobs[message['job']]['label']}: {message['phase']}")
+                    log(f"{stamp()} {info['name']} {known[message['job']]['label']}: {message['phase']}")
+                elif kind in ("done", "failed") and known[message["job"]]["kind"] == "warmup":
+                    info["job"], info["warm"] = None, True  # a failed warmup is not retried: the worker's first job will show it
+                    end = time.monotonic() - started
+                    records[message["job"]] = {"label": "warmup", "gpu": info["gpu"], "worker": worker, "start_s": round(end - message["seconds"], 2),
+                                               "end_s": round(end, 2), "seconds": round(message["seconds"], 2), "status": kind}
+                    log(f"{stamp()} {info['name']} warmup {kind} in {message['seconds']:.1f} s" + (f": {message['error']}" if kind == "failed" else ""))
                 elif kind == "done":
                     job = scheduler.jobs[message["job"]]
                     scheduler.mark(job["id"], "done")
-                    info["job"], gated = None, False
+                    info["job"], info["warm"], gated = None, True, False
                     end = time.monotonic() - started
                     records[job["id"]] = {"label": job["label"], "gpu": info["gpu"], "worker": worker,
                                           "start_s": round(end - message["seconds"], 2), "end_s": round(end, 2),
@@ -949,7 +993,7 @@ def run(plan: dict, out: Path, gpus: list[str], backend: str = "wangp", wangp_ro
                     log(f"{stamp()} {info['name']} worker lost: {message['error']}")
                     if message.get("trace"):
                         log(message["trace"])
-                    if info["job"] is not None:
+                    if info["job"] is not None and info["job"] in scheduler.jobs:
                         requeue(info["job"], info["name"], message["error"])
                     if not workers:
                         raise RunError("no GPU worker left")
@@ -984,7 +1028,8 @@ def run(plan: dict, out: Path, gpus: list[str], backend: str = "wangp", wangp_ro
     return report
 
 
-def dry_run(plan: dict, out: Path, gpus: int, scale: float, load_s: float, prebuffer: int, log=print) -> list[dict]:
+def dry_run(plan: dict, out: Path, gpus: int, scale: float, load_s: float, prebuffer: int, parallel_start: bool = False,
+            warmup: bool = True, log=print) -> list[dict]:
     jobs, boards = build_jobs(plan, out)
     out.mkdir(parents=True, exist_ok=True)
     (out / "jobs.json").write_text(json.dumps(jobs, indent=1), encoding="utf-8")
@@ -1002,8 +1047,9 @@ def dry_run(plan: dict, out: Path, gpus: int, scale: float, load_s: float, prebu
     for job in jobs[:1] + [job for job in jobs if job["kind"] == "clip"][:1]:
         log(f"\n--- {job['label']} prompt ---\n{job['settings']['prompt']}")
     counts = sorted({1, 2, 3, 4, 5, 6, 8, gpus})
-    rows = estimate(jobs, counts, scale, load_s, prebuffer)
-    log(f"\nestimate from warm RTX 5090 times x{scale} (cold load {load_s} s per GPU), playback starts after {prebuffer} clip(s):")
+    rows = estimate(jobs, counts, scale, load_s, prebuffer, parallel_start, warmup, plan["frames_rule"]["minimum"])
+    log(f"\nestimate from warm RTX 5090 times x{scale} (cold load {load_s} s per GPU, warmups {'on' if warmup else 'off'}, "
+        f"{'parallel start' if parallel_start else 'first job alone'}), playback starts after {prebuffer} clip(s):")
     log("  GPUs  first clip live  stalls  render done  (film length)")
     for row in rows:
         mark = "  <- realtime" if row["stall_s"] <= 0.0 else ""
@@ -1025,6 +1071,8 @@ def main(argv=None) -> int:
     parser.add_argument("--retries", type=int, default=1, help="retries per failed job before the run stops")
     parser.add_argument("--parallel-start", action="store_true",
                         help="do not hold the other GPUs until the first job finishes (only when the weights are already downloaded)")
+    parser.add_argument("--no-warmup", action="store_true",
+                        help="do not load the model on idle GPUs with a short warmup generation (see --parallel-start)")
     parser.add_argument("--no-hls", action="store_true", help="skip the HLS playlist; still stitch film.mp4")
     parser.add_argument("--prebuffer", type=int, default=1, help="clips buffered before playback starts (report and estimate)")
     parser.add_argument("--est-scale", type=float, default=1.0, help="dry run: scale the measured RTX 5090 times (1.2 = 20%% slower host)")
@@ -1034,12 +1082,13 @@ def main(argv=None) -> int:
     try:
         plan = load_plan(args.plan)
         if args.dry_run:
-            dry_run(plan, Path(args.out).resolve(), len(gpus), args.est_scale, args.est_load_s, args.prebuffer)
+            dry_run(plan, Path(args.out).resolve(), len(gpus), args.est_scale, args.est_load_s, args.prebuffer,
+                    args.parallel_start, not args.no_warmup)
             return 0
         if not gpus:
             raise PlanError("--gpus lists no GPU")
         run(plan, Path(args.out), gpus, args.backend, Path(args.wangp_root), args.retries, not args.no_hls, args.prebuffer,
-            args.fake_seconds, args.parallel_start)
+            args.fake_seconds, args.parallel_start, not args.no_warmup)
         return 0
     except PlanError as exc:
         print(f"director: {exc}", file=sys.stderr)
