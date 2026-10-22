@@ -29,7 +29,8 @@ python scripts/director.py my_plan.json --out runs/rehearsal --backend fake --gp
 | `--est-scale`, `--est-load-s` | Dry run only: scale the measured times for a slower host, and add a cold model load to each GPU's first job. |
 | `--prebuffer N` | Playback starts once N clips are live (used in the stall estimate and `report.json`). |
 | `--retries N` | Each failed job is retried N times, on any free GPU, before the run stops (default 1). |
-| `--parallel-start` | Skips holding the other GPUs until the first job finishes. The hold exists because a first job may download the weights, and concurrent downloads into one checkpoint folder collide. Use this flag only when the weights are already present. |
+| `--parallel-start` | Skips holding the other GPUs until the first job finishes. The hold exists because a first job may download the weights, and concurrent downloads into one checkpoint folder collide. Use this flag only when the weights are already present. With it, warmups run while the first storyboard renders. |
+| `--no-warmup` | Turns off warmups. By default, a GPU with no model loaded and nothing to run (for example while a storyboard renders) runs the shortest text-only generation (107 frames) to load the model, so its first clip does not pay the load. |
 | `--no-hls` | Skips the playlist and still writes `film.mp4`. |
 | `--backend fake` | No GPU and no WanGP import. Checks that every input a job names exists, then renders a test pattern of the right length. |
 
@@ -37,7 +38,9 @@ Watch the stream while it renders. `ffplay runs/signal/stream/playlist.m3u8` or 
 
 ## The plan
 
-Paths are relative to the plan file. See `scripts/director_example_plan.json` for a complete six-clip, one-minute example.
+Paths are relative to the plan file. Two complete six-clip, one-minute examples are included:
+- `scripts/director_example_plan.json` uses reference images for a character and a place.
+- `scripts/director_example_textonly_plan.json` needs no assets. It describes its character the same way in every shot, and the single storyboard generation keeps the look consistent.
 
 ```json
 {
@@ -121,6 +124,8 @@ In kept mode, a clip that starts after the soundtrack ends generates its own aud
 The dry-run estimate replays the real scheduler using warm RTX 5090 times for FastH3 Omni NVFP4 at 832×480: 5 s → 16.5 s, 10 s → 31.3 s, 15 s → 62.6 s. For the one-minute example (one 6.6 s storyboard, then six 10 s clips), it shows:
 - 3 GPUs stall about 1 s.
 - 4 GPUs stream without a stall, with the first clip live about 52 s after launch.
+
+Add cold model loads with `--est-load-s`. Pass `--parallel-start` when the weights are present, so idle GPUs warm up while the storyboard renders. Without it, each GPU's first clip pays the load and playback stalls once.
 
 Measured times are the best case: they reuse a cached prompt and the fastest host. Keep a spare GPU, or pass `--est-scale 1.2`, until fresh-prompt timings are measured.
 
