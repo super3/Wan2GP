@@ -41,6 +41,22 @@ def test_upstream_forward_unchanged_since_usp_mirror():
     )
 
 
+#: sha256 of models/minimax_h3/vsa/attention.py at the revision usp.py's VSA support was verified against (upstream
+#: dee6635). usp._usp_vsa_call runs VSAAttention UNCHANGED on heads / world_size heads of the full sequence, which is exact
+#: only while VSA mixes nothing across heads (pooling, scores, top-k, coarse branch, scales are all per head today).
+VSA_ATTENTION_SHA256 = "b764c8049ecb2b8d3a0bbd2936f2ad60c1ae816f8d14a604c4a886c051ba4d3e"
+
+
+def test_vsa_unchanged_since_usp_verified_it_head_separable():
+    digest = hashlib.sha256((REPO / "models" / "minimax_h3" / "vsa" / "attention.py").read_text().encode()).hexdigest()
+    assert digest == VSA_ATTENTION_SHA256, (
+        "models/minimax_h3/vsa/attention.py changed. USP runs VSA per rank on a subset of the heads, so re-check that "
+        "nothing in it couples heads (or plans per call over the sequence), re-run "
+        "runpod_worker/scripts/test_usp_vsa_cpu.py (torch + triton, CPU-only), then update "
+        f"VSA_ATTENTION_SHA256 to {digest}."
+    )
+
+
 def test_usp_module_stays_torch_lazy_for_this_suite():
     # The CPU suite must stay importable without torch; usp.py needs torch at
     # module scope, so nothing in runpod_worker may import it at module scope.
