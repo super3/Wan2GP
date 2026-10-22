@@ -23,15 +23,30 @@ no ray. The method mirrors komikndr/raylight's ComfyUI port of this model:
 - after the block loop the shards are all-gathered, so the final layer and
   everything downstream is identical on every rank.
 
+FastH3's VSA (video sparse attention, ``vsa/attention.py``) runs under USP
+through the same exchange: ``VSAAttention.__call__`` is wrapped so q/k/v and
+its trained gate are traded to the full sequence for ``heads / world_size``
+heads, VSA runs UNCHANGED, and its output is traded back. That is exact
+because (1) the tile layout is planned by ``begin_forward`` over the global
+packed sequence, before sharding, and after the all-to-all each rank holds
+exactly that sequence in global row order (no padding: shards are ragged);
+(2) everything VSA computes is per head -- tile means, pooled scores, the
+per-region top-k, the coarse softmax, the INT8 / FP8 scales and key means,
+the gated scatter -- so a head subset gives those heads' single-GPU result
+(single-GPU H3 already runs VSA by groups of 7 heads). Its reductions over
+rows (key means, FP8 V ranges, pooling) need the full sequence, which the
+exchange provides. ``runpod_worker/scripts/test_usp_vsa_cpu.py`` checks all
+of it bit for bit on CPU; ``test_usp_drift.py`` pins ``vsa/attention.py``.
+
 Every rank runs the ENTIRE pipeline (text encode, VAE, sampling loop)
 redundantly and deterministically — initial latents come from a CPU
 generator seeded by the task seed, so ranks stay in lockstep without a
 command channel. Rank 0's outputs are the ones to keep.
 
 Not supported under USP (assert loudly rather than silently corrupt):
-- Sol, Veda and VSA sparse attention, and VDN hybrid attention: they plan
-  their work over the global sequence / video grid; run ``--attention sdpa``
-  or ``sage2`` on a standard H3 variant.
+- Sol and Veda sparse attention, and VDN hybrid attention: they plan their
+  work over the global sequence / video grid inside the attention call; run
+  ``--attention sdpa`` or ``sage2`` on a standard H3 variant (or VSA on FastH3).
 - ``skip_steps_cache`` variants (Spectrum / FirstBlockCache): their
   full-sequence signatures diverge per shard.
 - ControlNet-Union control streams (``payload["control_rows"]``): the control
@@ -225,15 +240,58 @@ def _usp_qkv_attention(x_list, q_proj, k_proj, v_proj, heads, head_dim, norm_rop
     if not is_active() or _S.bounds is None:
         return _ORIG_QKV_ATTENTION(x_list, q_proj, k_proj, v_proj, heads, head_dim, norm_rope,
                                    extra_proj=extra_proj, **kwargs)
-    if extra_proj is not None or kwargs.get("attention_fn") is not None:
-        raise RuntimeError("Veda / VSA sparse attention is global-sequence-based and unsupported "
+    attention_fn = kwargs.get("attention_fn")
+    if attention_fn is None and extra_proj is None:
+        kwargs["attention_fn"] = lambda qkv_list, group: _usp_heads_attention(qkv_list)
+    elif _VSA_CLASS is None or not isinstance(attention_fn, _VSA_CLASS):
+        raise RuntimeError("Veda sparse attention is global-sequence-based and unsupported "
                            "under USP; run --attention sdpa or sage2 on a standard H3 variant.")
+    # (VSA keeps its attention_fn: VSAAttention.__call__ is _usp_vsa_call, which
+    # exchanges q/k/v and the gate -- the extra projection -- itself.)
     # The all-to-all splits the heads across ranks itself and needs all of them at
-    # once: an Attention Head Split group (e.g. 7 of 56 heads) would not divide by
-    # the world size. head_split_level=0 keeps one group of all heads.
-    kwargs["attention_fn"] = lambda qkv_list, group: _usp_heads_attention(qkv_list)
+    # once: an Attention Head Split group (e.g. 7 of 56 heads, VSA's own level)
+    # would not divide by the world size. head_split_level=0 keeps one group of
+    # all heads.
     kwargs["head_split_level"] = 0
-    return _ORIG_QKV_ATTENTION(x_list, q_proj, k_proj, v_proj, heads, head_dim, norm_rope, **kwargs)
+    return _ORIG_QKV_ATTENTION(x_list, q_proj, k_proj, v_proj, heads, head_dim, norm_rope,
+                               extra_proj=extra_proj, **kwargs)
+
+
+def _usp_vsa_call(self, qkv_list, group, gate_list):
+    """Class-level wrapper for VSAAttention.__call__ (FastH3's video sparse
+    attention). Both attention routes reach it: as ``qkv_attention``'s
+    ``attention_fn`` (split q/k/v, the gate as its extra projection) and
+    directly from ``Attention.forward`` (fused ``qkv_proj``). q/k/v and the gate
+    ``[1, shard, H, D]`` take the Ulysses exchange, so VSA runs unchanged on the
+    FULL sequence -- the global row order its tile layout was planned for --
+    for this rank's ``H / world`` heads; it is head-separable (module docstring),
+    so the result is single-GPU VSA's for those heads."""
+    if not is_active() or _S.bounds is None:
+        return _ORIG_VSA_CALL(self, qkv_list, group, gate_list)
+    from shared.attention_kit import HeadGroup
+
+    bounds = _S.bounds
+    query, key, value = qkv_list
+    qkv_list.clear()
+    gate = gate_list[0]
+    gate_list.clear()
+    heads = query.shape[2]
+    if len(group.q) != heads:
+        raise RuntimeError("USP VSA needs every head in one call (head_split_level=0); "
+                           f"got a group of {len(group.q)} of {heads} heads.")
+    hpr = heads // _S.world
+    local = range(group.q.start + _S.rank * hpr, group.q.start + (_S.rank + 1) * hpr)
+    # One tensor at a time: each shard copy is released as soon as it is exchanged.
+    qkv_list = [_seq_to_heads(query, bounds)]
+    query = None
+    qkv_list.append(_seq_to_heads(key, bounds))
+    key = None
+    qkv_list.append(_seq_to_heads(value, bounds))
+    value = None
+    gate_list = [_seq_to_heads(gate, bounds)]
+    gate = None
+    output = _ORIG_VSA_CALL(self, qkv_list, HeadGroup(local, local, None), gate_list)
+    return _heads_to_seq(output, bounds)
 
 
 def _usp_graph_gate():
@@ -243,15 +301,20 @@ def _usp_graph_gate():
 
 
 def _refuse_global_attention(model):
-    """Sparse attentions plan their work over the global sequence / video grid."""
+    """Sol and Veda plan their work over the global sequence / video grid inside
+    the attention call. VSA plans in begin_forward (global layout, before the
+    shard) and attends the full sequence after the exchange: supported."""
     if model.sol_attention.enabled:
         raise RuntimeError("Sol sparse attention is global-sequence-based and unsupported "
                            "under USP; run --attention sdpa or sage2.")
-    for name in ("veda_attention", "vsa_attention"):
-        policy = getattr(model, name, None)
-        if policy is not None and policy.enabled:
-            raise RuntimeError(f"{name.split('_')[0].upper()} sparse attention is global-sequence-based "
-                               "and unsupported under USP; run a standard H3 variant.")
+    policy = getattr(model, "veda_attention", None)
+    if policy is not None and policy.enabled:
+        raise RuntimeError("VEDA sparse attention is global-sequence-based "
+                           "and unsupported under USP; run a standard H3 variant.")
+    policy = getattr(model, "vsa_attention", None)
+    if policy is not None and policy.enabled and _ORIG_VSA_CALL is None:
+        raise RuntimeError("VSA is enabled but usp.activate() could not hook VSAAttention "
+                           "(models.minimax_h3.vsa failed to import); refusing shard-local VSA.")
 
 
 def _usp_forward(self, video_x, audio_x, sigma_video, sigma_audio, context, payload,
@@ -433,6 +496,8 @@ def _usp_forward(self, video_x, audio_x, sigma_video, sigma_audio, context, payl
 _ORIG_FORWARD = None
 _ORIG_SOL_CALL = None
 _ORIG_QKV_ATTENTION = None
+_ORIG_VSA_CALL = None
+_VSA_CLASS = None
 
 
 def activate() -> int:
@@ -441,7 +506,7 @@ def activate() -> int:
     Call BEFORE the model loads (class-level patch — instances inherit it).
     Returns this process's rank. Safe to call when WORLD_SIZE is unset or 1:
     patches become passthroughs."""
-    global _ORIG_FORWARD, _ORIG_SOL_CALL, _ORIG_QKV_ATTENTION
+    global _ORIG_FORWARD, _ORIG_SOL_CALL, _ORIG_QKV_ATTENTION, _ORIG_VSA_CALL, _VSA_CLASS
 
     world = int(os.environ.get("WORLD_SIZE", "1"))
     _S.world = world
@@ -472,5 +537,14 @@ def activate() -> int:
         # rebinding the module attribute reaches every block.
         _ORIG_QKV_ATTENTION = attention_kit.qkv_attention
         attention_kit.qkv_attention = _usp_qkv_attention
+    if _ORIG_VSA_CALL is None:
+        try:  # Triton-only; without it no VSA model can load, and _refuse_global_attention guards the rest
+            from .vsa.attention import VSAAttention
+        except ImportError:
+            VSAAttention = None
+        if VSAAttention is not None:
+            _VSA_CLASS = VSAAttention
+            _ORIG_VSA_CALL = VSAAttention.__call__
+            VSAAttention.__call__ = _usp_vsa_call
     cuda_graphs.register_gate(_usp_graph_gate)
     return _S.rank
