@@ -345,7 +345,10 @@ inferred.
   suite (`runpod_worker/scripts/test_usp_gloo.py`) shows USP attention is
   numerically identical to full-sequence SDPA, and it is re-run on the bench
   host before any GPU work. Sol sparse attention and the skip-steps caches
-  raise under USP (both are global-sequence constructs).
+  raise under USP (both are global-sequence constructs). FastH3's VSA runs
+  under USP: its tile plan is global and every op in it is per head, so each
+  rank runs it unchanged on its heads of the full sequence
+  (`scripts/test_usp_vsa_cpu.py` proves it bit-exact on CPU).
   **Cost, however, moves the wrong way**: 2 GPUs bill 2x for 1.31x, so
   cents/clip goes 0.87 -> 1.32. Multi-GPU buys latency only. A single full
   RTX PRO 6000 beats 2x A40 on both axes (22.5 s, 1.06 cents/clip). Reach for
@@ -1323,7 +1326,9 @@ in this repo**; a Ref2VA endpoint runs at 20 steps.
 | `scripts/install_hooks.py` | Installs `secret_guard.py` as this clone's `pre-commit` hook. `.git/hooks` is not version controlled, so every clone opts in separately. |
 | `scripts/usp_bench.py` | Benchmark harness: drives `handler.run_job` directly for single-GPU attention/codec/VAE legs and multi-GPU USP. Pins every env var **before** importing `config` and asserts the result — see finding (a) in Inference tuning. |
 | `scripts/test_usp_gloo.py` | 2-process gloo proof that Ulysses SP is numerically exact vs full SDPA. Needs torch, so it is not in the CPU suite. |
+| `scripts/test_usp_vsa_cpu.py` | FastH3's VSA under USP, on CPU (gloo + the Triton interpreter): the real VSA kernels match a torch reference, all heads == head subsets bit for bit (VSA is head-separable), and the USP VSA hook and a tiny H3 forward with VSA reproduce single-process results bit for bit. Needs torch and triton (no GPU). |
+| `scripts/usp_fasth3_bench.py` | FastH3 Omni NVFP4 (832x480, 124 frames, one reference image, `,lightvae_int8`): 1 GPU vs `torchrun` 2-GPU USP, 1 cold + 2 warm runs each, per-phase timings, outputs compared (latents, PSNR). Drives `engine.run` (the request schema does not admit FastH3). Launch commands in its docstring. |
 | `webdemo/index.html` | Single-file browser tester for a live endpoint: paste endpoint id + API key, submit, poll, play. No build step and no server — `api.runpod.ai` sends `access-control-allow-origin: *`. The tracked copy keeps `DEFAULT_KEY` empty on purpose. |
 | `webdemo/serve.py` | Serves `webdemo/` over http. Safari and Firefox refuse cross-origin requests from `file://` pages while Chrome allows them, so the same file works or silently does nothing depending on the browser; http has no such special case. |
-| `tests/` | CPU-only test suite: `test_schema.py`, `test_media.py`, `test_wgp_config_drift.py`, `test_handler.py` (end-to-end `run_job` with a stubbed engine), `test_engine.py` (the drain loop with a fake job), `test_obs.py`, `test_usp_drift.py` (hash-pins the `MiniMaxH3Model.forward` that `usp.py` mirrors). No GPU, no torch, no weights, no network. |
+| `tests/` | CPU-only test suite: `test_schema.py`, `test_media.py`, `test_wgp_config_drift.py`, `test_handler.py` (end-to-end `run_job` with a stubbed engine), `test_engine.py` (the drain loop with a fake job), `test_obs.py`, `test_usp_drift.py` (hash-pins the `MiniMaxH3Model.forward` that `usp.py` mirrors, and the VSA attention it runs per head subset). No GPU, no torch, no weights, no network. |
 | `../.github/workflows/worker-ci.yml` | The Tier-1 suite plus hadolint, on every PR touching this directory. |
