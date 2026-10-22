@@ -174,6 +174,14 @@ class PromptTests(TempDirTest):
         self.assertIn("[Shot 1] <Picture 1> holds still.", linked)
         self.assertIn("[Shot 3] At 00:02.000, cut to shot 5 keyframe.", linked)
 
+    def test_text_only_board_declares_no_reference(self):
+        plan = self.plan(subjects=[], shots=[{"keyframe": "A lighthouse at dusk.", "action": "waves rise"}] * 2)
+        prompt = D.board_prompt(plan, D.plan_boards(plan)[0])
+        self.assert_h3_layout(prompt)
+        self.assertIn("summary:\nA storyboard of 2", prompt)
+        self.assertNotIn("<Picture", prompt)
+        self.assertNotIn("<Subject", prompt)
+
     def test_clip_prompt_picture_numbering(self):
         plan = self.plan()
         shot = plan["shots"][1]
@@ -255,6 +263,13 @@ class SchedulingTests(unittest.TestCase):
         self.assertEqual([done[f"clip{k}"] for k in range(4)], [40.0, 40.0, 70.0, 70.0])
         cold = D.simulate(self.jobs(), 2, lambda job: 10.0, load_s=5.0)
         self.assertEqual(cold["board0"], 15.0)
+        self.assertEqual(cold["clip0"], 25.0)  # clip 1 goes to the GPU that already loaded the model
+        self.assertEqual(cold["clip1"], 30.0)
+        # a parallel start lets the idle GPU load the model while the storyboard renders
+        warmed = D.simulate(self.jobs(), 2, lambda job: 10.0, load_s=5.0, serial_first=False, warmup_s=3.0)
+        self.assertEqual((warmed["board0"], warmed["clip0"], warmed["clip1"]), (15.0, 25.0, 25.0))
+        held = D.simulate(self.jobs(), 2, lambda job: 10.0, load_s=5.0, serial_first=True, warmup_s=3.0)
+        self.assertEqual(held["clip1"], 30.0)  # the first-job hold keeps warmups from running beside it
 
     def test_scheduler_priority_and_unknown_deps(self):
         jobs = self.jobs(2) + [{"id": "board1", "kind": "board", "priority": [0, 1], "deps": [], "seconds": 5}]
@@ -365,6 +380,19 @@ class FakeRunTests(TempDirTest):
             first, second = report["jobs"]["clip0"], report["jobs"]["clip1"]
             overlapped = max(first["start_s"], second["start_s"]) < min(first["end_s"], second["end_s"])
             self.assertEqual(overlapped, overlap, report["jobs"])
+
+    def test_idle_gpus_warm_up_during_the_storyboard(self):
+        plan = self.plan(subjects=[], shots=[{"keyframe": "k", "action": "a", "seconds": 4.5}] * 2)
+        report = D.run(plan, self.tmp / "run", ["0", "0"], backend="fake", fake_seconds=1.0, parallel_start=True, hls=False,
+                       log=lambda *_: None)
+        jobs = report["jobs"]
+        warmups = [job for job_id, job in jobs.items() if job_id.startswith("warmup")]
+        self.assertEqual(len(warmups), 1)  # the storyboard's worker loads the model with the storyboard itself
+        self.assertNotEqual(warmups[0]["worker"], jobs["board0"]["worker"])
+        self.assertLess(warmups[0]["start_s"], jobs["board0"]["end_s"])
+        quiet = D.run(plan, self.tmp / "run2", ["0", "0"], backend="fake", parallel_start=True, warmup=False, hls=False,
+                      log=lambda *_: None)
+        self.assertFalse([job for job in quiet["jobs"] if job.startswith("warmup")])
 
     def test_failed_job_stops_the_run(self):
         plan = self.plan(shots=[{"keyframe_image": "missing.png", "action": "a"}])
