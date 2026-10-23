@@ -1,0 +1,63 @@
+{
+  "title": "The Signal",
+  "model_type": "minimax_h3_fasth3_omni_nvfp4",
+  "resolution": "832x480",
+  "clip_seconds": 10,
+  "seed": 42,
+  "style": "a cinematic night drama shot on 35 mm film: cool teal moonlight, warm amber practical lamps, shallow depth of field, gentle film grain",
+  "subjects": [
+    {
+      "image": "refs/astronomer.png",
+      "description": "the radio astronomer from {picture}, a woman in her sixties with short grey hair, round glasses and a moss-green wool cardigan",
+      "retain": "face, hair, glasses and cardigan are retained"
+    },
+    {
+      "image": "refs/observatory.png",
+      "description": "the hilltop glass observatory from {picture}, with its brass radio receiver and domed glass roof",
+      "retain": "architecture, brass receiver and glass dome are retained"
+    }
+  ],
+  "storyboard": {"shot_seconds": 1.0, "shots_per_board": 6, "link_boards": true, "seed": 7},
+  "audio": {"mode": "generated", "cut_fade_ms": 40},
+  "end_images": "none",
+  "settings": {"config": ",lightvae_int8"},
+  "shots": [
+    {
+      "keyframe": "Wide, locked-off exterior: <Subject 2> glows on a dark hilltop under a starry sky, rain clouds gathering.",
+      "action": "the camera slowly pushes in toward the glowing dome as wind bends the grass and the first raindrops streak the glass.",
+      "soundscape": "Wind across the hilltop, distant thunder, the first raindrops on glass.",
+      "subjects": [2]
+    },
+    {
+      "keyframe": "Medium shot inside <Subject 2>: <Subject 1> sits at the brass receiver, headphones around her neck, lit by an amber lamp.",
+      "action": "<Subject 1> lifts the headphones to her ears and slowly turns the large tuning dial, listening intently while rain runs down the dome behind her.",
+      "soundscape": "Rain on the glass roof, the creak of the dial, soft radio static.",
+      "subjects": [1, 2]
+    },
+    {
+      "keyframe": "Extreme close-up of the receiver's glowing frequency needle resting between two numbers.",
+      "action": "the needle trembles, then swings sharply as the static resolves into a faint, regular pulse; a small green indicator lamp flickers on.",
+      "soundscape": "Static that resolves into a slow electronic pulse, a click as the lamp turns on.",
+      "subjects": []
+    },
+    {
+      "keyframe": "Close-up of <Subject 1>'s face in amber light, eyes wide behind her round glasses.",
+      "action": "<Subject 1> holds her breath, then leans toward the microphone and speaks quietly, her voice trembling.",
+      "soundscape": "The faint pulse in her headphones, rain, her breathing.",
+      "dialogue": [{"subject": 1, "text": "If you can hear me, answer on this frequency."}],
+      "subjects": [1]
+    },
+    {
+      "keyframe": "Wide shot inside <Subject 2>: <Subject 1> stands beside the receiver looking up through the dome at a single bright star.",
+      "action": "the bright star pulses in rhythm with the signal while <Subject 1> rises from her chair and walks slowly toward the glass, the camera tilting up with her gaze.",
+      "soundscape": "The pulse grows louder and steadier, rain softening.",
+      "subjects": [1, 2]
+    },
+    {
+      "keyframe": "Exterior wide shot: <Subject 2> on the hilltop at dawn, the storm clearing, a pale light on the horizon.",
+      "action": "the sky brightens as the clouds part; inside the dome a small amber lamp still glows, and the pulse fades to silence.",
+      "soundscape": "Birdsong at first light, dripping water, the pulse fading away.",
+      "subjects": [2]
+    }
+  ]
+}

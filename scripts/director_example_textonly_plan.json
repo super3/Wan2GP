@@ -1,0 +1,45 @@
+{
+  "title": "The Keeper",
+  "model_type": "minimax_h3_fasth3_omni_nvfp4",
+  "resolution": "832x480",
+  "clip_seconds": 10,
+  "seed": 1234,
+  "style": "a cinematic maritime drama shot on 35 mm film: storm-grey seas, cold blue dusk light against the warm amber glow of the lighthouse, wind-driven rain, gentle film grain. The keeper is a weathered man in his seventies with a short white beard, a grey wool cap and a bright yellow oilskin coat",
+  "subjects": [],
+  "storyboard": {"shot_seconds": 1.0, "shots_per_board": 6, "link_boards": true, "seed": 77},
+  "audio": {"mode": "generated", "cut_fade_ms": 40},
+  "end_images": "none",
+  "settings": {"config": ",lightvae_int8"},
+  "shots": [
+    {
+      "keyframe": "Wide establishing shot at dusk: a white stone lighthouse on a black rocky point, huge storm waves breaking below it, its lamp just beginning to glow.",
+      "action": "the lighthouse beam sweeps slowly across the darkening sea while enormous grey waves roll in and explode against the black rocks, throwing white spray high into the air. Rain slants through the frame in the wind. The camera holds wide and steady, then drifts very slowly toward the lighthouse as the lamp brightens and the clouds churn overhead.",
+      "soundscape": "Roaring surf, howling wind, heavy rain, the low hum of the lighthouse lamp."
+    },
+    {
+      "keyframe": "Medium shot inside the lamp room: the keeper in his yellow oilskin coat and grey wool cap wipes the great glass lens with a cloth, amber light on his white beard.",
+      "action": "the keeper polishes the huge glass lens in slow circles, squinting against its glow as the light rotates behind the glass and throws moving shadows across his weathered face and white beard. Rain streams down the windows behind him. He pauses, tucks the cloth into his yellow coat pocket and glances out toward the dark sea, the camera slowly pushing in on his face.",
+      "soundscape": "Rain drumming on the glass, the steady mechanical tick of the rotating lens, distant waves."
+    },
+    {
+      "keyframe": "Point-of-view shot through the rain-streaked lamp-room window: far out on the black sea, a small fishing boat with one weak light tilts on a giant wave.",
+      "action": "far out on the storm-black sea, a small fishing boat climbs a towering wave, its single masthead light swinging wildly, then disappears into a trough and reappears again. The lighthouse beam sweeps across the water and briefly catches the boat's white hull. Rain runs down the glass in front of the camera, which stays fixed on the boat.",
+      "soundscape": "Muffled storm outside the glass, wind rattling the window frame, a faint distant ship's horn."
+    },
+    {
+      "keyframe": "Close-up of the keeper at an old brass radio set in the lamp room, holding the microphone, his yellow coat collar turned up, worry in his eyes.",
+      "action": "the keeper leans close to the brass radio set and presses the microphone button, speaking firmly and clearly: (S1) <d>[English] Fishing vessel, this is Fairhaven light. Steer for my beam. I will guide you in.</d> He releases the button and listens intently, his white beard lit by the amber dial lamps while static crackles back.",
+      "soundscape": "Radio static and a crackling reply, rain on the windows, the tick of the rotating lens."
+    },
+    {
+      "keyframe": "Wide shot from the lighthouse gallery: the keeper in his yellow oilskin coat grips the iron railing in the storm, the beam sweeping over his head toward the sea.",
+      "action": "on the exposed iron gallery outside the lamp, the keeper braces against the gale, rain lashing his yellow oilskin coat and grey wool cap. He raises a heavy signal lantern and swings it slowly from side to side toward the boat while the great beam sweeps over his head. The camera holds wide as the wind tugs at his coat and spray rises from the rocks far below.",
+      "soundscape": "Screaming wind, rain hammering metal, the creak of the railing, crashing surf below."
+    },
+    {
+      "keyframe": "Wide shot at dawn: the small fishing boat rests safely in the calm harbour below the lighthouse, the storm clearing into pale pink light.",
+      "action": "pale dawn light spreads across a calm, glassy harbour as the small fishing boat drifts gently at its mooring below the white lighthouse. Gulls circle overhead and the last storm clouds break apart into pink and gold. High on the lighthouse gallery, a tiny figure in a yellow coat raises one hand in greeting as the camera slowly pulls back to reveal the whole headland.",
+      "soundscape": "Gentle lapping water, gulls calling, a soft breeze, a distant bell buoy."
+    }
+  ]
+}
