@@ -7,7 +7,7 @@
 3. **Clips.** There is one H3 generation per shot. Each starts exactly on its keyframe (`image_start`), uses the same subject reference images, and can optionally end on the next keyframe (`image_end`). Each GPU runs its own WanGP process, and the clips render in parallel.
 4. **Stream.** Each clip is appended to `stream/playlist.m3u8` (HLS) as soon as it and every clip before it are done. At the end everything is stitched into `film.mp4`.
 
-The director script has been tested only on CPU, with the fake backend described below. It has not yet run on GPUs.
+It has run on RTX 5090s: see [Measured on RTX 5090](#measured-on-rtx-5090).
 
 ## Running it
 
@@ -131,12 +131,22 @@ Measured times are the best case: they reuse a cached prompt and the fastest hos
 
 ## Known limits and open questions
 - **Weights in RAM.** Each worker loads its own copy of the weights into system RAM. Plan on about 40–50 GB of RAM per worker on one machine.
-- **Untested on GPUs.** Not yet measured:
-  - whether 1 s storyboard shots render cleanly (`shot_seconds` 1.5–2 is the fallback);
-  - how well identity holds over a 10 s clip;
-  - the speed of Soundtrack Kept mode on FastH3;
-  - the warm text-encoder cost of a new prompt.
+- **Not yet measured:** Soundtrack Kept mode on FastH3, and plans with reference images.
 - **No per-job timeout.** A WanGP process that hangs holds its GPU until you stop the run.
+
+## Measured on RTX 5090
+
+`scripts/director_example_textonly_plan.json` (one 6-shot storyboard, then six 10 s clips: 60.8 s of film) on FastH3 Omni NVFP4 at 832×480, with `"wgp_config": {"int8_kernels": "kitchen", "compute_cache": true, "video_profile": 1, "profile": 1, "kernel_precision": "fast"}`, weights already downloaded, `--parallel-start`.
+
+| Setup | Storyboard | 10 s clip | First clip live | Film rendered | Stalls |
+|---|---|---|---|---|---|
+| 4× RTX 5090, 450 W cap, one machine | 39 s (with model load) | 47–50 s with 4 at once, 39–41 s with 2 | 101 s | 146 s | **0** |
+| 1× RTX 5090, 475 W cap | 45 s (with model load) | 37 s | 89 s | 277 s | 5 (135 s) |
+
+- **Worker start:** 6–12 s once the weights are cached, about 55 s the first time. The three warmups (33–37 s) finished before the storyboard did.
+- **A clip's phases:** a fresh prompt encodes in about 2 s, and the 8 denoising steps take about 31 s. VAE decode, audio and saving take 6 s with one or two clips running and about 14 s with four. That shared post-denoise work is the four-GPU slowdown.
+- **Margin:** four 450 W cards run at about 0.9× realtime per clip. The minute streamed without a stall because the first four clips arrived together. Longer films need a fifth GPU on such cards. At the single-GPU 37 s per clip, four GPUs would sustain about 1.1×.
+- **Consistency:** 1 s storyboard shots rendered as clean, distinct frames, and the keeper's face, beard, cap and coat stayed the same across all six clips.
 
 ## Tests
 
