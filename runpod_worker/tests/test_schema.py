@@ -238,7 +238,9 @@ def test_letter_whitelists_match_the_handler_source():
         pytest.skip(f"{HANDLER_PY} not found")
     source = _read(HANDLER_PY)
     upstream = set(re.findall(r'"letters_filter"\s*:\s*"([^"]*)"', source))
-    assert upstream == {"KI", "PDEV+-", "ABK", "GVKFI", "AK2"}, (
+    # FL2VA "GVUKFI"/"AK2"; Ref2VA "KFI"/"GPDEV+*-U1"/"ABDKS1"; the rest belong to
+    # models this worker does not serve (Viggle "I"/"V-U"/"AK", TTS "ABD").
+    assert upstream == {"GVUKFI", "AK2", "KFI", "GPDEV+*-U1", "ABDKS1", "I", "V-U", "AK", "ABD"}, (
         f"minimax_h3_handler.py letters_filter set changed to {sorted(upstream)}; "
         "update _FALLBACK_LETTERS / _FL2VA_MODEL_DEF / _REF2VA_MODEL_DEF in schema.py"
     )
@@ -254,16 +256,16 @@ def test_letter_whitelists_match_the_handler_source():
     )
     fl2va = S.letters_allowed(FL2VA_PRUNED, S.fallback_model_def(FL2VA_PRUNED))
     ref2va = S.letters_allowed(REF2VA, S.fallback_model_def(REF2VA))
-    assert set(fl2va["video_prompt_type"]) == set("GVKFI") | set("AN")
-    # "U" belongs to guide_preprocessing, which neither variant declares.
-    assert "U" not in fl2va["video_prompt_type"]
+    assert set(fl2va["video_prompt_type"]) == set("GVUKFI") | set("AN")
     # The fallback (no model_def) must agree with the model_def-driven answer.
     assert set(S.letters_allowed(FL2VA_PRUNED)["video_prompt_type"]) == set(
         fl2va["video_prompt_type"]
     )
     assert set(fl2va["audio_prompt_type"]) == set("AK2")
-    assert set(ref2va["video_prompt_type"]) == set("PDEV+-") | set("KI")
-    assert set(ref2va["audio_prompt_type"]) == set("ABK")
+    assert set(ref2va["video_prompt_type"]) == set("GPDEV+*-U1") | set("KFI")
+    assert set(ref2va["audio_prompt_type"]) == set("ABDKS1")
+    assert set(S.letters_allowed(REF2VA)["video_prompt_type"]) == set(ref2va["video_prompt_type"])
+    assert set(S.letters_allowed(REF2VA)["audio_prompt_type"]) == set(ref2va["audio_prompt_type"])
     for letters in (fl2va, ref2va):
         assert set(letters["image_prompt_type"]) == set("TSEVL")
 
@@ -779,15 +781,15 @@ def fl2va(settings: dict, media: dict | None = None) -> dict:
 
 
 def test_letters_outside_the_variant_alphabet_are_rejected(cfg):
-    # "P"/"D" are Ref2VA guide letters; FL2VA's filter is "GVKFI".
+    # "P"/"D" are Ref2VA guide letters; FL2VA's filter is "GVUKFI".
     error = raises("invalid_setting", fl2va({"video_prompt_type": "PD"}), cfg=cfg)
     assert "not supported by FL2VA" in error.message
     # "B" (second audio reference) is Ref2VA-only; FL2VA's filter is "AK2".
     raises("invalid_setting", fl2va({"audio_prompt_type": "AB"}), cfg=cfg)
-    # "F"/"G" are FL2VA guide letters; Ref2VA's filter is "PDEV+-" + "KI".
+    # "N"/"A" come from FL2VA's mask group; Ref2VA's letters are "GPDEV+*-U1" + "KFI".
     error = raises(
         "invalid_setting",
-        {"settings": {"prompt": DEMO_PROMPT, "video_prompt_type": "GF"}},
+        {"settings": {"prompt": DEMO_PROMPT, "video_prompt_type": "NA"}},
         REF2VA,
         cfg=cfg,
     )
@@ -922,9 +924,9 @@ def test_ref2va_reference_counting(cfg):
     )
     assert "reference video" in error.message
 
-    # ...and with one, K is fine and does not count toward the 12-file total.
+    # ...and with one reference video, K is fine and does not count toward the 12-file total.
     assert parse(
-        {"settings": {"prompt": DEMO_PROMPT, "video_prompt_type": "IV",
+        {"settings": {"prompt": DEMO_PROMPT, "video_prompt_type": "IV-",
                       "audio_prompt_type": "K"},
          "media": {"image_refs": [b64_stub()], "video_guide": b64_stub()}},
         REF2VA,
@@ -943,6 +945,30 @@ def test_ref2va_reference_counting(cfg):
         cfg=cfg,
     )
     assert "12 reference files" in error.message
+
+
+def test_ref2va_accepts_the_new_input_modes(cfg):
+    """minimax_h3_handler.py:1105-1214: three reference videos and three audio
+    references, kept soundtracks, frame injection."""
+    three = {"image_refs": [b64_stub() for _ in range(3)], "video_guide": b64_stub(),
+             "video_guide2": b64_stub(), "video_guide3": b64_stub(), "audio_guide": b64_stub(),
+             "audio_guide2": b64_stub(), "audio_guide3": b64_stub()}
+    req = parse({"settings": {"prompt": DEMO_PROMPT, "video_prompt_type": "IV+*-",
+                              "audio_prompt_type": "ABD"}, "media": three}, REF2VA, cfg=cfg)
+    assert req.settings["audio_prompt_type"] == "ABD"
+    # a kept soundtrack is not an audio reference, so it needs no visual reference
+    assert parse({"settings": {"prompt": DEMO_PROMPT, "audio_prompt_type": "AS"},
+                  "media": {"audio_guide": b64_stub()}}, REF2VA, cfg=cfg)
+    # frame injection: positions consume images ("X" does not); the rest are references
+    assert parse({"settings": {"prompt": DEMO_PROMPT, "video_prompt_type": "FI",
+                               "frames_positions": "1 X 60"},
+                  "media": {"image_refs": [b64_stub(), b64_stub(), b64_stub()]}}, REF2VA, cfg=cfg)
+    error = raises("invalid_setting", {"settings": {"prompt": DEMO_PROMPT, "video_prompt_type": "FI",
+                                                    "frames_positions": "1 30 60"},
+                                       "media": {"image_refs": [b64_stub()]}}, REF2VA, cfg=cfg)
+    assert "frame injection" in error.message
+    # In-Context control video ("VU") on FL2VA
+    assert parse(fl2va({"video_prompt_type": "VU"}, {"video_guide": b64_stub()}), cfg=cfg)
 
 
 def test_ref2va_accepts_two_videos_and_two_audio_references(cfg):
