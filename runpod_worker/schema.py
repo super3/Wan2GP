@@ -518,10 +518,11 @@ _MINIMAX_H3_COMMON: dict[str, Any] = {
 
 _FL2VA_MODEL_DEF: dict[str, Any] = {
     **_MINIMAX_H3_COMMON,
-    # minimax_h3_handler.py:313-321 -- letters_filter "GVKFI".
+    # minimax_h3_handler.py:910-915 -- letters_filter "GVUKFI" ("VU": Control Video
+    # as In-Context Guide).
     # NOTE there is no frames_maximum here: FL2VA has no upper frame bound
     # anywhere in the headless path, which is why WANGP_MAX_FRAMES exists.
-    "guide_custom_choices": {"letters_filter": "GVKFI", "default": ""},
+    "guide_custom_choices": {"letters_filter": "GVUKFI", "default": ""},
     "audio_prompt_type_sources": {"letters_filter": "AK2", "default": ""},
     # minimax_h3_handler.py:725 -- accelerator profiles moved from profiles/minimax_h3/
     # to per-variant folders; the shared folder is still searched first.
@@ -543,10 +544,14 @@ _REF2VA_MODEL_DEF: dict[str, Any] = {
     # the cap message can still cite the model's own number, but WANGP_MAX_FRAMES
     # is now the ONLY real bound for Ref2VA as well as FL2VA.
     "frames_selection_maximum": 737,
-    # minimax_h3_handler.py:265-279 -- "PDEV+-" for the guide, "KI" for refs.
-    "guide_custom_choices": {"letters_filter": "PDEV+-", "default": ""},
-    "image_ref_choices": {"letters_filter": "KI", "default": ""},
-    "audio_prompt_type_sources": {"letters_filter": "ABK", "default": ""},
+    # minimax_h3_handler.py:832-889 -- "GPDEV+*-U1" for the guide (up to three reference
+    # videos, excerpts "1", Denoise "GV", In-Context "VU"), "KFI" for refs (frame
+    # injection "FI"), "ABDKS1" for audio (three references, kept soundtracks "AS"/"KS",
+    # soundtrack excerpts "K1").
+    "guide_custom_choices": {"letters_filter": "GPDEV+*-U1", "default": ""},
+    "image_ref_choices": {"letters_filter": "KFI", "default": ""},
+    "audio_prompt_type_sources": {"letters_filter": "ABDKS1", "default": ""},
+    "custom_frames_injection": True,
     "profiles_dir": ["minimax_h3", "minimax_h3_ref2va"],
     "reference_image_enabled": True,
     "any_image_refs_relative_size": True,
@@ -699,11 +704,10 @@ def is_legal_frame_count(value: int, model_def: Mapping[str, Any] | None) -> boo
 # (wgp.py:11580-11582), which wgp.py:1350-1356 then enforces with
 # "You must provide a Video Mask".
 #
-# "U" ("identity", wgp.py:4584) is deliberately NOT allowed: it belongs to the
-# ``guide_preprocessing`` group, which neither MiniMax H3 variant declares, so it
-# is unreachable from the UI for these models. It only ever appears as the opt-out
-# half of ``"A" in vpt and not "U" in vpt``; allowing it would let a caller ask for
-# masked processing and then suppress the mask requirement WanGP enforces.
+# "U" is allowed: both variants now declare it in ``guide_custom_choices`` ("VU",
+# Control Video as In-Context Guide; Ref2VA also "V-U" reference videos). It is also
+# the opt-out half of ``"A" in vpt and not "U" in vpt``; WanGP itself skips the mask
+# requirement when it is present, and _check_media_requirements mirrors that.
 #
 # An illegal letter is not always an error upstream -- some are silently dropped
 # -- so rejecting here is strictly more informative than letting it through.
@@ -711,15 +715,15 @@ def is_legal_frame_count(value: int, model_def: Mapping[str, Any] | None) -> boo
 _FALLBACK_LETTERS: dict[str, dict[str, str]] = {
     "fl2va": {
         "image_prompt_type": "TSEVL",
-        # "GVKFI" from guide_custom_choices + "AN" from mask_preprocessing
+        # "GVUKFI" from guide_custom_choices + "AN" from mask_preprocessing
         # (selection ["", "A", "NA"], filtered through wgp.py:11602's "XYZWNA").
-        "video_prompt_type": "GVKFIAN",
+        "video_prompt_type": "GVUKFIAN",
         "audio_prompt_type": "AK2",
     },
     "ref2va": {
         "image_prompt_type": "TSEVL",
-        "video_prompt_type": "KIPDEV+-",
-        "audio_prompt_type": "ABK",
+        "video_prompt_type": "GPDEV+*-U1KFI",
+        "audio_prompt_type": "ABDKS1",
     },
 }
 
@@ -1233,6 +1237,12 @@ _REQUIRED_MEDIA: tuple[tuple[str, str, str, str, str], ...] = (
 )
 
 
+def _injection_positions(settings: Mapping[str, Any]) -> int:
+    """Injected-frame positions that consume an image ("X" skips a window)."""
+    positions = str(settings.get("frames_positions") or "").replace(",", " ").split()
+    return sum(position.upper() != "X" for position in positions)
+
+
 def check_cross_variant(
     model_type: str,
     settings: Mapping[str, Any],
@@ -1280,9 +1290,9 @@ def check_cross_variant(
                     "video_guide2/3 and audio_guide2/3 are Ref2VA-only",
                     details=[f"'{key}' was supplied for {model_type}"],
                 )
-        # minimax_h3_handler.py:355-359
+        # minimax_h3_handler.py:1090-1094 ("X" skips a window without consuming an image)
         if "F" in vpt:
-            n_pos = len(str(settings.get("frames_positions") or "").replace(",", " ").split())
+            n_pos = _injection_positions(settings)
             if n_pos != n_refs:
                 raise WorkerError(
                     INVALID_SETTING,
@@ -1304,33 +1314,63 @@ def check_cross_variant(
                     f"video_guide file",
                 )
     else:
-        # minimax_h3_handler.py:376-445, in source order.
-        n_vid = (1 if "V" in vpt else 0) + (1 if "+" in vpt else 0)
-        soundtrack = "K" in apt
-        if n_refs > 9:
-            raise WorkerError(INVALID_SETTING, "Ref2VA accepts at most 9 reference images")
-        if n_vid > 2:
-            raise WorkerError(INVALID_SETTING, "Ref2VA accepts at most 2 reference videos")
-        if soundtrack:
-            if n_vid == 0:
+        # minimax_h3_handler.py:1105-1214, in source order. The duration and audio-track
+        # checks need the files and stay with WanGP.
+        n_images = n_refs
+        if "F" in vpt:
+            if "G" in vpt:
+                raise WorkerError(
+                    INVALID_SETTING, "frame injection cannot be combined with Denoise Control Video ('G')"
+                )
+            n_pos = _injection_positions(settings)
+            if n_pos == 0 or n_pos > n_images:
                 raise WorkerError(
                     INVALID_SETTING,
-                    "audio_prompt_type 'K' (use the reference-video soundtracks) requires at "
-                    "least one reference video",
+                    "frame injection requires at least one frames_positions entry and one "
+                    f"image_refs entry per position ({n_pos} positions, {n_images} images)",
                 )
-            n_aud = n_vid
-        else:
-            n_aud = (1 if "A" in apt else 0) + (1 if "B" in apt else 0)
-        if n_aud > 2:
-            raise WorkerError(INVALID_SETTING, "Ref2VA accepts at most 2 audio references")
-        visual = n_refs + n_vid
+            n_images -= n_pos  # images beyond the injected frames are reference images
+        n_vid = (1 + ("+" in vpt) + ("*" in vpt)) if "V" in vpt and "G" not in vpt else 0
+        kept = "S" in apt  # a kept soundtrack ("AS"/"KS") is not an audio reference
+        n_aud = ("A" in apt and not kept) + ("B" in apt) + ("D" in apt)
+        if n_images > 9:
+            raise WorkerError(INVALID_SETTING, "Ref2VA accepts at most 9 reference images")
+        if n_vid > 3:
+            raise WorkerError(INVALID_SETTING, "Ref2VA accepts at most 3 reference videos")
+        soundtrack = "K" in apt
+        if soundtrack:
+            control = kept and "V" in vpt and "-" not in vpt  # "KS" keeps a control video's own track
+            if not (control or ("-" in vpt and n_vid)):
+                raise WorkerError(
+                    INVALID_SETTING,
+                    "keeping a video soundtrack requires a reference video or a control video"
+                    if kept else
+                    "using video soundtracks as audio references requires a reference video ('V-')",
+                )
+            excerpts = "1" in apt
+            if "1" in vpt and not (kept or excerpts):
+                raise WorkerError(
+                    INVALID_SETTING,
+                    "reference-video excerpts cannot also be audio references; use audio_prompt_type 'K1'",
+                )
+            if n_vid > 1 and (kept or excerpts):
+                raise WorkerError(
+                    INVALID_SETTING,
+                    "keeping a reference-video soundtrack or taking excerpts from it requires a "
+                    "single reference video",
+                )
+            # excerpt counts come from custom_settings and are checked by WanGP
+            n_aud = 0 if kept or excerpts else n_vid
+        if n_aud > 3:
+            raise WorkerError(INVALID_SETTING, "Ref2VA accepts at most 3 audio references")
+        visual = n_images + n_vid
         if n_aud > visual:
             raise WorkerError(
                 INVALID_SETTING,
                 "Ref2VA needs at least as many reference images+videos as audio references "
                 f"({visual} visual, {n_aud} audio)",
             )
-        if visual + (0 if soundtrack else n_aud) > 12:
+        if n_images + n_vid + (0 if soundtrack else n_aud) > 12:
             raise WorkerError(INVALID_SETTING, "Ref2VA accepts at most 12 reference files")
 
     # wgp.py:1336 -- one_image_ref_only bites only when "I" is used without K/F.
