@@ -296,7 +296,7 @@ FIRST_BLOCK_CACHE_THRESHOLDS: tuple[float, ...] = (0.06, 0.08, 0.10, 0.12, 0.14)
 # ``activated_loras``, ``frames_positions``, ``masking_strength``,
 # ``skip_steps_cache_type``, ``negative_prompt``, ``config`` and
 # ``overrides`` are all ABSENT from it. The real universe is
-# ``models/_settings.json`` (118 keys), merged in by ``clean_settings``
+# ``models/_settings.json`` (119 keys), merged in by ``clean_settings``
 # (``wgp.py:1747-1760``).
 #
 # The list is baked rather than read at import so this module does zero I/O and
@@ -330,6 +330,7 @@ _PRIMARY_SETTINGS_KEYS: tuple[str, ...] = (
     "control_net_weight_alt",
     "custom_guide",
     "custom_settings",
+    "custom_sigmas",
     "denoising_strength",
     "duration_seconds",
     "embedded_guidance_scale",
@@ -375,6 +376,7 @@ _PRIMARY_SETTINGS_KEYS: tuple[str, ...] = (
     "postprocess_audio",
     "postprocess_audio_neg_prompt",
     "postprocess_audio_prompt",
+    "postprocessing_reference_images",
     "prompt",
     "prompt_enhancer",
     "remove_background_images_ref",
@@ -398,10 +400,7 @@ _PRIMARY_SETTINGS_KEYS: tuple[str, ...] = (
     "sliding_window_overlap_noise",
     "sliding_window_size",
     "sliding_window_trim_first_frames",
-    "spatial_upsampler_param",
-    "spatial_upsampler_param2",
-    "spatial_upsampler_prompt",
-    "spatial_upsampler_reference_images",
+    "spatial_postprocessing_parameters",
     "spatial_upsampling",
     "speakers_locations",
     "sub_parallel_window_overlap",
@@ -409,6 +408,7 @@ _PRIMARY_SETTINGS_KEYS: tuple[str, ...] = (
     "switch_threshold",
     "switch_threshold2",
     "temperature",
+    "temporal_postprocessing_parameters",
     "temporal_upsampling",
     "top_k",
     "top_p",
@@ -420,7 +420,8 @@ _PRIMARY_SETTINGS_KEYS: tuple[str, ...] = (
     "video_length",
     "video_mask",
     "video_prompt_type",
-    "video_source",)
+    "video_source",
+    "world_output",)
 
 PRIMARY_SETTINGS: frozenset[str] = frozenset(_PRIMARY_SETTINGS_KEYS)
 
