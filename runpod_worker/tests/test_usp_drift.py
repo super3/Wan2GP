@@ -75,7 +75,10 @@ def test_usp_module_stays_torch_lazy_for_this_suite():
 #: last frame bit-identical for 107-362 frames): the chunk loop is unchanged;
 #: finalized frames now go to a CPU buffer via _prepare_decoded_chunk(uint8_rounding)
 #: and a single latent frame takes a separate still-image path.
-MIRRORED_DECODE_SHA256 = "57c6f669ed43592cd74d3a15e74f9aa7c1ee488f9dd25d9a75f38eb2d5760467"
+#: Re-verified at upstream a288819: only the copy of each finalized part into the CPU buffer
+#: changed (decoded[...].copy_(part) became transfer.copy_(decoded[...], part)); the chunk loop
+#: and the slice positions are the same.
+MIRRORED_DECODE_SHA256 = "9729355d7941438d6b818d57f15565c2a3d758260ec1fb39baa31410cfd2b154"
 
 
 def _decode_source() -> str:
