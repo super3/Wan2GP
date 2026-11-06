@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Chunk Streaming plugin for WanGP.
 
-Wraps models/minimax_h3/streaming.py (an activation-style patch that touches
+Wraps streaming.py in this folder (an activation-style patch that touches
 no core files): the MiniMax H3 video VAE finalizes 17 frames (~0.7 s of video)
 per temporal decode chunk, and with the plugin enabled each finished chunk is
 muxed into a standalone fragmented MP4 segment in a background thread while
@@ -27,7 +27,7 @@ PlugIn_Id = "ChunkStreaming"
 
 
 def _streaming():
-    from models.minimax_h3 import streaming
+    from . import streaming
 
     return streaming
 

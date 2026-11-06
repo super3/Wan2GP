@@ -1,5 +1,5 @@
 # Copyright 2026. Licensed under the Apache License, Version 2.0.
-"""CPU tests for models/minimax_h3/streaming.py.
+"""CPU tests for plugins/chunk_streaming/streaming.py.
 
 Three properties are load-bearing enough to gate a GPU bench on:
 1. The instrumented `_decode` returns a tensor bit-identical to the original
@@ -21,7 +21,7 @@ from pathlib import Path
 import pytest
 import torch
 
-_ROOT = str(Path(__file__).resolve().parents[1])
+_ROOT = str(Path(__file__).resolve().parents[3])
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
@@ -34,7 +34,8 @@ if _ROOT not in sys.path:
 import importlib
 import types
 
-for name, rel in (("models", "models"), ("models.minimax_h3", "models/minimax_h3"), ("shared", "shared")):
+for name, rel in (("models", "models"), ("models.minimax_h3", "models/minimax_h3"), ("shared", "shared"),
+                  ("plugins", "plugins"), ("plugins.chunk_streaming", "plugins/chunk_streaming")):
     if name not in sys.modules:
         pkg = types.ModuleType(name)
         pkg.__path__ = [str(Path(_ROOT) / rel)]
@@ -63,7 +64,7 @@ if "shared.attention" not in sys.modules:
         return None
 
     def _sage_attention_mask(*_args, **_kw):
-        raise NotImplementedError("Sage attention masks are not stubbed in tests/test_streaming.py")
+        raise NotImplementedError("Sage attention masks are not stubbed in plugins/chunk_streaming/tests/test_streaming.py")
 
     attn_mod.pay_attention = _sdpa_pay_attention
     attn_mod.sage_staged = _no_sage_staged
@@ -82,12 +83,12 @@ if "shared.utils.utils" not in sys.modules:
         utils_mod = types.ModuleType("shared.utils.utils")
 
         def _guide_to_float(_video):
-            raise RuntimeError("shared.utils.utils is stubbed by tests/test_streaming.py")
+            raise RuntimeError("shared.utils.utils is stubbed by plugins/chunk_streaming/tests/test_streaming.py")
 
         utils_mod.guide_to_float = _guide_to_float
         sys.modules["shared.utils.utils"] = utils_mod
 
-streaming = importlib.import_module("models.minimax_h3.streaming")
+streaming = importlib.import_module("plugins.chunk_streaming.streaming")
 AutoencoderKLMiniMaxH3 = importlib.import_module(
     "models.minimax_h3.components.video_autoencoder"
 ).AutoencoderKLMiniMaxH3
