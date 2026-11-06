@@ -4,7 +4,7 @@
 
 Runs the production H3 480p clip (sage2, profile 4, 4-step turbo LoRA) at
 5/10/15 seconds (124/243/362 frames), each once as today's monolithic path and
-once with models/minimax_h3/streaming.py instrumentation active. The streaming
+once with plugins/chunk_streaming/streaming.py instrumentation active. The streaming
 leg records when every finished decode chunk (17 frames, ~0.7 s of video)
 could have left the worker, muxes each chunk into a standalone fMP4 segment
 (timed), and models the player two ways: the post-hoc oracle earliest
@@ -104,7 +104,7 @@ def main() -> int:
     assert list(live.cli_args) == os.environ["WANGP_CLI_ARGS"].split(), (
         f"config froze early: {list(live.cli_args)}")
 
-    from models.minimax_h3 import streaming  # noqa: PLC0415
+    from plugins.chunk_streaming import streaming  # noqa: PLC0415
     from runpod_worker import handler as H  # noqa: PLC0415
 
     H.bootstrap()
