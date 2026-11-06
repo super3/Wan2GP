@@ -42,7 +42,7 @@ import torch
 
 from shared.utils.phase_progress import PhaseProgress
 
-from .components import video_autoencoder as _va
+from models.minimax_h3.components import video_autoencoder as _va
 
 
 class StreamRecorder:
@@ -290,8 +290,8 @@ def activate(store_frames: bool = True, live_dir: str | None = None,
         rec.live_dir = live_dir
         rec.audio_first = audio_first
         return rec
-    from . import audio_vae as _audio_mod
-    from . import video_vae as _video_mod
+    from models.minimax_h3 import audio_vae as _audio_mod
+    from models.minimax_h3 import video_vae as _video_mod
 
     rec = StreamRecorder(store_frames=store_frames, live_dir=live_dir, audio_first=audio_first)
     _STATE["recorder"] = rec
@@ -333,8 +333,8 @@ def activate(store_frames: bool = True, live_dir: str | None = None,
 def deactivate() -> None:
     if not _STATE["active"]:
         return
-    from . import audio_vae as _audio_mod
-    from . import video_vae as _video_mod
+    from models.minimax_h3 import audio_vae as _audio_mod
+    from models.minimax_h3 import video_vae as _video_mod
 
     rec = _STATE["recorder"]
     if rec is not None and rec.live is not None:
