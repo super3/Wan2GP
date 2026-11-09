@@ -77,7 +77,9 @@ def activate() -> None:
         tokens_chunk_size = math.ceil(int(self.config.clip_length)
                                       / int(self.temporal_compression_ratio))
         aligned = (available + int(self.config.token_drop)) % tokens_chunk_size == 0
-        if available <= need or not aligned:
+        # A single-frame decoder (H3 image models) maps one latent to one pixel frame: no chunks to skip.
+        single_frame = getattr(getattr(self, "decoder", None), "patch_size_t", None) == 1
+        if available <= need or not aligned or single_frame:
             return _ORIGINAL_DECODE(self, latents, *args, **kwargs)
         return _ORIGINAL_DECODE(self, latents[:, :, -need:], *args, **kwargs)
 
