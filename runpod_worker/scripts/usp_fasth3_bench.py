@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""FastH3 Omni NVFP4 benchmark: one GPU vs two-GPU Ulysses sequence parallelism (models/minimax_h3/usp.py) with VSA.
+"""FastH3 Omni NVFP4 benchmark: one GPU vs two-GPU Ulysses sequence parallelism (plugins/usp_multi_gpu/usp.py) with VSA.
 
 One fixed job, run 1 cold + 2 warm times per mode: ``minimax_h3_fasth3_omni_nvfp4``, 832x480, video_length 124 (5 s at 24 fps),
 seed 42, one generated reference image (``video_prompt_type="I"``, ``image_refs=[png]``), the model's default prompt,
@@ -324,7 +324,8 @@ def main() -> int:
         # usp.activate() would init NCCL itself with the default timeout; a cold load can differ by minutes between ranks.
         torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", rank)) % max(torch.cuda.device_count(), 1))
         dist.init_process_group("nccl", timeout=timedelta(minutes=30))
-    from models.minimax_h3 import usp  # noqa: PLC0415
+    sys.path.insert(0, os.path.join(_ROOT, "plugins"))
+    from usp_multi_gpu import usp  # noqa: PLC0415
 
     usp.activate()  # before the model loads: class-level patches; a passthrough when WORLD_SIZE is 1
     assert usp.is_active() == (world > 1)

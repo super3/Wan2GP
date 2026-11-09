@@ -329,7 +329,7 @@ inferred.
   value table (warm, profile 3 unless noted): H100 p1 22.9 s / PRO 6000 p1
   24.2 s / H100 p3 39.5 s / MIG 2g.48gb p3 46.7 s / A40 p3 67.0 s.
 - **Multi-GPU sequence parallelism works and is worth 1.31x, no more.**
-  `models/minimax_h3/usp.py` adds Ulysses sequence parallelism (an all-to-all
+  `plugins/usp_multi_gpu/usp.py` (the Multi-GPU (USP) plugin) adds Ulysses sequence parallelism (an all-to-all
   around each block's attention so every rank holds the full sequence for
   `heads / world_size` heads) via plain `torch.distributed` -- no xfuser, no
   ray. Measured on ONE 2x A40 pod, same clip, warm second job:

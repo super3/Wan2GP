@@ -34,6 +34,7 @@ on:
   pull_request:
     paths:
       - 'runpod_worker/**'
+      - 'plugins/usp_multi_gpu/**'
       - 'Dockerfile'
       - 'requirements.txt'
       - 'wgp.py'
@@ -48,6 +49,7 @@ on:
   push:
     paths:
       - 'runpod_worker/**'
+      - 'plugins/usp_multi_gpu/**'
       - 'Dockerfile'
       - 'requirements.txt'
       - 'wgp.py'
@@ -135,7 +137,7 @@ jobs:
           PY
 
       - name: pytest
-        run: pytest runpod_worker/tests -q
+        run: pytest runpod_worker/tests plugins/usp_multi_gpu/tests -q
 
       # test_input.json is what Tier 2/3 and every copy-paste example run. A payload
       # that no longer parses is a broken runbook, and this costs ~50 ms to prove.
@@ -228,7 +230,7 @@ jobs:
           python -m pip check
 
       - name: pytest with the SDK present
-        run: pytest runpod_worker/tests -q
+        run: pytest runpod_worker/tests plugins/usp_multi_gpu/tests -q
 
   hadolint:
     name: hadolint (runpod_worker/Dockerfile)
