@@ -16,8 +16,8 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[2]
 
 #: sha256 of MiniMaxH3Model.forward's source at the revision usp.py mirrors
-#: (upstream dee6635).
-MIRRORED_FORWARD_SHA256 = "c7ff3a3d9124eaa78dc79f739b8ad5720d7d8c41986527de42be59ec65bfd429"
+#: (upstream 9f30419: HyperFlow's two-time AdaLN rows, its LoRA offsets and dropped blocks).
+MIRRORED_FORWARD_SHA256 = "917010463ebf1873a406810d05404f06ddc9cdc6bac3c951bd623712dc6a982b"
 
 
 def _forward_source() -> str:
@@ -78,7 +78,10 @@ def test_usp_module_stays_torch_lazy_for_this_suite():
 #: Re-verified at upstream a288819: only the copy of each finalized part into the CPU buffer
 #: changed (decoded[...].copy_(part) became transfer.copy_(decoded[...], part)); the chunk loop
 #: and the slice positions are the same.
-MIRRORED_DECODE_SHA256 = "9729355d7941438d6b818d57f15565c2a3d758260ec1fb39baa31410cfd2b154"
+#: Re-verified at upstream 9f30419: only a single-frame decoder branch (decoder.patch_size_t == 1,
+#: H3 image models) was added ahead of the still-image path; the video chunk loop and slice
+#: positions are unchanged, and last_frame.py decodes such a VAE in full.
+MIRRORED_DECODE_SHA256 = "d6e684189a60a7c626299e6925027437d51e647be90e37b9641ffd135dcfd7bc"
 
 
 def _decode_source() -> str:
