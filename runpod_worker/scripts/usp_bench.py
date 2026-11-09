@@ -9,7 +9,7 @@ metrics. Two launch shapes, both inside the worker image with weights present:
     # single GPU, any attention mode
     python3 runpod_worker/scripts/usp_bench.py --attention sdpa --profile 1
 
-    # 2-GPU Ulysses sequence parallelism (models/minimax_h3/usp.py)
+    # 2-GPU Ulysses sequence parallelism (plugins/usp_multi_gpu/usp.py)
     torchrun --nproc-per-node=2 runpod_worker/scripts/usp_bench.py \
         --attention sdpa --profile 1 --tag usp2
 
@@ -181,7 +181,8 @@ def main() -> int:
         print("bench: last-frame decode active", flush=True)
 
     if world > 1:
-        from models.minimax_h3 import usp
+        sys.path.insert(0, os.path.join(_ROOT, "plugins"))
+        from usp_multi_gpu import usp
         usp.activate()
         if args.attention == "sol":
             print("bench: sol attention is unsupported under USP", file=sys.stderr)

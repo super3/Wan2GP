@@ -66,7 +66,7 @@ import os
 import torch
 import torch.distributed as dist
 
-__all__ = ["activate", "is_active", "rank", "world_size"]
+__all__ = ["activate", "deactivate", "is_active", "rank", "world_size"]
 
 
 class _State:
@@ -75,6 +75,10 @@ class _State:
     world = 1
     bounds: list[int] | None = None  # per-forward shard bounds, len world+1
     checked_forward = False
+    # Set by the WanGP plugin (sync.py): a lockstep gate the DiT forward passes through
+    # before its first collective. None under torchrun / the benchmarks, where every rank
+    # runs the same script and nothing can abort one rank alone.
+    sync = None
 
 
 _S = _State()
@@ -177,8 +181,9 @@ def _assert_ranks_agree(hidden: torch.Tensor) -> None:
     """One scalar collective proving every rank assembled the same sequence.
 
     Ranks compute encodes redundantly; if a nondeterministic kernel ever broke
-    lockstep, the collectives would silently produce garbage. Checked once per
-    process (the first forward), not per step."""
+    lockstep, the collectives would silently produce garbage. Checked on the first
+    forward after ``checked_forward`` is cleared: once per process under torchrun,
+    once per generation under the plugin (sync.py clears it), not per step."""
     if _S.checked_forward:
         return
     _S.checked_forward = True
@@ -330,7 +335,7 @@ def _usp_forward(self, video_x, audio_x, sigma_video, sigma_audio, context, payl
     from mmgp import cuda_graphs
     from shared.kernels import ops as kernels
 
-    from . import transformer as T
+    from models.minimax_h3 import transformer as T
 
     if not is_active():
         return _ORIG_FORWARD(self, video_x, audio_x, sigma_video, sigma_audio, context,
@@ -477,6 +482,11 @@ def _usp_forward(self, video_x, audio_x, sigma_video, sigma_audio, context, payl
     # (USP delta: no control stream setup -- control_rows is refused above.)
 
     # ---- USP delta: shard the sequence across ranks --------------------
+    if _S.sync is not None:
+        # Plugin lockstep gate: rank 0 checks its abort flag, then every rank confirms it
+        # is entering this same forward before the first collective. A rank that stopped
+        # (abort, error) answers instead of joining, so no rank waits inside NCCL alone.
+        _S.sync.before_forward(self)
     _assert_ranks_agree(hidden)
     bounds = _shard_bounds(layout.sequence_length, _S.world)
     lo, hi = bounds[_S.rank], bounds[_S.rank + 1]
@@ -487,8 +497,10 @@ def _usp_forward(self, video_x, audio_x, sigma_video, sigma_audio, context, payl
     _S.bounds = bounds
     try:
         with cuda_graphs.scope():  # _usp_graph_gate keeps every block eager
+            # USP delta: no per-block self._check_interrupt(). One rank raising between
+            # blocks would leave the others in the next all-to-all; aborts are honored at
+            # the next forward instead (sync.before_forward), about one step later.
             for block_index in self.kept_blocks:  # HyperFlow-pruned models drop blocks
-                self._check_interrupt()
                 block = self.blocks[block_index]
                 block_temb = ref2va_temb if ref2va_temb is not None and self.hybrid_ref2va_blocks[0] <= block_index <= self.hybrid_ref2va_blocks[1] else temb
                 if block_offsets is not None:
@@ -524,12 +536,13 @@ _ORIG_VSA_CALL = None
 _VSA_CLASS = None
 
 
-def activate() -> int:
+def activate(timeout_s: float | None = None) -> int:
     """Initialize NCCL from torchrun-style env and patch the model classes.
 
     Call BEFORE the model loads (class-level patch — instances inherit it).
     Returns this process's rank. Safe to call when WORLD_SIZE is unset or 1:
-    patches become passthroughs."""
+    patches become passthroughs. ``timeout_s`` bounds each NCCL collective
+    (torch's default when None)."""
     global _ORIG_FORWARD, _ORIG_SOL_CALL, _ORIG_QKV_ATTENTION, _ORIG_VSA_CALL, _VSA_CLASS
 
     world = int(os.environ.get("WORLD_SIZE", "1"))
@@ -539,7 +552,12 @@ def activate() -> int:
         if not dist.is_initialized():
             local = int(os.environ.get("LOCAL_RANK", _S.rank))
             torch.cuda.set_device(local % max(torch.cuda.device_count(), 1))
-            dist.init_process_group("nccl")
+            if timeout_s is None:
+                dist.init_process_group("nccl")
+            else:
+                import datetime
+
+                dist.init_process_group("nccl", timeout=datetime.timedelta(seconds=timeout_s))
         heads = 56  # MiniMaxH3 num_attention_heads; checked again at first a2a by shape math
         if heads % world:
             raise RuntimeError(f"world size {world} must divide {heads} attention heads")
@@ -548,8 +566,8 @@ def activate() -> int:
     from mmgp import cuda_graphs
     from shared import attention_kit
 
-    from . import transformer as T
-    from .sol_attention import MiniMaxH3SolAttention
+    from models.minimax_h3 import transformer as T
+    from models.minimax_h3.sol_attention import MiniMaxH3SolAttention
     if _ORIG_FORWARD is None:
         _ORIG_FORWARD = T.MiniMaxH3Model.forward
         T.MiniMaxH3Model.forward = _usp_forward
@@ -563,7 +581,7 @@ def activate() -> int:
         attention_kit.qkv_attention = _usp_qkv_attention
     if _ORIG_VSA_CALL is None:
         try:  # Triton-only; without it no VSA model can load, and _refuse_global_attention guards the rest
-            from .vsa.attention import VSAAttention
+            from models.minimax_h3.vsa.attention import VSAAttention
         except ImportError:
             VSAAttention = None
         if VSAAttention is not None:
@@ -572,3 +590,35 @@ def activate() -> int:
             VSAAttention.__call__ = _usp_vsa_call
     cuda_graphs.register_gate(_usp_graph_gate)
     return _S.rank
+
+
+def deactivate() -> None:
+    """Undo :func:`activate`: restore the original classes and leave the process group.
+
+    Models loaded while USP was active keep the restored methods (the patches are
+    class-level), but release them anyway so nothing cached for the sharded forward
+    survives."""
+    global _ORIG_FORWARD, _ORIG_SOL_CALL, _ORIG_QKV_ATTENTION, _ORIG_VSA_CALL, _VSA_CLASS
+
+    from shared import attention_kit
+
+    from models.minimax_h3 import transformer as T
+    from models.minimax_h3.sol_attention import MiniMaxH3SolAttention
+    if _ORIG_FORWARD is not None:
+        T.MiniMaxH3Model.forward = _ORIG_FORWARD
+        _ORIG_FORWARD = None
+    if _ORIG_SOL_CALL is not None:
+        MiniMaxH3SolAttention.__call__ = _ORIG_SOL_CALL
+        _ORIG_SOL_CALL = None
+    if _ORIG_QKV_ATTENTION is not None:
+        attention_kit.qkv_attention = _ORIG_QKV_ATTENTION
+        _ORIG_QKV_ATTENTION = None
+    if _ORIG_VSA_CALL is not None:
+        _VSA_CLASS.__call__ = _ORIG_VSA_CALL
+        _ORIG_VSA_CALL = _VSA_CLASS = None
+    _S.enabled = False  # _usp_graph_gate stays registered and now always allows graphs
+    _S.sync = None
+    _S.world, _S.rank = 1, 0
+    _S.checked_forward = False
+    if dist.is_initialized():
+        dist.destroy_process_group()

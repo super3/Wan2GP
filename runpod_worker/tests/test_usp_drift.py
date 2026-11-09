@@ -1,4 +1,4 @@
-"""Drift guard for models/minimax_h3/usp.py — text-only, no torch.
+"""Drift guard for plugins/usp_multi_gpu/usp.py — text-only, no torch.
 
 ``usp._usp_forward`` is a rank-aware COPY of ``MiniMaxH3Model.forward``
 (transformer.py). If upstream edits that forward, the copy silently diverges;
@@ -35,7 +35,7 @@ def _forward_source() -> str:
 def test_upstream_forward_unchanged_since_usp_mirror():
     digest = hashlib.sha256(_forward_source().encode()).hexdigest()
     assert digest == MIRRORED_FORWARD_SHA256, (
-        "MiniMaxH3Model.forward changed upstream since models/minimax_h3/usp.py mirrored it. "
+        "MiniMaxH3Model.forward changed upstream since plugins/usp_multi_gpu/usp.py mirrored it. "
         "Re-diff usp._usp_forward against transformer.py's forward, port the change, and "
         f"update MIRRORED_FORWARD_SHA256 to {digest}."
     )
@@ -60,12 +60,13 @@ def test_vsa_unchanged_since_usp_verified_it_head_separable():
 def test_usp_module_stays_torch_lazy_for_this_suite():
     # The CPU suite must stay importable without torch; usp.py needs torch at
     # module scope, so nothing in runpod_worker may import it at module scope.
-    needle = "minimax_h3" + ".usp"  # split so this file does not match itself
+    # The module lives in the Multi-GPU (USP) plugin: plugins/usp_multi_gpu/usp.py.
+    needles = ("usp_multi_gpu" + " import", "usp_multi_gpu" + ".usp", "minimax_h3" + ".usp")  # split: no self-match
     for py in (REPO / "runpod_worker").rglob("*.py"):
-        if py.name in ("usp_bench.py", "test_usp_gloo.py", "test_usp_drift.py"):
-            continue  # torch-dependent (or this guard itself), never imported by the suite
+        if py.parent.name == "scripts" or py.name == "test_usp_drift.py":
+            continue  # GPU / torch scripts (or this guard itself), never imported by the suite
         text = py.read_text()
-        assert needle not in text, (
+        assert not any(needle in text for needle in needles), (
             f"{py} references the torch-requiring usp module; keep the worker package torch-free"
         )
 
