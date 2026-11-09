@@ -221,6 +221,38 @@ def test_instrumented_decode_single_latent_still():
     assert rec.frames[0].shape[0] == 1
 
 
+def test_instrumented_decode_single_frame_decoder():
+    """H3 image models build the VAE with a single-frame decoder
+    (decoder_patch_size_t=1): one latent frame decodes to one pixel frame,
+    with no still-image repeat and no pre-padding."""
+    torch.manual_seed(0)
+    vae = AutoencoderKLMiniMaxH3(
+        latent_channels=4,
+        block_out_channels=(8, 8, 8, 8, 8, 8),
+        layers_per_block=1,
+        norm_num_groups=4,
+        decoder_num_layers=1,
+        decoder_num_attention_heads=1,
+        decoder_attention_head_dim=8,
+        decoder_num_register_tokens=1,
+        decoder_ffn_mult=1,
+        decoder_patch_size_t=1,
+    ).eval()
+    z = torch.randn(1, 4, 1, 8, 8)
+    with torch.no_grad():
+        expected = AutoencoderKLMiniMaxH3._decode(vae, z)
+    rec = streaming.activate(store_frames=True)
+    try:
+        rec.reset()
+        with torch.no_grad():
+            got = AutoencoderKLMiniMaxH3._decode(vae, z)
+    finally:
+        streaming.deactivate()
+    assert expected.shape[2] == 1
+    assert torch.equal(expected, got), "instrumented decode diverged from original"
+    assert [(c["frame_start"], c["frame_end"]) for c in rec.chunks] == [(0, 1)]
+
+
 def test_audio_first_video_decode_forwards_arguments(monkeypatch):
     """The audio-first wrapper sits on `MiniMaxH3VideoVAE.decode`, which the
     pipeline calls as `self.vae.decode(video, uint8_rounding)`."""
