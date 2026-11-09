@@ -239,8 +239,9 @@ def test_letter_whitelists_match_the_handler_source():
     source = _read(HANDLER_PY)
     upstream = set(re.findall(r'"letters_filter"\s*:\s*"([^"]*)"', source))
     # FL2VA "GVUKFI"/"AK2"; Ref2VA "KFI"/"GPDEV+*-U1"/"ABDKS1"; the rest belong to
-    # models this worker does not serve (Viggle "I"/"V-U"/"AK", TTS "ABD").
-    assert upstream == {"GVUKFI", "AK2", "KFI", "GPDEV+*-U1", "ABDKS1", "I", "V-U", "AK", "ABD"}, (
+    # models this worker does not serve (Viggle "I"/"V-U"/"AK", Viggle Remake
+    # "FI"/"V-UA"/"AK", TTS "ABD").
+    assert upstream == {"GVUKFI", "AK2", "KFI", "GPDEV+*-U1", "ABDKS1", "I", "V-U", "AK", "ABD", "FI", "V-UA"}, (
         f"minimax_h3_handler.py letters_filter set changed to {sorted(upstream)}; "
         "update _FALLBACK_LETTERS / _FL2VA_MODEL_DEF / _REF2VA_MODEL_DEF in schema.py"
     )

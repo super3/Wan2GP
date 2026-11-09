@@ -319,10 +319,10 @@ def _refuse_global_attention(model):
 
 def _usp_forward(self, video_x, audio_x, sigma_video, sigma_audio, context, payload,
                  spectrum=None, first_block_cache=None):
-    """Rank-aware copy of MiniMaxH3Model.forward (transformer.py:753-948).
+    """Rank-aware copy of MiniMaxH3Model.forward (transformer.py:811-1051).
 
     Kept as close to upstream as possible; the USP deltas are marked. Pinned to
-    the upstream revision this branch tracks (dee6635) — re-diff on upstream
+    the upstream revision this branch tracks (9f30419) — re-diff on upstream
     bumps; runpod_worker/tests/test_usp_drift.py fails when the original moves.
     Upstream paths this copy drops are refused up front instead of ported: the
     Spectrum forecast branch and the FirstBlockCache loop (step caches), the
@@ -352,10 +352,8 @@ def _usp_forward(self, video_x, audio_x, sigma_video, sigma_audio, context, payl
     sigma_video = sigma_video.flatten()
     if sigma_video.numel() not in (1, latent_t):
         raise ValueError(f"MiniMax H3 received {sigma_video.numel()} video sigmas for {latent_t} latent frames")
-    if not self.control_layers and sigma_video.numel() > 1 and not bool((sigma_video == sigma_video[0]).all()):
-        raise ValueError("MiniMax H3 requires one uniform video sigma")
-    # A clean first-frame ControlNet anchor must not set the text/audio prefix's noise level.
-    base_video_sigma = sigma_video.max() if self.control_layers else sigma_video[0]
+    # A nearly clean anchor (known frames of a ControlNet or a Remake window) must not set the text/audio prefix's noise level.
+    base_video_sigma = sigma_video.max()
     audio_t = audio_x.shape[-1]
     text_tags = payload["text_token_tags"].view(-1).cpu()
     layout = self._layout(text_tags, latent_t, latent_h, latent_w, audio_t, payload)
@@ -396,13 +394,16 @@ def _usp_forward(self, video_x, audio_x, sigma_video, sigma_audio, context, payl
     else:
         video_x = audio_x = None
 
+    video_time = float(1.0 - base_video_sigma)
+    condition_video_time = max(video_time, T.VISUAL_COND_TIMESTEP)
+    keyframe_times = T._keyframe_timesteps(payload.get("keyframes"), latent_h // self.patch_size[1] * (latent_w // self.patch_size[2]))
     timestep, timestep_indices = T.build_row_timesteps(
         layout,
-        float(1.0 - base_video_sigma),
+        video_time,
         float(1.0 - sigma_audio.flatten()[0]),
-        max(float(1.0 - base_video_sigma), T.VISUAL_COND_TIMESTEP),
+        condition_video_time,
         T.AUDIO_COND_TIMESTEP,
-        keyframe_timesteps=T._keyframe_timesteps(payload.get("keyframes"), latent_h // self.patch_size[1] * (latent_w // self.patch_size[2])),
+        keyframe_timesteps=keyframe_times,
     )
     timestep, timestep_indices = timestep.to(device), timestep_indices.to(device)
     target_video_rows = latent_t * (latent_h // self.patch_size[1]) * (latent_w // self.patch_size[2])
@@ -415,6 +416,20 @@ def _usp_forward(self, video_x, audio_x, sigma_video, sigma_audio, context, payl
             target_video_fixed_rows, target_video_mask_active)
     elif sigma_video.numel() == latent_t:
         timestep, timestep_indices, video_head_row, frame_rows = T._frame_video_timestep_rows(timestep, timestep_indices, sigma_video, target_video_rows)
+    endpoints = None
+    lora_offsets = payload.get("hyperflow_lora")  # (LoraAdaLNOffsets, multiplier): HyperFlow's 8-step LoRA on a pruned model
+    if self.endpoint_gate is not None or lora_offsets is not None:  # HyperFlow: one (t, r) pair per row; rows pinned at their own noise level (fixed, anchored) keep r = t
+        rows_per_frame = target_video_rows // latent_t
+        spans = (grouped_segments if grouped_segments is not None else
+                 [(video_start + index * rows_per_frame, video_start + (index + 1) * rows_per_frame, int(row) * 3) for index, row in enumerate(frame_rows)]
+                 if frame_rows is not None else [])
+        pinned = [(start, stop, value) for start, stop, row in spans if (value := float(timestep[row // 3])) != video_time]
+        video_endpoint, audio_endpoint = payload["endpoint_sigmas"]
+        timestep, endpoints, timestep_indices = T.two_time_rows(layout, timestep, timestep_indices, (1.0 - float(video_endpoint), 1.0 - float(audio_endpoint)),
+                                                                condition_video_time, keyframe_times, pinned)
+        frame_rows = grouped_segments = None
+        runs = T.row_runs(timestep_indices, video_start, layout.sequence_length)
+        video_head_row = runs[0][2] if len(runs) == 1 else runs
     adaln_indices = timestep_indices * 3 + layout.token_tags.to(device).clamp_min(0)
     changes = torch.cat((torch.ones(1, dtype=torch.bool, device=device), adaln_indices[1:] != adaln_indices[:-1],
                          torch.ones(1, dtype=torch.bool, device=device))).nonzero().flatten()
@@ -428,7 +443,14 @@ def _usp_forward(self, video_x, audio_x, sigma_video, sigma_audio, context, payl
     elif grouped_segments is not None:
         segments = [segment for segment in segments if segment[0] < video_start]
         segments.extend(grouped_segments)
-    temb = self._time_embedding(timestep)
+    block_offsets = final_temb = None
+    if lora_offsets is not None:  # the pruned curve at t, each block's AdaLN offsets of the rows' (t, r) pairs in extra columns
+        temb = self._time_embedding(timestep)
+        block_offsets, final_offsets = lora_offsets[0].gather(lora_offsets[0].rows(timestep, endpoints), lora_offsets[1], device)
+        final_temb = torch.cat((temb, final_offsets.to(temb.dtype)), dim=1)
+        del final_offsets
+    else:
+        temb = self._time_embedding(timestep, endpoints=endpoints)
     ref2va_temb = self._time_embedding(timestep, self.ref2va_adaln_t_table) if self.hybrid_ref2va_blocks is not None else None
     rope = payload.get("rope")
     if rope is None:
@@ -465,10 +487,12 @@ def _usp_forward(self, video_x, audio_x, sigma_video, sigma_audio, context, payl
     _S.bounds = bounds
     try:
         with cuda_graphs.scope():  # _usp_graph_gate keeps every block eager
-            for block_index in range(len(self.blocks)):
+            for block_index in self.kept_blocks:  # HyperFlow-pruned models drop blocks
                 self._check_interrupt()
                 block = self.blocks[block_index]
                 block_temb = ref2va_temb if ref2va_temb is not None and self.hybrid_ref2va_blocks[0] <= block_index <= self.hybrid_ref2va_blocks[1] else temb
+                if block_offsets is not None:
+                    block_temb = torch.cat((temb, block_offsets[block_index].to(temb.dtype)), dim=1)
                 h_list = [hidden]
                 hidden = None
                 hidden = block(h_list, block_temb, shard_segments, shard_rope)
@@ -482,9 +506,9 @@ def _usp_forward(self, video_x, audio_x, sigma_video, sigma_audio, context, payl
                                                        max(audio_t - 1, 0))])
     h_list = [hidden]
     hidden = None
-    video, audio = self.final_layer(h_list, temb, (video_start, layout.sequence_length, video_head_row),
+    video, audio = self.final_layer(h_list, temb if final_temb is None else final_temb, (video_start, layout.sequence_length, video_head_row),
                                     (audio_start, video_start, audio_row))
-    del temb, ref2va_temb, rope, timestep_indices
+    del temb, ref2va_temb, rope, timestep_indices, block_offsets, final_temb
     if target_video_inverse_order is not None:
         video = video.index_select(0, target_video_inverse_order)
     video = T._to_dtype([video], video_dtype)
