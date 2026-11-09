@@ -1,0 +1,881 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Minimax H3 Studio</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 26 26%22><rect width=%2226%22 height=%2226%22 rx=%227%22 fill=%22%23b4531f%22/><path d=%22M13 5.5l1.7 5.3 5.5 2.2-5.5 2.2L13 20.5l-1.7-5.3L5.8 13l5.5-2.2z%22 fill=%22%23fff%22/></svg>">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;500;650&family=JetBrains+Mono:wght@400;500&display=swap">
+<!-- The publishable key is public by design: it ships in the page source of
+     every Clerk site and only names which instance to talk to. -->
+<script async crossorigin="anonymous"
+  data-clerk-publishable-key="pk_test_aW1wcm92ZWQtYnVjay00ODk3LmNsZXJrLmFjY291bnRzLmRldiQ"
+  src="https://improved-buck-4897.clerk.accounts.dev/npm/@clerk/clerk-js@5/dist/clerk.browser.js"></script>
+<style>
+  * { box-sizing:border-box; }
+  /* Author display rules (e.g. .banner { display:flex }) override the UA's
+     [hidden] { display:none } in the cascade, which silently un-hides every
+     element the JS toggles via the hidden property. This wins over both. */
+  [hidden] { display:none !important; }
+  body { margin:0; background:#faf9f7; color:#1c1a17;
+         font:400 15px/1.65 Archivo, ui-sans-serif, system-ui, sans-serif; }
+  a { color:#b4531f; text-decoration:none; }
+  a:hover { color:#8f3f14; text-decoration:underline; }
+  button { font:inherit; cursor:pointer; }
+  header { border-bottom:1px solid #e3e0da; background:#fff; }
+  .hwrap { max-width:1200px; margin:0 auto; padding:14px 28px;
+           display:flex; align-items:center; justify-content:space-between; gap:16px; }
+  .brand { display:flex; align-items:center; gap:10px; }
+  .brand b { font-weight:650; font-size:16px; }
+  .brand span { font-size:11px; letter-spacing:.12em; text-transform:uppercase; color:#6b665e;
+                padding-top:2px; }
+  .hbtns { display:flex; align-items:center; gap:18px; }
+  .signin { font-size:13px; font-weight:500; color:#1c1a17; background:none; border:none; padding:0; }
+  .signin:hover { color:#b4531f; }
+  .signup { font-size:13px; font-weight:650; color:#fff; background:#b4531f;
+            border:1px solid #b4531f; border-radius:7px; padding:7px 14px; }
+  .signup:hover { background:#9c4517; }
+  main { max-width:1200px; margin:0 auto; padding:28px 28px 70px; }
+  .cols { display:flex; flex-wrap:wrap; gap:26px; align-items:flex-start; }
+  .panel { flex:0 1 360px; min-width:320px; }
+  .card { background:#fff; border:1px solid #e3e0da; border-radius:14px; padding:20px; }
+  .tabs { display:flex; background:#f4f2ee; border-radius:9px; padding:3px; gap:3px; }
+  .tabs button { flex:1; font-size:13px; font-weight:500; padding:7px 10px; border-radius:7px;
+                 background:transparent; border:1px solid transparent; color:#6b665e; }
+  .tabs button.on { background:#fff; border-color:#e3e0da; color:#1c1a17; }
+  label, .lbl { display:block; font-size:12px; text-transform:uppercase; letter-spacing:.07em;
+                color:#6b665e; margin:0 0 5px; }
+  .field { margin-top:16px; }
+  .drop { border:1.5px dashed #d5d1c9; border-radius:9px; padding:22px 14px; text-align:center;
+          cursor:pointer; background:#faf9f7; font-size:13px; color:#6b665e; }
+  .drop:hover, .drop.over { border-color:#b4531f; }
+  .drop.has { color:#1c1a17; }
+  .hint { font-size:12px; color:#6b665e; margin:6px 0 0; line-height:1.5; }
+  .prompt-head { display:flex; align-items:baseline; justify-content:space-between; }
+  .count { font-size:11px; color:#6b665e; font-family:"JetBrains Mono",monospace; }
+  textarea { width:100%; min-height:130px; resize:vertical; margin-top:5px;
+             font-family:"JetBrains Mono",monospace; font-size:12.5px; line-height:1.55;
+             color:#1c1a17; background:#faf9f7; border:1px solid #e3e0da; border-radius:9px;
+             padding:11px 13px; }
+  textarea:focus, input:focus { outline:2px solid #b4531f; outline-offset:-1px; }
+  .chips { display:flex; align-items:center; gap:6px; flex-wrap:wrap; margin-top:8px; }
+  .chips span { font-size:12px; color:#6b665e; }
+  .chips button { font-size:12px; color:#6b665e; background:#faf9f7; border:1px solid #e3e0da;
+                  border-radius:20px; padding:3px 10px; }
+  .chips button:hover { border-color:#b4531f; color:#b4531f; }
+  .segs { display:flex; gap:6px; }
+  .segs button { flex:1; display:inline-flex; align-items:center; justify-content:center; gap:5px;
+                 font-size:13px; font-weight:500; border-radius:7px; height:36px; padding:0;
+                 background:#fff; border:1px solid #e3e0da; color:#6b665e; }
+  .segs button.on { border-color:#b4531f; color:#b4531f; }
+  .lock { display:inline-flex; align-items:center; }
+  body.signedin .lock { display:none; }
+  .gate { display:flex; align-items:center; gap:10px; margin:0 0 16px; padding:10px 12px;
+          background:#faf5f1; border:1px solid #ecd9cc; border-radius:8px; }
+  .gate span { flex:1; font-size:12.5px; color:#8f3f14; line-height:1.45; }
+  .gate .signup { font-size:12px; padding:5px 11px; border-radius:6px; flex:none; }
+  .adv-toggle { display:inline-flex; align-items:center; gap:5px; font-size:12.5px; font-weight:500;
+                color:#6b665e; background:none; border:none; padding:0; }
+  .adv-toggle:hover { color:#b4531f; }
+  .adv-toggle svg { transition:transform .15s; }
+  .adv-toggle.open svg { transform:rotate(90deg); }
+  input[type=number], input[type=password] { width:100%; font-family:"JetBrains Mono",monospace;
+    font-size:13px; color:#1c1a17; background:#faf9f7; border:1px solid #e3e0da;
+    border-radius:7px; padding:9px 11px; }
+  input[type=password] { font-family:Archivo, ui-sans-serif, system-ui, sans-serif; font-size:14px; }
+  .create { display:flex; align-items:center; justify-content:center; gap:12px; width:100%;
+            margin-top:16px; background:#b4531f; color:#fff; border:1px solid #9c4517;
+            border-radius:10px; padding:12px 16px; box-shadow:0 1px 2.5px rgba(28,26,23,.18); }
+  .create .clabel { display:inline-flex; align-items:center; gap:9px; font-weight:650;
+                    font-size:16px; letter-spacing:.01em; }
+  .create .cpill { display:inline-flex; align-items:center; gap:6px; font-size:12px; color:#fff;
+                   font-family:"JetBrains Mono",monospace; background:rgba(255,255,255,.16);
+                   padding:4px 11px; border-radius:20px; font-variant-numeric:tabular-nums; }
+  .create:hover { background:#9c4517; }
+  .create:disabled { opacity:.5; cursor:not-allowed; }
+  .stagecol { flex:1.4 1 420px; min-width:320px; }
+  .stage { position:relative; aspect-ratio:16/9; border-radius:12px; overflow:hidden;
+           background:#151412; border:1px solid #33302b; }
+  .stage .center { position:absolute; inset:0; display:flex; flex-direction:column;
+                   align-items:center; justify-content:center; gap:8px; padding:0 24px; }
+  .stage .mono { font-family:"JetBrains Mono",monospace; font-size:12px; color:#a09a90; }
+  .stage .sub { font-size:11.5px; color:#6b665e; }
+  .stage .clock { font-family:"JetBrains Mono",monospace; font-size:58px; font-weight:500;
+                  line-height:1; font-variant-numeric:tabular-nums; color:#eeebe5; }
+  .stage .clock small { font-size:24px; color:#a09a90; font-weight:400; }
+  .stage .busymsg { font-size:13px; color:#a09a90; text-align:center; }
+  .stage .pvwimg { position:absolute; inset:0; width:100%; height:100%; object-fit:cover;
+                   opacity:.45; }
+  .stage .clock, .stage .busymsg { position:relative; text-shadow:0 1px 8px rgba(0,0,0,.7); }
+  .stage video { position:absolute; inset:0; width:100%; height:100%; display:block; background:#000; }
+  .done { display:flex; align-items:baseline; justify-content:space-between; gap:12px;
+          flex-wrap:wrap; margin-top:14px; }
+  .done .big { font-size:20px; font-weight:650; letter-spacing:-.01em; }
+  .done .big b { color:#b4531f; font-variant-numeric:tabular-nums; font-weight:650; }
+  .done .meta { font-size:12px; color:#6b665e; font-family:"JetBrains Mono",monospace; }
+  .belowmsg { font-size:14px; margin:10px 0 0; color:#6b665e; }
+  .belowmsg.err { color:#b4531f; }
+  .belowmsg.ok { color:#2f7d52; }
+  h2 { font-size:13px; font-weight:650; text-transform:uppercase; letter-spacing:.09em;
+       color:#6b665e; margin:32px 0 6px; }
+  .retention { font-size:12.5px; color:#9a6b12; margin:0 0 14px; }
+  .freeline { font-size:12px; color:#6b665e; margin:10px 0 0; text-align:center; }
+  .banner { display:flex; align-items:center; gap:14px; margin-top:14px; padding:13px 16px;
+            background:#fff; border:1px solid #e3e0da; border-radius:10px; }
+  .banner .txt { flex:1; font-size:13.5px; color:#1c1a17; line-height:1.5; }
+  .banner .x { font-size:15px; color:#6b665e; background:none; border:none; padding:0; flex:none; }
+  .banner .x:hover { color:#1c1a17; }
+  .empty { font-size:13px; color:#6b665e; margin:0; }
+  @keyframes omFade { from { opacity:0 } to { opacity:1 } }
+  @keyframes omPop { from { opacity:0; transform:scale(.96) translateY(8px) } to { opacity:1; transform:none } }
+  .modalback { position:fixed; inset:0; background:rgba(28,26,23,.52); backdrop-filter:blur(3px);
+               display:flex; justify-content:center; z-index:50; padding:20px; overflow-y:auto;
+               animation:omFade .18s ease-out; }
+  .modal { position:relative; background:#fff; border-radius:18px; width:400px; max-width:100%;
+           margin:auto; flex:none; height:fit-content; overflow:hidden;
+           box-shadow:0 32px 80px rgba(28,26,23,.35), 0 4px 16px rgba(28,26,23,.12);
+           animation:omPop .22s ease-out; }
+  .modal .mx { position:absolute; top:14px; right:14px; width:28px; height:28px;
+               display:flex; align-items:center; justify-content:center; font-size:14px;
+               line-height:1; color:#8a8478; background:none; border:none; border-radius:8px; z-index:1; }
+  .modal .mx:hover { background:rgba(28,26,23,.07); color:#1c1a17; }
+  .modal .mhead { background:linear-gradient(180deg,#f9ecdf,#fff); padding:30px 28px 18px;
+                  display:flex; flex-direction:column; align-items:center; gap:14px; }
+  .modal .mbadge { font-family:"JetBrains Mono",monospace; font-size:11px; color:#8f3f14;
+                   background:rgba(180,83,31,.09); border:1px solid rgba(180,83,31,.18);
+                   border-radius:20px; padding:4px 11px; }
+  .modal .mbody { padding:8px 30px 24px; }
+  .modal .mtitle { font-size:20px; font-weight:650; line-height:1.25; letter-spacing:-.01em;
+                   text-align:center; margin:0 0 6px; }
+  .modal .msub { font-size:13.5px; color:#6b665e; margin:0 0 20px; line-height:1.55; text-align:center; }
+  .modal .mperks { display:flex; flex-direction:column; gap:12px; margin:0 0 22px; }
+  .modal .mperk { display:flex; align-items:center; gap:12px; font-size:13.5px; }
+  .modal .mperk span { width:28px; height:28px; border-radius:50%; background:#faf1e9;
+                       display:flex; align-items:center; justify-content:center; flex:none; color:#b4531f; }
+  .modal .mgoogle { display:flex; align-items:center; justify-content:center; gap:8px; width:100%;
+                    font-size:14px; font-weight:500; color:#1c1a17; background:#fff;
+                    border:1px solid #d5d1c9; border-radius:10px; padding:11px 16px; }
+  .modal .mgoogle:hover { border-color:#b4531f; }
+  .modal .mgoogle b { font-weight:650; font-size:14px; }
+  .modal .mor { display:flex; align-items:center; gap:12px; margin:14px 0; }
+  .modal .mor i { flex:1; height:1px; background:#ece9e3; }
+  .modal .mor em { font-size:11px; color:#8a8478; text-transform:uppercase;
+                   letter-spacing:.08em; font-style:normal; }
+  .modal input[type=email] { width:100%; font:inherit; font-size:14px; color:#1c1a17; background:#fff;
+                             border:1px solid #d5d1c9; border-radius:10px; padding:11px 13px; }
+  .modal .mcontinue { display:block; width:100%; font-size:14.5px; font-weight:650; color:#fff;
+                      background:#b4531f; border:1px solid #9c4517; border-radius:10px;
+                      padding:12px 16px; margin-top:8px; box-shadow:0 1px 3px rgba(28,26,23,.2); }
+  .modal .mcontinue:hover { background:#9c4517; }
+  .modal .mlater { display:block; width:100%; font-size:12.5px; font-weight:500; color:#8a8478;
+                   background:none; border:none; padding:14px 0 0; text-align:center; }
+  .modal .mlater:hover { color:#1c1a17; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(200px,1fr)); gap:14px; }
+  .tile { background:#fff; border:1px solid #e3e0da; border-radius:10px; padding:0 0 10px;
+          cursor:pointer; overflow:hidden; }
+  .tile:hover { border-color:#b4531f; }
+  .thumb { position:relative; aspect-ratio:16/9; background:#151412; display:flex;
+           align-items:center; justify-content:center; overflow:hidden; }
+  .thumb video { width:100%; height:100%; object-fit:cover; pointer-events:none; }
+  .thumb .play { position:absolute; width:32px; height:32px; border-radius:50%;
+                 background:rgba(238,235,229,.92); display:flex; align-items:center;
+                 justify-content:center; color:#1c1a17; font-size:10px; padding-left:2px; }
+  .thumb .dur { position:absolute; right:8px; bottom:8px; font-family:"JetBrains Mono",monospace;
+                font-size:10.5px; color:#eeebe5; background:rgba(0,0,0,.55); padding:2px 6px;
+                border-radius:4px; }
+  .thumb .extag { position:absolute; left:8px; top:8px; font-family:"JetBrains Mono",monospace;
+                  font-size:10px; color:#eeebe5; background:rgba(0,0,0,.55); padding:2px 6px;
+                  border-radius:4px; }
+  .tile .title { padding:9px 12px 0; font-size:13px; font-weight:500; line-height:1.4;
+                 color:#1c1a17; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .tile .sub { padding:3px 12px 0; font-size:11px; color:#6b665e;
+               font-family:"JetBrains Mono",monospace; }
+  .tile .acts { display:flex; align-items:center; gap:12px; padding:9px 12px 0;
+                opacity:.55; transition:opacity .15s; }
+  .tile:hover .acts { opacity:1; }
+  .tile .save { display:inline-flex; align-items:center; gap:4px; font-size:12px; font-weight:650;
+                color:#b4531f; background:none; border:none; padding:0; }
+  .tile .save:hover { text-decoration:underline; }
+  .tile .ghost { display:inline-flex; align-items:center; gap:4px; font-size:12px; color:#6b665e;
+                 background:none; border:none; padding:0; }
+  .tile .ghost:hover { text-decoration:underline; color:#b4531f; }
+  .tile .del:hover { color:#6b665e; }
+</style>
+</head>
+<body>
+<header><div class="hwrap">
+  <div class="brand">
+    <svg width="26" height="26" viewBox="0 0 26 26"><rect width="26" height="26" rx="7" fill="#b4531f"/><path d="M13 5.5l1.7 5.3 5.5 2.2-5.5 2.2L13 20.5l-1.7-5.3L5.8 13l5.5-2.2z" fill="#fff"/></svg>
+    <b>Minimax H3 Studio</b><span>Fast video generation</span>
+  </div>
+  <div class="hbtns">
+    <button type="button" class="signin" id="signin">Sign in</button>
+    <button type="button" class="signup" id="signup">Sign up free</button>
+    <div id="userbtn" hidden></div>
+  </div>
+</div></header>
+
+<main><div class="cols">
+  <div class="panel">
+    <div class="card">
+      <div>
+        <div class="prompt-head">
+          <label style="margin:0">Prompt</label>
+          <span class="count"><span id="chars">0</span> / 2000</span>
+        </div>
+        <textarea id="prompt" spellcheck="false" maxlength="2000" placeholder="A brass desk lamp switches on in a dark study, dust drifting through the beam…"></textarea>
+        <div class="chips">
+          <button type="button" data-p="integrated_multimodal_description: [Shot 1] A cinematic close-up of a brass desk lamp switching on in a dark study, dust drifting through the beam. The camera pushes in slowly.&#10;overall_soundscape: A single click, a low electrical hum, faint room tone.&#10;non_diegetic_music: None.">Desk lamp</button>
+          <button type="button" data-p="integrated_multimodal_description: [Shot 1] Rain streaking down a café window at dusk, neon signs blurring into bokeh beyond the glass. The camera holds still.&#10;overall_soundscape: Steady rain, muffled street noise, a distant tram bell.&#10;non_diegetic_music: None.">Rain on glass</button>
+          <button type="button" data-p="integrated_multimodal_description: [Shot 1] A slow-motion espresso shot pouring into a white cup, crema folding over itself, warm morning light.&#10;overall_soundscape: The hiss of the machine, a liquid trickle, quiet café murmur.&#10;non_diegetic_music: None.">Espresso pour</button>
+        </div>
+      </div>
+
+      <div class="field"><label>Length</label>
+        <div class="segs" id="durs">
+          <button type="button" data-v="5" class="on">5 s</button>
+          <button type="button" data-v="10"><span class="lock"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg></span>10 s</button>
+          <button type="button" data-v="15"><span class="lock"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg></span>15 s</button>
+        </div>
+      </div>
+
+      <div style="display:flex;gap:14px;margin-top:16px;margin-bottom:16px">
+        <div style="flex:1.1"><label>Resolution</label>
+          <div class="segs" id="tiers">
+            <button type="button" data-v="480p" class="on">480p</button>
+            <button type="button" data-v="720p"><span class="lock"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg></span>720p</button>
+          </div>
+        </div>
+        <div style="flex:1"><label>Aspect</label>
+          <div class="segs" id="aspects">
+            <button type="button" data-v="portrait" title="Portrait"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="8" y="3.5" width="8" height="17" rx="1.5"/></svg></button>
+            <button type="button" data-v="horizontal" title="Horizontal" class="on"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3.5" y="8" width="17" height="8" rx="1.5"/></svg></button>
+            <button type="button" data-v="square" title="Square"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="5.5" y="5.5" width="13" height="13" rx="1.5"/></svg></button>
+          </div>
+        </div>
+      </div>
+
+      <div class="gate" id="gate" hidden>
+        <span id="gatemsg"></span>
+        <button type="button" class="signup" id="gateup">Sign up free</button>
+      </div>
+      <p class="freeline" id="freehint" style="margin:0 0 16px">5 s at 480p is free —
+        <a href="#" id="freeup">sign up</a> for 10–15 s and 720p.</p>
+
+      <div>
+        <button type="button" class="adv-toggle" id="advtoggle"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18l6-6-6-6"/></svg>Advanced</button>
+        <div id="advbody" hidden style="margin-top:12px">
+          <label>Seed</label>
+          <input id="seed" type="number" value="-1" spellcheck="false">
+          <p class="hint">-1 picks a random seed. A fixed seed with an identical prompt reproduces the same video.</p>
+          <div style="margin-top:12px">
+            <label>API key</label>
+            <input id="key" type="password" placeholder="sk_live_…" autocomplete="off" spellcheck="false">
+          </div>
+        </div>
+      </div>
+
+      <button type="button" class="create" id="go">
+        <span class="clabel"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2l2.4 7.6L22 12l-7.6 2.4L12 22l-2.4-7.6L2 12l7.6-2.4z"/></svg>Create</span>
+        <span class="cpill"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3.5 2"/></svg><span id="est">~22 s</span></span>
+      </button>
+      <p class="freeline" id="quotaline"></p>
+    </div>
+  </div>
+
+  <div class="stagecol">
+    <div class="stage" id="stage">
+      <div class="center" id="idlebox">
+        <span class="mono">the generated video appears here</span>
+        <span class="sub">write a prompt — a 5 s clip lands in about 22 seconds</span>
+      </div>
+      <div class="center" id="busybox" hidden>
+        <img class="pvwimg" id="pvw" alt="" hidden>
+        <div class="clock"><span id="clock">0.0</span><small> s</small></div>
+        <div class="busymsg" id="busymsg"></div>
+      </div>
+      <video id="vid" controls playsinline hidden></video>
+    </div>
+    <div class="done" id="donebox" hidden>
+      <div class="big">Generated in <b id="finalt"></b></div>
+      <div class="meta" id="meta"></div>
+    </div>
+    <div class="banner" id="banner" hidden>
+      <div class="txt">Like the speed? A free account unlocks longer lengths, 720p, and 20 generations a day during the beta.</div>
+      <button type="button" class="signup" id="bannerup">Sign up free</button>
+      <button type="button" class="x" id="bannerx" title="Dismiss">✕</button>
+    </div>
+    <p class="belowmsg" id="msg" hidden></p>
+
+    <h2>Recent generations</h2>
+    <p class="retention">Clips only live in this browser — use Save to download anything you want to keep or open on another device.</p>
+    <p class="empty" id="empty">Videos you generate this session appear here.</p>
+    <div class="grid" id="grid"></div>
+  </div>
+</div></main>
+
+<div class="modalback" id="limitback" hidden>
+  <div class="modal">
+    <button type="button" class="mx" id="limitx" title="Close">✕</button>
+    <div class="mhead">
+      <svg width="44" height="44" viewBox="0 0 26 26" style="filter:drop-shadow(0 3px 6px rgba(180,83,31,.3))"><rect width="26" height="26" rx="8" fill="#b4531f"/><path d="M13 5.5l1.7 5.3 5.5 2.2-5.5 2.2L13 20.5l-1.7-5.3L5.8 13l5.5-2.2z" fill="#fff"/></svg>
+      <span class="mbadge" id="limitbadge">2 of 2 free clips used</span>
+    </div>
+    <div class="mbody">
+      <div class="mtitle">Keep creating for free</div>
+      <p class="msub">A free account gets you 20 clips a day.</p>
+      <div class="mperks">
+        <div class="mperk"><span><svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2l2.4 7.6L22 12l-7.6 2.4L12 22l-2.4-7.6L2 12l7.6-2.4z"/></svg></span>20 generations every day</div>
+        <div class="mperk"><span><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3.5 2"/></svg></span>Longer 10 and 15 second clips</div>
+        <div class="mperk"><span><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><rect x="3" y="6" width="18" height="12" rx="2"/></svg></span>Sharper 720p resolution</div>
+      </div>
+      <button type="button" class="mgoogle" id="limitgoogle"><b>G</b>Continue with Google</button>
+      <div class="mor"><i></i><em>or</em><i></i></div>
+      <input type="email" id="limitemail" placeholder="Enter your email" autocomplete="off" spellcheck="false">
+      <button type="button" class="mcontinue" id="limitcontinue">Continue</button>
+      <button type="button" class="mlater" id="limitlater">Maybe later</button>
+    </div>
+  </div>
+</div>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const state = { dur:"5", tier:"480p", aspect:"horizontal",
+                busy:false, gallery:[] };
+
+// ---- key handling: ?key= prefods the field then leaves the address bar -----
+// A key left in the URL leaks into history, Referer headers and proxy logs.
+(function adoptKeyFromUrl() {
+  const url = new URL(location.href);
+  const fromUrl = url.searchParams.get("key");
+  if (!fromUrl) return;
+  try { sessionStorage.setItem("gw.key", fromUrl); } catch {}
+  url.searchParams.delete("key");
+  history.replaceState(null, "", url.pathname + url.search + url.hash);
+})();
+try { $("key").value = sessionStorage.getItem("gw.key") || ""; } catch {}
+$("key").addEventListener("change", () => {
+  try { sessionStorage.setItem("gw.key", $("key").value); } catch {}
+});
+
+// ---- Clerk -----------------------------------------------------------------
+// The script tag in <head> loads ClerkJS async, so window.Clerk may not exist
+// yet when this runs -- wait for it rather than racing it. If it never shows
+// up (ad blocker, offline), the page still works as a signed-out visitor.
+let clerkReady = false;
+const clerkInit = (async function initClerk() {
+  for (let i = 0; i < 100 && typeof window.Clerk === "undefined"; i++)
+    await new Promise(r => setTimeout(r, 100));
+  if (typeof window.Clerk === "undefined") return;
+  try { await Clerk.load(); } catch { return; }
+  clerkReady = true;
+  renderAuth();
+  Clerk.addListener(renderAuth);
+})();
+
+// ---- gallery persistence ---------------------------------------------------
+// The browser is the system of record for clips: each mp4 is written into
+// IndexedDB the moment it downloads (localStorage cannot hold binary and
+// caps out around 5 MB), and the server deletes its copy after ~5 minutes.
+// Every helper swallows failure -- private windows and cleared site data
+// degrade to a session-only gallery, never a broken page.
+function idb() {
+  return new Promise((res, rej) => {
+    const rq = indexedDB.open("h3studio", 1);
+    rq.onupgradeneeded = () => rq.result.createObjectStore("clips", { keyPath: "id" });
+    rq.onsuccess = () => res(rq.result);
+    rq.onerror = () => rej(rq.error);
+  });
+}
+async function clipPut(entry) {
+  try {
+    const db = await idb();
+    await new Promise((res, rej) => {
+      const tx = db.transaction("clips", "readwrite");
+      tx.objectStore("clips").put(entry);
+      tx.oncomplete = res; tx.onerror = () => rej(tx.error);
+    });
+  } catch {}
+}
+async function clipAll() {
+  try {
+    const db = await idb();
+    return await new Promise((res, rej) => {
+      const rq = db.transaction("clips").objectStore("clips").getAll();
+      rq.onsuccess = () => res(rq.result || []);
+      rq.onerror = () => rej(rq.error);
+    });
+  } catch { return []; }
+}
+async function clipDrop(id) {
+  try {
+    const db = await idb();
+    await new Promise((res, rej) => {
+      const tx = db.transaction("clips", "readwrite");
+      tx.objectStore("clips").delete(id);
+      tx.oncomplete = res; tx.onerror = () => rej(tx.error);
+    });
+  } catch {}
+}
+async function pruneClips() {
+  const all = (await clipAll()).sort((a, b) => b.at - a.at);
+  for (const e of all.slice(12)) await clipDrop(e.id);   // storage cap
+}
+async function restoreGallery() {
+  const clips = (await clipAll()).sort((a, b) => b.at - a.at).slice(0, 12);
+  if (!clips.length) return;
+  const restored = clips.map(({ blob, ...meta }) =>
+    ({ ...meta, url: URL.createObjectURL(blob) }));
+  const ex = state.gallery.filter(g => g.example);
+  const mine = state.gallery.filter(g => !g.example);
+  state.gallery = [...mine, ...restored, ...ex];
+  renderGallery();
+}
+function signedIn() { return clerkReady && !!Clerk.user; }
+function renderAuth() {
+  const yes = signedIn();
+  document.body.classList.toggle("signedin", yes);   // hides the lock icons
+  $("signin").hidden = yes;
+  $("signup").hidden = yes;
+  $("userbtn").hidden = !yes;
+  $("key").placeholder = yes ? "optional — you're signed in" : "sk_live_…";
+  if (yes) { $("banner").hidden = true; $("gate").hidden = true; hideLimitModal(); }
+  $("freehint").hidden = yes || !$("gate").hidden;
+  for (const b of document.querySelectorAll(
+      '#durs button[data-v="10"], #durs button[data-v="15"], #tiers button[data-v="720p"]'))
+    b.title = yes ? "" : "Requires a free account";
+  refreshQuota();                       // the identity just changed
+  // Mounting last: a throw inside ClerkJS must not leave sign-up prompts
+  // showing to a signed-in user.
+  if (yes && !$("userbtn").hasChildNodes()) {
+    try { Clerk.mountUserButton($("userbtn")); } catch {}
+  }
+}
+// Dev-instance sign-in navigates away and back; a bfcache restore brings the
+// old DOM with it, so re-render auth state whenever the page is shown again.
+window.addEventListener("pageshow", () => { if (clerkReady) renderAuth(); });
+function openSignUp(e) {
+  if (e) e.preventDefault();
+  if (!clerkReady) return say("Sign-in is still loading — try again in a second.", "err");
+  Clerk.openSignUp({ afterSignInUrl: location.href, afterSignUpUrl: location.href });
+}
+$("signin").addEventListener("click", () => {
+  if (!clerkReady) return say("Sign-in is still loading — try again in a second.", "err");
+  Clerk.openSignIn({ afterSignInUrl: location.href, afterSignUpUrl: location.href });
+});
+$("signup").addEventListener("click", openSignUp);
+$("gateup").addEventListener("click", openSignUp);
+$("bannerup").addEventListener("click", openSignUp);
+$("freeup").addEventListener("click", openSignUp);
+$("bannerx").addEventListener("click", () => {
+  $("banner").hidden = true;
+  try { sessionStorage.setItem("gw.bannerDismissed", "1"); } catch {}
+});
+
+// ---- the free-account limit modal ------------------------------------------
+// Shown when a visitor's free clips are spent. It is the marketing wrapper;
+// the actual auth is Clerk's sign-up, with a typed email carried through.
+function showLimitModal() {
+  if (quota && quota.kind === "visitor")
+    $("limitbadge").textContent = quota.used + " of " + quota.limit + " free clips used";
+  $("limitback").hidden = false;
+}
+function hideLimitModal() { $("limitback").hidden = true; }
+$("limitx").addEventListener("click", hideLimitModal);
+$("limitlater").addEventListener("click", hideLimitModal);
+$("limitback").addEventListener("click", e => {
+  if (e.target === $("limitback")) hideLimitModal();
+});
+$("limitgoogle").addEventListener("click", e => { hideLimitModal(); openSignUp(e); });
+$("limitcontinue").addEventListener("click", () => {
+  const email = $("limitemail").value.trim();
+  hideLimitModal();
+  if (!clerkReady) return say("Sign-in is still loading — try again in a second.", "err");
+  Clerk.openSignUp({
+    afterSignInUrl: location.href, afterSignUpUrl: location.href,
+    ...(email ? { initialValues: { emailAddress: email } } : {}),
+  });
+});
+function bannerDismissed() {
+  try { return sessionStorage.getItem("gw.bannerDismissed") === "1"; } catch { return false; }
+}
+
+// ---- free-tier gating ------------------------------------------------------
+const FREE_CAP = 2, BETA_CAP = 20;      // gate copy only; limits live server-side
+// The quota line shows what the SERVER says is left. An earlier version kept
+// a sessionStorage counter, which promised "2 of 2 left" to a visitor whose
+// address had already spent both -- the server then 429'd the "first" clip.
+let quota = null;
+async function refreshQuota() {
+  try {
+    const r = await fetch("/v1/quota", { headers: await authHeaders() });
+    if (r.ok) quota = await r.json();
+  } catch {}
+  updateQuotaLine();
+}
+function updateQuotaLine() {
+  if (!quota) { $("quotaline").textContent = ""; return; }
+  $("quotaline").textContent = quota.kind === "visitor"
+    ? quota.remaining + " of " + quota.limit +
+      " free generations left — sign up for " + BETA_CAP + " a day in the beta"
+    : quota.remaining + " of " + quota.limit +
+      (quota.kind === "clerk" ? " beta" : "") + " generations left today";
+}
+// The gate and the free hint share the slot: whichever applies is visible.
+function showGate(msg) {
+  $("gatemsg").textContent = msg;
+  $("gate").hidden = false;
+  $("freehint").hidden = true;
+}
+function hideGate() {
+  $("gate").hidden = true;
+  $("freehint").hidden = signedIn();
+}
+
+// ---- pickers ---------------------------------------------------------------
+function pick(groupId, value, stateKey) {
+  // Anything past 5 s at 480p needs an account (or a pasted API key).
+  const gated = (stateKey === "dur" && value !== "5") ||
+                (stateKey === "tier" && value === "720p");
+  if (gated && !signedIn() && !$("key").value.trim())
+    return showGate("Longer lengths and 720p need a free account.");
+  hideGate();
+  for (const b of $(groupId).querySelectorAll("button"))
+    b.classList.toggle("on", b.dataset.v === value);
+  state[stateKey] = value;
+  updateEstimate();
+}
+$("durs").addEventListener("click", e => { const b = e.target.closest("button"); if (b) pick("durs", b.dataset.v, "dur"); });
+$("tiers").addEventListener("click", e => { const b = e.target.closest("button"); if (b) pick("tiers", b.dataset.v, "tier"); });
+$("aspects").addEventListener("click", e => { const b = e.target.closest("button"); if (b) pick("aspects", b.dataset.v, "aspect"); });
+
+// ---- smart estimate --------------------------------------------------------
+// The pill is computed, not hardcoded: warm per-combo seconds come from the
+// server (rolling averages of real completions), plus a queue-wait term and
+// the cold-start penalty when no worker is ready. The static numbers below
+// only paint the first frame and cover a failed fetch. This is one cached
+// fetch on demand, not the old 10-second heartbeat.
+const FALLBACK = { "480p": { "5": 30, "10": 65, "15": 110 },
+                   "720p": { "5": 55, "10": 115, "15": 200 } };
+let healthCache = null, healthAt = 0;
+async function healthInfo() {
+  if (healthCache && Date.now() - healthAt < 30000) return healthCache;
+  try {
+    const r = await fetch("/v1/health");
+    if (r.ok) { healthCache = await r.json(); healthAt = Date.now(); }
+  } catch {}
+  return healthCache;
+}
+// Rounds UP: a clip landing early reads as fast, one landing late reads as
+// broken, so the display never promises less than the computed number.
+function fmtDur(s) {
+  if (s < 60) return "~" + Math.max(5, Math.ceil(s / 5) * 5) + " s";
+  const m = s / 60;
+  return "~" + (m < 3 ? (Math.ceil(m * 2) / 2).toString().replace(".5", "½") : Math.ceil(m)) + " min";
+}
+function computeEstimate(h) {
+  const times = h && h.estimate && h.estimate.times[state.tier];
+  let s = (times && times[state.dur]) || FALLBACK[state.tier][state.dur];
+  let cold = false;
+  if (h) {
+    const q = h.queue || {}, c = h.capacity || {};
+    const inflight = (q.waiting || 0) + (q.running || 0);
+    s += inflight * ((h.estimate && h.estimate.avg_job_s) || 60);
+    if (!(c.ready > 0)) {
+      // A starting worker is partway through the cold start already.
+      s += (h.estimate ? h.estimate.cold_start_s : 150) / (c.starting > 0 ? 2 : 1);
+      cold = true;
+    }
+    cold = cold || inflight > 0;
+  }
+  // Safety margin: a "ready" worker that just booted still reloads the model
+  // on its first job, which the ready count cannot see.
+  return { s: Math.round(s * 1.2), cold };
+}
+let estSeq = 0;
+async function updateEstimate() {
+  const seq = ++estSeq;
+  $("est").textContent = fmtDur(FALLBACK[state.tier][state.dur]);  // instant paint
+  const h = await healthInfo();
+  if (h && seq === estSeq) $("est").textContent = fmtDur(computeEstimate(h).s);
+}
+
+// ---- prompt ----------------------------------------------------------------
+const promptEl = $("prompt");
+function syncChars() { $("chars").textContent = promptEl.value.length; }
+promptEl.addEventListener("input", syncChars);
+syncChars();
+document.querySelector(".chips").addEventListener("click", e => {
+  const b = e.target.closest("button[data-p]");
+  if (b) { promptEl.value = b.dataset.p; syncChars(); }
+});
+
+$("advtoggle").addEventListener("click", () => {
+  const open = $("advbody").hidden;
+  $("advbody").hidden = !open;
+  $("advtoggle").classList.toggle("open", open);
+});
+
+// ---- messages + stage ------------------------------------------------------
+function say(text, cls) {
+  const m = $("msg");
+  if (!text) { m.hidden = true; return; }
+  m.textContent = text; m.className = "belowmsg " + (cls || ""); m.hidden = false;
+}
+function showStage(which) {   // "idle" | "busy" | "video"
+  $("idlebox").hidden = which !== "idle";
+  $("busybox").hidden = which !== "busy";
+  $("vid").hidden = which !== "video";
+}
+let clockTimer = null, busyEstS = 0, overrunNoted = false, busyBase = "";
+// One writer for the busy message: live progress updates and the overrun
+// note compose instead of overwriting each other.
+function setBusy(text) {
+  busyBase = text;
+  $("busymsg").textContent =
+    text + (overrunNoted ? " Taking longer than usual — still running." : "");
+}
+function startClock(started) {
+  clearInterval(clockTimer);
+  overrunNoted = false;
+  clockTimer = setInterval(() => {
+    const elapsed = (Date.now() - started) / 1000;
+    $("clock").textContent = elapsed.toFixed(1);
+    // Own the miss instead of counting silently past the promise.
+    if (busyEstS && !overrunNoted && elapsed > busyEstS * 1.5) {
+      overrunNoted = true;
+      setBusy(busyBase);
+    }
+  }, 100);
+}
+// What the worker is doing right now, from the progress frames it pushes.
+function stepText(p) {
+  if (!p || !p.phase) return null;
+  const stage = /^inference_stage_(\d+)$/.exec(p.phase);
+  let label = stage ? "Generating video"
+    : { encoding_text: "Reading the prompt", vae: "Decoding frames" }[p.phase]
+      || p.phase.replace(/_/g, " ");
+  if (p.step != null && p.total_steps) label += " — step " + p.step + " of " + p.total_steps;
+  if (p.eta_s != null) label += " · ~" + Math.max(1, Math.round(p.eta_s)) + " s left";
+  return label + ".";
+}
+
+// ---- gallery ---------------------------------------------------------------
+function titleOf(p) {
+  return p.replace(/^integrated_multimodal_description:\s*/, "")
+          .replace(/^\[[^\]]*\]\s*/, "").split("\n")[0].slice(0, 70);
+}
+function renderGallery() {
+  const grid = $("grid");
+  grid.textContent = "";
+  $("empty").hidden = state.gallery.length > 0;
+  state.gallery.forEach((g, i) => {
+    const tile = document.createElement("div");
+    tile.className = "tile";
+    tile.innerHTML =
+      '<div class="thumb"><video muted preload="metadata"></video>' +
+      '<span class="play">▶</span><span class="dur"></span>' +
+      '<span class="extag" hidden>example</span></div>' +
+      '<div class="title"></div><div class="sub"></div>' +
+      '<div class="acts"><button type="button" class="save"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12"/><path d="M6 11l6 6 6-6"/><path d="M4 21h16"/></svg>Save</button>' +
+      '<button type="button" class="ghost reuse"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 4v6h6"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/></svg>Reuse</button>' +
+      '<button type="button" class="ghost del"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16"/><path d="M9 7V4h6v3"/><path d="M6 7l1 14h10l1-14"/></svg>Delete</button></div>';
+    tile.querySelector(".thumb video").src = g.url;
+    tile.querySelector(".extag").hidden = !g.example;
+    tile.querySelector(".dur").textContent = g.dur + " s";
+    tile.querySelector(".title").textContent = g.title;
+    tile.querySelector(".sub").textContent = g.sub;
+    tile.addEventListener("click", () => {
+      $("vid").src = g.url; showStage("video");
+      $("finalt").textContent = g.t + " s"; $("meta").textContent = g.meta;
+      $("donebox").hidden = false; say("");
+      window.scrollTo({ top: 0, behavior: "smooth" });
+    });
+    tile.querySelector(".save").addEventListener("click", e => {
+      e.stopPropagation();
+      const a = document.createElement("a");
+      a.href = g.url; a.download = "minimax-h3-" + (g.seed || "clip") + ".mp4"; a.click();
+    });
+    tile.querySelector(".reuse").addEventListener("click", e => {
+      e.stopPropagation();
+      promptEl.value = g.prompt; syncChars();
+      pick("durs", g.durV, "dur"); pick("tiers", g.tierV, "tier"); pick("aspects", g.aspectV, "aspect");
+      window.scrollTo({ top: 0, behavior: "smooth" });
+    });
+    tile.querySelector(".del").addEventListener("click", e => {
+      e.stopPropagation();
+      URL.revokeObjectURL(g.url);
+      if (g.id) clipDrop(g.id);
+      state.gallery.splice(i, 1); renderGallery();
+    });
+    grid.appendChild(tile);
+  });
+}
+
+// ---- example seed ----------------------------------------------------------
+// Real generations served as static assets, so a first-time visitor sees the
+// product before spending a free generation. They behave like any other tile:
+// reuse, save, and delete all work.
+const EXAMPLES = [
+  { title: "A brass desk lamp switching on in a dark study", dur: "5",
+    sub: "21.9 s · seed 164572212", t: "21.9", url: "/examples/desk-lamp.mp4",
+    example: true, meta: "seed 164572212 · 5.17s · 832×480", seed: 164572212,
+    durV: "5", tierV: "480p", aspectV: "horizontal",
+    prompt: "integrated_multimodal_description: [Shot 1] A cinematic close-up of a brass desk lamp switching on in a dark study, dust drifting through the beam. The camera pushes in slowly.\noverall_soundscape: A single click, a low electrical hum, faint room tone.\nnon_diegetic_music: None." },
+  { title: "Rain streaking down a café window at dusk", dur: "10",
+    sub: "45.5 s · seed 54636463", t: "45.5", url: "/examples/rain-window.mp4",
+    example: true, meta: "seed 54636463 · 10.125s · 832×480", seed: 54636463,
+    durV: "10", tierV: "480p", aspectV: "horizontal",
+    prompt: "integrated_multimodal_description: [Shot 1] Rain streaking down a café window at dusk, neon signs blurring into bokeh beyond the glass. The camera holds still.\noverall_soundscape: Steady rain, muffled street noise, a distant tram bell.\nnon_diegetic_music: None." },
+  { title: "A slow-motion espresso shot pouring into a white cup", dur: "5",
+    sub: "33.2 s · seed 305251806", t: "33.2", url: "/examples/espresso.mp4",
+    example: true, meta: "seed 305251806 · 5.17s · 832×480", seed: 305251806,
+    durV: "5", tierV: "480p", aspectV: "horizontal",
+    prompt: "integrated_multimodal_description: [Shot 1] A slow-motion espresso shot pouring into a white cup, crema folding over itself, warm morning light.\noverall_soundscape: The hiss of the machine, a liquid trickle, quiet café murmur.\nnon_diegetic_music: None." },
+];
+state.gallery = EXAMPLES.slice();
+renderGallery();
+
+// ---- generate --------------------------------------------------------------
+// Auth is a pasted sk_ key, a Clerk session, or the visitor device token. A
+// Clerk session token expires after about a minute, so every request fetches
+// a fresh one rather than reusing the first. The device token exists because
+// a phone's IP changes mid-generation (wifi to cellular): quota is still
+// counted per address server-side, but job ownership rides on this token so
+// polling keeps working across the hop.
+function visitorToken() {
+  try {
+    let t = localStorage.getItem("gw.visitor");
+    if (!t) { t = "vt_" + crypto.randomUUID(); localStorage.setItem("gw.visitor", t); }
+    return t;
+  } catch { return null; }
+}
+async function authHeaders() {
+  const key = $("key").value.trim();
+  if (key) return { Authorization: "Bearer " + key };
+  if (signedIn() && Clerk.session) {
+    try {
+      const t = await Clerk.session.getToken();
+      if (t) return { Authorization: "Bearer " + t };
+    } catch {}
+  }
+  const vt = visitorToken();
+  return vt ? { Authorization: "Bearer " + vt } : {};
+}
+
+// Always background:true + short polls: a phone browser aborts a held fetch
+// the moment the screen locks, which surfaced as "Failed to fetch" while the
+// identical curl call succeeded. Short polls survive backgrounding.
+$("go").addEventListener("click", async () => {
+  let prompt = promptEl.value.trim();
+  const hasKey = !!$("key").value.trim();
+  if (!prompt) {
+    // An empty prompt falls back to the default the placeholder promises,
+    // written into the box so the user sees exactly what ran.
+    prompt = EXAMPLES[0].prompt;
+    promptEl.value = prompt;
+    syncChars();
+  }
+  if (!hasKey && !signedIn()) {
+    if (state.dur !== "5" || state.tier === "720p")
+      return showGate("Longer lengths and 720p need a free account.");
+    if (quota && quota.kind === "visitor" && quota.remaining <= 0)
+      return showLimitModal();
+  }
+
+  state.busy = true;
+  $("go").disabled = true;
+  $("donebox").hidden = true;
+  $("pvw").hidden = true;
+  $("pvw").removeAttribute("src");
+  showStage("busy");
+  const est = computeEstimate(await healthInfo());
+  busyEstS = est.s;
+  setBusy("Generating " + state.dur + " s of video — " +
+    fmtDur(est.s).replace("~", "about ") +
+    (est.cold ? ", including worker start." : " on a warm worker."));
+  say("");
+  const started = Date.now();
+  startClock(started);
+
+  try {
+    const seedVal = parseInt($("seed").value, 10);
+    const res = await fetch("/v1/videos", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...(await authHeaders()) },
+      body: JSON.stringify({
+        prompt, duration_s: Number(state.dur), resolution: state.tier,
+        aspect_ratio: state.aspect, background: true,
+        ...(Number.isFinite(seedVal) && seedVal >= 0 ? { seed: seedVal } : {}),
+      }),
+    });
+    if (!res.ok) {
+      let d = res.statusText;
+      try { d = (await res.json()).detail || d; } catch {}
+      refreshQuota();
+      if (res.status === 429 && !hasKey && !signedIn())
+        return showLimitModal();
+      return say("HTTP " + res.status + " — " + d, "err");
+    }
+    refreshQuota();                   // the server just counted this one
+    const { poll_url } = await res.json();
+
+    let info = null;
+    for (let i = 0; i < 240; i++) {
+      await new Promise(r => setTimeout(r, 3000));
+      let p;
+      try { p = await fetch(poll_url, { headers: await authHeaders() }); }
+      catch { continue; }                       // a blip mid-generation is not a failure
+      if (!p.ok) continue;
+      info = await p.json();
+      if (info.status === "completed") break;
+      if (info.status === "failed") return say("Generation failed: " + (info.error || ""), "err");
+      setBusy(info.status === "queued"
+        ? "Queued — a worker is starting (a cold start can take a few minutes)."
+        : stepText(info.progress) || "Generating " + state.dur + " s of video.");
+      // The denoising preview: a partial image beats a blank stage.
+      if (info.progress && info.progress.preview_jpeg) {
+        $("pvw").src = "data:image/jpeg;base64," + info.progress.preview_jpeg;
+        $("pvw").hidden = false;
+      }
+    }
+    if (!info || info.status !== "completed") return say("Timed out waiting for the video.", "err");
+
+    const v = await fetch(info.content_url, { headers: await authHeaders() });
+    if (!v.ok) return say("Could not download the video.", "err");
+    const blob = await v.blob();
+    const url = URL.createObjectURL(blob);
+    const t = ((Date.now() - started) / 1000).toFixed(1);
+    const meta = "seed " + info.seed + " · " + info.duration_s + "s · " + info.width + "×" + info.height;
+
+    $("vid").src = url; showStage("video");
+    $("finalt").textContent = t + " s"; $("meta").textContent = meta;
+    $("donebox").hidden = false;
+    const entry = {
+      id: info.id, title: titleOf(prompt), dur: state.dur,
+      sub: t + " s · seed " + info.seed, t, meta, prompt, seed: info.seed,
+      durV: state.dur, tierV: state.tier, aspectV: state.aspect, at: Date.now(),
+    };
+    state.gallery.unshift({ ...entry, url });
+    state.gallery = state.gallery.slice(0, 12);
+    clipPut({ ...entry, blob }).then(pruneClips);   // the browser copy is the durable one
+    renderGallery();
+    if (!bannerDismissed() && !signedIn()) $("banner").hidden = false;
+  } catch (e) {
+    say("Request failed: " + e, "err");
+  } finally {
+    clearInterval(clockTimer);
+    state.busy = false;
+    $("go").disabled = false;
+    if ($("vid").hidden) showStage("idle");
+  }
+});
+updateEstimate();
+refreshQuota();
+restoreGallery();
+</script>
+</body>
+</html>
