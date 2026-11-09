@@ -184,8 +184,8 @@ def _instrumented_decode(self, z: torch.Tensor, uint8_rounding: str | None = Non
     """`AutoencoderKLMiniMaxH3._decode` with recorder callbacks.
 
     The body is copied verbatim from components/video_autoencoder.py (upstream
-    dee6635: single-latent still path, CPU output buffer filled by
-    `write_chunk`, `PhaseProgress`); the callbacks only read finalized regions
+    9f30419: single-frame decoder and single-latent still paths, CPU output
+    buffer filled by `write_chunk`, `PhaseProgress`); the callbacks only read finalized regions
     of that buffer, so the returned tensor is bit-identical to the original
     implementation's.
     """
@@ -196,8 +196,12 @@ def _instrumented_decode(self, z: torch.Tensor, uint8_rounding: str | None = Non
     token_drop = self.config.token_drop
     temporal_ratio = self.temporal_compression_ratio
     chunk_num_frames = tokens_chunk_size * temporal_ratio
+    frame_pre_padding = self.frame_pre_padding
 
-    if z.shape[2] == 1:
+    if self.decoder.patch_size_t == 1:
+        # A single-frame decoder: one latent frame, one pixel frame.
+        num_chunks, output_frames, frame_pre_padding = 0, 1, 0
+    elif z.shape[2] == 1:
         # Fizgig H3 Still's decode recipe: five identical latents, then keep pixel frame 3.
         # https://github.com/shootthesound/ComfyUI-Fizgig-H3-Still (MIT)
         z = z.repeat(1, 1, tokens_chunk_size, 1, 1)
@@ -236,13 +240,13 @@ def _instrumented_decode(self, z: torch.Tensor, uint8_rounding: str | None = Non
                 part = self._prepare_decoded_chunk(chunk[:, :, start : min(start + 4, copy_frames)], uint8_rounding)
                 if decoded is None:
                     decoded = torch.empty(*part.shape[:2], output_frames, *part.shape[3:], dtype=part.dtype, device="cpu")
-                decoded[:, :, write_position : write_position + part.shape[2]].copy_(part, non_blocking=False)
+                _va.transfer.copy_(decoded[:, :, write_position : write_position + part.shape[2]], part)  # mmgp.transfer, as upstream
                 write_position += part.shape[2]
                 del part
 
         if num_chunks == 0:
             # Short videos still need one decode, without an overlapping temporal chunk.
-            write_chunk(self._decode_clip(z)[:, :, self.frame_pre_padding : self.frame_pre_padding + output_frames])
+            write_chunk(self._decode_clip(z)[:, :, frame_pre_padding : frame_pre_padding + output_frames])
             rec.on_chunk(self, decoded, 0, write_position, 0)
             rec.on_decode_end()
             return decoded
