@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""CPU correctness tests for models/minimax_h3/usp.py, using gloo.
+"""CPU correctness tests for plugins/usp_multi_gpu/usp.py, using gloo.
 
 Needs torch (run inside the worker image); deliberately NOT part of the CPU
 pytest suite, which stays torch-free. Loads usp.py by file path so no wgp /
@@ -27,7 +27,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 REPO = Path(__file__).resolve().parents[2]
-USP_PATH = REPO / "models" / "minimax_h3" / "usp.py"
+USP_PATH = REPO / "plugins" / "usp_multi_gpu" / "usp.py"
 
 WORLD = 2
 SEQ = 1031          # deliberately odd: uneven shards (516 / 515)

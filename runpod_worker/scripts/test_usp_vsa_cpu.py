@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""CPU correctness tests for FastH3's VSA under USP (models/minimax_h3/usp.py), using gloo and the Triton interpreter.
+"""CPU correctness tests for FastH3's VSA under USP (plugins/usp_multi_gpu/usp.py), using gloo and the Triton interpreter.
 
 Needs torch and triton (any build: TRITON_INTERPRET=1, set below, runs WanGP's Triton kernels on CPU tensors) -- not part of the
 torch-free pytest suite. No GPU, no weights:
@@ -58,6 +58,7 @@ def _setup():
         sys.modules["models.minimax_h3"] = package
     if not torch.cuda.is_available():
         torch.cuda.get_device_capability = lambda *args, **kwargs: (0, 0)
+        torch.cuda.current_device = lambda: 0  # shared/kernels/dispatch.capability asks for it before the capability
 
     import numpy as np
     import triton.language as tl
@@ -268,7 +269,7 @@ def _build_model(split_qkv, dtype):
     import models.minimax_h3.transformer as T
     from models.minimax_h3.vsa.attention import VSAAttention, VSAPolicy
 
-    kernels.mlp_chunk_rows = lambda tokens, row_bytes, device: tokens  # CPU: no L2 query
+    kernels.mlp_chunk_rows = lambda tokens, row_bytes, device, double=False: tokens  # CPU: no L2 query
     torch.manual_seed(1234)
     model = T.MiniMaxH3Model(hidden_size=64, num_layers=2, token_refiner_num_layers=1, num_attention_heads=4,
                              attention_head_dim=16, ffn_hidden_size=96, latents_dim=24, audio_latents_dim=32,
@@ -366,7 +367,8 @@ def _worker(rank):
     os.environ.update(MASTER_ADDR="127.0.0.1", MASTER_PORT=os.environ.get("USP_TEST_PORT", "29653"),
                       WORLD_SIZE=str(WORLD), RANK=str(rank))
     dist.init_process_group("gloo", rank=rank, world_size=WORLD)
-    from models.minimax_h3 import usp
+    sys.path.insert(0, str(REPO / "plugins"))
+    from usp_multi_gpu import usp
 
     usp.activate()  # gloo is already initialized: patches only
     assert usp.is_active() and usp._ORIG_VSA_CALL is not None

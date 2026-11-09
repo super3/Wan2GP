@@ -1,0 +1,10 @@
+{
+  "name": "Multi-GPU (USP)",
+  "author": "super3",
+  "version": "0.1.0",
+  "description": "Splits each MiniMax H3 denoising step across several GPUs with Ulysses sequence parallelism. One click starts a helper WanGP process per extra GPU; queue generations then run on all of them, with output identical to one GPU. Pays off only with NVLink or PCIe peer-to-peer between the GPUs.",
+  "type": ["app"],
+  "date": "2026-11-09",
+  "wan2gp_version": "",
+  "url": "https://github.com/super3/Wan2GP"
+}
