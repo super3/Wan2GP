@@ -69,8 +69,9 @@ class StreamRecorder:
         self.audio_start_t: float | None = None
         self.audio_end_t: float | None = None
         self.audio_out: torch.Tensor | None = None
-        #: (id(latents), decoded) so an audio-first prefetch is never paid twice
-        self.audio_cache: tuple[int, object] | None = None
+        #: (latents, decoded) so an audio-first prefetch is never paid twice. It holds the latents
+        #: tensor itself and matches by identity (`is`): an id() could be reused by a later tensor.
+        self.audio_cache: tuple[object, object] | None = None
         #: True when the audio-first hook actually decoded audio before video
         self.audio_first_effective = False
 
@@ -150,31 +151,48 @@ def recorder() -> StreamRecorder | None:
     return _STATE["recorder"]
 
 
-def _maybe_prefetch_audio(caller_locals: dict, rec: StreamRecorder) -> bool:
+def _pipeline_locals(frame, max_depth: int = 4) -> dict | None:
+    """The locals of the H3 pipeline frame that called the video decode.
+
+    The pipeline calls `self.vae.decode(...)` inside a list comprehension
+    (`[self.vae.decode(video[item:item + 1], uint8_rounding) ... for item in
+    ...]`). On Python 3.11, which WanGP installs, a comprehension runs in its own
+    frame whose locals hold only what it references, so `audio` and
+    `image_outputs` are one frame further up. Python 3.12+ inlines
+    comprehensions (PEP 709). Walk up a few frames to the one holding the
+    pipeline (`self` with an `audio_vae`) and the `audio` latents.
+    """
+    for _ in range(max_depth):
+        if frame is None:
+            return None
+        found = frame.f_locals
+        if torch.is_tensor(found.get("audio")) and getattr(found.get("self"), "audio_vae", None) is not None:
+            return found
+        frame = frame.f_back
+    return None
+
+
+def _maybe_prefetch_audio(frame, rec: StreamRecorder) -> bool:
     """Audio-first hook: decode audio before the video decode starts.
 
-    The pipeline decodes video before audio (`decoded_video = self.vae.decode(
-    video, uint8_rounding)` then `self.audio_vae.decode(audio)`), which would
-    leave live segments silent until the whole clip is decoded. At the moment
-    the video decode is entered, the caller's frame already holds both the
-    pipeline (`self`) and the audio latents (`audio`), so decode them now; the
-    audio wrapper caches the result by latents identity and the pipeline's own
-    later call returns it without paying twice. Image outputs (`image_outputs`)
-    return before any audio decode, so they are skipped. Every check fails
-    closed: any mismatch with the expected call site just keeps the original
-    ordering.
+    The pipeline decodes video before audio (`self.vae.decode(video, ...)`
+    then `self.audio_vae.decode(audio)`), which would leave live segments
+    silent until the whole clip is decoded. When the video decode is entered,
+    the pipeline frame (`_pipeline_locals`) already holds the pipeline and the
+    audio latents, so decode them now; the audio wrapper caches the result by
+    latents identity and the pipeline's own later call returns it without
+    paying twice. Image outputs (`image_outputs`) return before any audio
+    decode, so they are skipped. Every check fails closed: any mismatch with
+    the expected call site just keeps the original ordering.
     """
     try:
-        if caller_locals.get("image_outputs"):
-            return False  # image generations never decode their audio latents
-        pipe = caller_locals.get("self")
-        audio = caller_locals.get("audio")
-        audio_vae = getattr(pipe, "audio_vae", None)
-        if audio_vae is None or not torch.is_tensor(audio):
-            return False
-        if rec.audio_cache is not None:
+        caller_locals = _pipeline_locals(frame)
+        if caller_locals is None or caller_locals.get("image_outputs"):
+            return False  # unknown call site, or an image generation that never decodes its audio latents
+        audio = caller_locals["audio"]
+        if rec.audio_cache is not None and rec.audio_cache[0] is audio:
             return True
-        audio_vae.decode(audio)
+        caller_locals["self"].audio_vae.decode(audio)
         return True
     except Exception:  # noqa: BLE001 - the hook must never break generation
         return False
@@ -305,12 +323,12 @@ def activate(store_frames: bool = True, live_dir: str | None = None,
     orig_audio_decode = _audio_mod.MiniMaxH3AudioVAE.decode
 
     def timed_audio_decode(self, latents):
-        if rec.audio_cache is not None and rec.audio_cache[0] == id(latents):
+        if rec.audio_cache is not None and rec.audio_cache[0] is latents:
             return rec.audio_cache[1]
         rec.audio_start_t = time.monotonic()
         out = orig_audio_decode(self, latents)
         rec.audio_end_t = time.monotonic()
-        rec.audio_cache = (id(latents), out)
+        rec.audio_cache = (latents, out)
         rec.audio_out = out.detach().float().cpu() if torch.is_tensor(out) else None
         if rec.live is not None and rec.audio_out is not None:
             rec.live.set_audio(rec.audio_out)
@@ -324,8 +342,12 @@ def activate(store_frames: bool = True, live_dir: str | None = None,
     def audio_first_video_decode(self, latents, *args, **kwargs):
         # The pipeline calls `self.vae.decode(video, uint8_rounding)`: forward
         # every extra argument untouched.
+        # A new video decode starts a new generation's segments: drop the previous generation's audio, or
+        # its segments would carry it (the UI never calls reset() between generations).
+        rec.audio_out = rec.audio_cache = rec.audio_start_t = rec.audio_end_t = None
+        rec.audio_first_effective = False
         if rec.audio_first:
-            rec.audio_first_effective = _maybe_prefetch_audio(sys._getframe(1).f_locals, rec)
+            rec.audio_first_effective = _maybe_prefetch_audio(sys._getframe(1), rec)
         return orig_video_decode(self, latents, *args, **kwargs)
 
     _STATE["orig_video_decode"] = orig_video_decode

@@ -389,19 +389,95 @@ def test_audio_first_prefetch_helper():
 
     pipe = DummyPipe()
     pipe.audio_vae = DummyAudioVAE()
+
+    def call_site(self, audio, rec):  # the pipeline frame: `self` and `audio` in its locals
+        return streaming._maybe_prefetch_audio(sys._getframe(), rec)
+
+    def bare_site(rec):
+        return streaming._maybe_prefetch_audio(sys._getframe(), rec)
+
     rec = streaming.StreamRecorder()
     latents = torch.zeros(2)
-    assert streaming._maybe_prefetch_audio({"self": pipe, "audio": latents}, rec)
+    assert call_site(pipe, latents, rec)
     assert calls == [latents]
-    # a warm cache reports success without decoding again
-    rec.audio_cache = (id(latents), latents)
-    assert streaming._maybe_prefetch_audio({"self": pipe, "audio": latents}, rec)
+    # a warm cache for these same latents reports success without decoding again
+    rec.audio_cache = (latents, latents)
+    assert call_site(pipe, latents, rec)
     assert len(calls) == 1
+    # a cache for other latents is not reused, even with an equal id() after a free
+    rec.audio_cache = (torch.zeros(2), latents)
+    assert call_site(pipe, latents, rec)
+    assert len(calls) == 2
     # unexpected call sites fall back cleanly
     fresh = streaming.StreamRecorder()
-    assert not streaming._maybe_prefetch_audio({"self": pipe}, fresh)
-    assert not streaming._maybe_prefetch_audio({}, fresh)
-    assert not streaming._maybe_prefetch_audio({"self": object(), "audio": latents}, fresh)
+    assert not bare_site(fresh)
+    assert not call_site(object(), latents, fresh)
+
+
+def _audio_first_pipeline(monkeypatch):
+    """A pipeline whose generate() decodes video exactly like the real one: inside a list comprehension."""
+    video_vae = importlib.import_module("models.minimax_h3.video_vae")
+    calls = []
+
+    def fake_video_decode(self, latents, uint8_rounding=None):
+        calls.append(("video", uint8_rounding))
+        return latents
+
+    monkeypatch.setattr(video_vae.MiniMaxH3VideoVAE, "decode", fake_video_decode)
+
+    audio_mod = importlib.import_module("models.minimax_h3.audio_vae")
+
+    def fake_audio_decode(self, latents):
+        calls.append(("audio", float(latents.sum())))
+        return latents.clone()
+
+    # The plugin's caching wrapper wraps the real class's decode, so patch that class (before activate()).
+    monkeypatch.setattr(audio_mod.MiniMaxH3AudioVAE, "decode", fake_audio_decode)
+
+    class DummyPipe:
+        audio_vae = audio_mod.MiniMaxH3AudioVAE.__new__(audio_mod.MiniMaxH3AudioVAE)
+        vae = video_vae.MiniMaxH3VideoVAE.__new__(video_vae.MiniMaxH3VideoVAE)
+
+        def generate(self, video, audio, image_outputs=False):
+            uint8_rounding = "truncate"
+            decoded = [self.vae.decode(video[item:item + 1], uint8_rounding) for item in range(video.shape[0])]
+            if image_outputs:
+                return decoded, None
+            return decoded, self.audio_vae.decode(audio)
+
+    return DummyPipe(), calls
+
+
+def test_audio_first_reaches_the_pipeline_through_a_list_comprehension(monkeypatch):
+    """On Python 3.11 the comprehension is its own frame: the hook must look past it (it used to fall back silently)."""
+    pipe, calls = _audio_first_pipeline(monkeypatch)
+    rec = streaming.activate(store_frames=False, audio_first=True)
+    try:
+        pipe.generate(torch.zeros(1, 1), torch.ones(2))
+        assert rec.audio_first_effective
+        assert calls == [("audio", 2.0), ("video", "truncate")]  # audio first, and decoded only once
+    finally:
+        streaming.deactivate()
+
+
+def test_each_generation_gets_its_own_audio(monkeypatch):
+    """The UI never calls reset(): a second generation must not reuse the first one's audio for its segments."""
+    pipe, calls = _audio_first_pipeline(monkeypatch)
+    rec = streaming.activate(store_frames=False, audio_first=True)
+    try:
+        pipe.generate(torch.zeros(1, 1), torch.ones(2))
+        first = rec.audio_out
+        pipe.generate(torch.zeros(1, 1), torch.full((2,), 3.0))
+        assert rec.audio_first_effective
+        assert calls == [("audio", 2.0), ("video", "truncate"), ("audio", 6.0), ("video", "truncate")]
+        assert torch.equal(rec.audio_out, torch.full((2,), 3.0)) and not torch.equal(rec.audio_out, first)
+        # without audio-first, a generation's segments stay silent instead of inheriting the last audio
+        rec.audio_first = False
+        pipe.generate(torch.zeros(1, 1), torch.full((2,), 5.0))
+        assert not rec.audio_first_effective
+        assert calls[-2:] == [("video", "truncate"), ("audio", 10.0)]
+    finally:
+        streaming.deactivate()
 
 
 def test_live_segmenter_muxes_with_audio(tmp_path):

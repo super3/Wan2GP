@@ -11,8 +11,11 @@ segment is playable the moment it lands. Segments appear under
 as soon as the estimated no-rebuffer start time passes instead of waiting for
 the full clip.
 
-Measured on an RTX 5090 at 832x480 with the 4-step turbo LoRA: perceived time
-to first frame drops 1.2x to 1.31x (6 to 14 seconds) with zero rebuffering.
+Measured on one RTX 5090 with FastH3 Omni NVFP4 (8 steps, Nov 2026): the earliest
+playback start that never stalls comes 14-31% sooner than the finished clip,
+from 18-31% with the original VAE at 480p-720p, 5-10 s, down to 14-20% with
+LightVAE INT8, whose faster decode leaves less to hide (5 s at 480p: 13.4 s
+instead of 17.3 s). An earlier run with the 4-step turbo LoRA gave 1.2-1.31x at 480p.
 """
 
 import os
