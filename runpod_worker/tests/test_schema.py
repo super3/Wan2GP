@@ -34,7 +34,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 WGP_PY = REPO_ROOT / "wgp.py"
 HANDLER_PY = REPO_ROOT / "models" / "minimax_h3" / "minimax_h3_handler.py"
 SETTINGS_JSON = REPO_ROOT / "models" / "_settings.json"
-PROFILE_NAME = "Turbo Lightx2v FL2V 4 Steps v1.0 768p"
+PROFILE_NAME = "Lightx2v FL2V 4 Steps v1.0 768p"
 
 FL2VA = "minimax_h3_fl2va"
 FL2VA_PRUNED = "minimax_h3_fl2va_pruned"
@@ -238,10 +238,10 @@ def test_letter_whitelists_match_the_handler_source():
         pytest.skip(f"{HANDLER_PY} not found")
     source = _read(HANDLER_PY)
     upstream = set(re.findall(r'"letters_filter"\s*:\s*"([^"]*)"', source))
-    # FL2VA "GVUKFI"/"AK2"; Ref2VA "KFI"/"GPDEV+*-U1"/"ABDKS1"; the rest belong to
+    # FL2VA "GVUKFI"/"AKS2"; Ref2VA "KFI"/"GPDEV+*-U1"/"ABDKS1"; the rest belong to
     # models this worker does not serve (Viggle "I"/"V-U"/"AK", Viggle Remake
-    # "FI"/"V-UA"/"AK", TTS "ABD").
-    assert upstream == {"GVUKFI", "AK2", "KFI", "GPDEV+*-U1", "ABDKS1", "I", "V-U", "AK", "ABD", "FI", "V-UA"}, (
+    # "FI"/"V-UA"/"AK", Control "AKS", TTS "ABD").
+    assert upstream == {"GVUKFI", "AKS2", "KFI", "GPDEV+*-U1", "ABDKS1", "I", "V-U", "AK", "AKS", "ABD", "FI", "V-UA"}, (
         f"minimax_h3_handler.py letters_filter set changed to {sorted(upstream)}; "
         "update _FALLBACK_LETTERS / _FL2VA_MODEL_DEF / _REF2VA_MODEL_DEF in schema.py"
     )
@@ -262,7 +262,7 @@ def test_letter_whitelists_match_the_handler_source():
     assert set(S.letters_allowed(FL2VA_PRUNED)["video_prompt_type"]) == set(
         fl2va["video_prompt_type"]
     )
-    assert set(fl2va["audio_prompt_type"]) == set("AK2")
+    assert set(fl2va["audio_prompt_type"]) == set("AKS2")
     assert set(ref2va["video_prompt_type"]) == set("GPDEV+*-U1") | set("KFI")
     assert set(ref2va["audio_prompt_type"]) == set("ABDKS1")
     assert set(S.letters_allowed(REF2VA)["video_prompt_type"]) == set(ref2va["video_prompt_type"])
@@ -458,6 +458,17 @@ def test_accelerator_profile_is_applied_before_user_settings(cfg):
     payload = example_a()
     payload["settings"]["num_inference_steps"] = 8
     assert parse(payload, FL2VA_PRUNED, cfg=cfg).settings["num_inference_steps"] == 8
+
+
+def test_pre_rename_turbo_profile_name_still_resolves(cfg):
+    """Upstream c8d47da dropped "Turbo " from the profile names; old callers keep working."""
+    payload = example_a()
+    payload["profile"] = "Turbo " + PROFILE_NAME
+    req = parse(payload, FL2VA_PRUNED, cfg=cfg)
+    assert req.settings["num_inference_steps"] == 4
+    assert "lightx2v_fl2v_turbo_4step" in req.settings["activated_loras"][0]
+    payload["profile"] = "Turbo no such profile"
+    assert "unknown accelerator profile" in raises("bad_request", payload, FL2VA_PRUNED, cfg=cfg).message
 
 
 def test_profile_is_not_forced_on(cfg):
@@ -785,7 +796,7 @@ def test_letters_outside_the_variant_alphabet_are_rejected(cfg):
     # "P"/"D" are Ref2VA guide letters; FL2VA's filter is "GVUKFI".
     error = raises("invalid_setting", fl2va({"video_prompt_type": "PD"}), cfg=cfg)
     assert "not supported by FL2VA" in error.message
-    # "B" (second audio reference) is Ref2VA-only; FL2VA's filter is "AK2".
+    # "B" (second audio reference) is Ref2VA-only; FL2VA's filter is "AKS2".
     raises("invalid_setting", fl2va({"audio_prompt_type": "AB"}), cfg=cfg)
     # "N"/"A" come from FL2VA's mask group; Ref2VA's letters are "GPDEV+*-U1" + "KFI".
     error = raises(

@@ -324,14 +324,15 @@ def _refuse_global_attention(model):
 
 def _usp_forward(self, video_x, audio_x, sigma_video, sigma_audio, context, payload,
                  spectrum=None, first_block_cache=None):
-    """Rank-aware copy of MiniMaxH3Model.forward (transformer.py:811-1051).
+    """Rank-aware copy of MiniMaxH3Model.forward (transformer.py:846-1099).
 
     Kept as close to upstream as possible; the USP deltas are marked. Pinned to
-    the upstream revision this branch tracks (9f30419) — re-diff on upstream
+    the upstream revision this branch tracks (c8d47da) — re-diff on upstream
     bumps; runpod_worker/tests/test_usp_drift.py fails when the original moves.
     Upstream paths this copy drops are refused up front instead of ported: the
     Spectrum forecast branch and the FirstBlockCache loop (step caches), the
-    ControlNet-Union control stream, and VDN's per-block planning."""
+    ControlNet-Union control stream, VDN's per-block planning, and several images
+    denoised as one batch (H3 image models; one sharded sequence per forward here)."""
     from mmgp import cuda_graphs
     from shared.kernels import ops as kernels
 
@@ -349,6 +350,9 @@ def _usp_forward(self, video_x, audio_x, sigma_video, sigma_audio, context, payl
                            "stream and its skip row ranges are full-sequence.")
     if hasattr(self.blocks[0].attn, "vdn"):
         raise RuntimeError("VDN hybrid attention is global-sequence-based and unsupported under USP.")
+    if video_x.shape[0] > 1:
+        raise RuntimeError("Several images denoised at once (batch > 1) are unsupported under USP: "
+                           "set the number of images to 1.")
     # ---- end USP delta ----------------------------------------------------
 
     device, dtype = video_x.device, self.dtype or next(self.blocks.parameters()).dtype
@@ -385,7 +389,7 @@ def _usp_forward(self, video_x, audio_x, sigma_video, sigma_audio, context, payl
             audio_rows = torch.cat((cond_audio.to(device), audio_rows))
         video_embeds = self.video_patch_proj(video_rows).to(dtype)
         del video_rows
-        audio_embeds = self.audio_patch_proj(audio_rows).to(dtype)
+        audio_embeds = None if self.audio_patch_proj is None else self.audio_patch_proj(audio_rows).to(dtype)
         del audio_rows
 
         text_embeds = context[0]
@@ -394,7 +398,8 @@ def _usp_forward(self, video_x, audio_x, sigma_video, sigma_audio, context, payl
         hidden = torch.empty(layout.sequence_length, self.hidden_size, dtype=dtype, device=device)
         hidden.index_copy_(0, layout.text_indices.to(device), text_embeds)
         hidden.index_copy_(0, layout.video_indices.to(device), video_embeds)
-        hidden.index_copy_(0, layout.audio_indices.to(device), audio_embeds)
+        if audio_embeds is not None:
+            hidden.index_copy_(0, layout.audio_indices.to(device), audio_embeds)
         del text_embeds, video_embeds, audio_embeds
     else:
         video_x = audio_x = None
@@ -518,15 +523,15 @@ def _usp_forward(self, video_x, audio_x, sigma_video, sigma_audio, context, payl
                                                        max(audio_t - 1, 0))])
     h_list = [hidden]
     hidden = None
-    video, audio = self.final_layer(h_list, temb if final_temb is None else final_temb, (video_start, layout.sequence_length, video_head_row),
-                                    (audio_start, video_start, audio_row))
-    del temb, ref2va_temb, rope, timestep_indices, block_offsets, final_temb
+    final_input, length = temb if final_temb is None else final_temb, layout.sequence_length
+    # (USP delta: batch == 1 only -- batch > 1 is refused above.)
+    video, audio = self.final_layer(h_list, final_input, (video_start, length, video_head_row), (audio_start, video_start, audio_row))
+    del temb, ref2va_temb, rope, timestep_indices, block_offsets, final_temb, final_input
     if target_video_inverse_order is not None:
         video = video.index_select(0, target_video_inverse_order)
     video = T._to_dtype([video], video_dtype)
-    audio = T._to_dtype([audio], audio_dtype)
-    return (T.unpatchify_video_tokens(video, latent_t, latent_h, latent_w, self.latents_dim, self.patch_size),
-            T.unpack_audio(audio))
+    audio = T.unpack_audio(T._to_dtype([audio], audio_dtype))
+    return T.unpatchify_video_tokens(video, latent_t, latent_h, latent_w, self.latents_dim, self.patch_size), audio
 
 
 _ORIG_FORWARD = None
