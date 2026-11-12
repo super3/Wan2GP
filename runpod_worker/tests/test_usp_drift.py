@@ -16,8 +16,9 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[2]
 
 #: sha256 of MiniMaxH3Model.forward's source at the revision usp.py mirrors
-#: (upstream 9f30419: HyperFlow's two-time AdaLN rows, its LoRA offsets and dropped blocks).
-MIRRORED_FORWARD_SHA256 = "917010463ebf1873a406810d05404f06ddc9cdc6bac3c951bd623712dc6a982b"
+#: (upstream c8d47da: several H3 images denoised as one batch, which USP refuses, and an optional
+#: audio stream, H3-Image having none).
+MIRRORED_FORWARD_SHA256 = "32e5a5db125dfbd08fe43857bc3f5b7378568b18801ac493dcf53e66c2aea51a"
 
 
 def _forward_source() -> str:
