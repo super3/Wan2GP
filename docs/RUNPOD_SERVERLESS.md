@@ -523,7 +523,7 @@ def _check_cross_variant(mt, settings, media) -> None:
             raise WorkerError(BAD_REQUEST, "video_guide2/audio_guide2 are Ref2VA-only")
         for letter, legal in (("image_prompt_type", set("TSEVL")),
                               ("video_prompt_type", set("GVKFI")),
-                              ("audio_prompt_type", set("AK2"))):
+                              ("audio_prompt_type", set("AKS2"))):
             value = set(str(settings.get(letter, "")))
             if value - legal:
                 raise WorkerError(INVALID_SETTING,
@@ -990,7 +990,7 @@ def deliver(path: Path, *, key: str, req, cfg) -> dict:
   "input": {
     "model_type": "minimax_h3_fl2va_pruned",   // must match WANGP_MODEL_TYPE
     "prompt": "…",                              // convenience alias for settings.prompt
-    "profile": "Turbo Lightx2v FL2V 4 Steps v1.0 768p",   // optional accelerator profile
+    "profile": "Lightx2v FL2V 4 Steps v1.0 768p",   // optional accelerator profile
     "settings": { /* any subset of models/_settings.json ∪ get_default_settings() */ },
     "media":    { /* attachment key -> {"b64"|"volume"} (list for image_refs) */ },
     "output":   { "mode": "auto|presigned|rp_bucket|volume|base64",
@@ -1013,7 +1013,7 @@ def deliver(path: Path, *, key: str, req, cfg) -> dict:
 ```json
 {"input": {
   "model_type": "minimax_h3_fl2va_pruned",
-  "profile": "Turbo Lightx2v FL2V 4 Steps v1.0 768p",
+  "profile": "Lightx2v FL2V 4 Steps v1.0 768p",
   "settings": {
     "prompt": "integrated_multimodal_description: [Shot 1] A five-second cinematic single take inside a rain-lashed glass observatory at midnight. A radio astronomer leans toward a brass receiver and says clearly (S1) <d>[English] If you can hear me, follow this signal.</d>\noverall_soundscape: Rain on the dome, a low electrical hum, three clean receiver tones, and her synchronized voice.\nnon_diegetic_music: One quiet bowed-glass chord rising and fading.",
     "resolution": "832x480",
@@ -1030,7 +1030,7 @@ def deliver(path: Path, *, key: str, req, cfg) -> dict:
 }}
 ```
 
-The profile file (`profiles/minimax_h3/Turbo Lightx2v FL2V 4 Steps v1.0 768p.json`, read verbatim) supplies `activated_loras` = the `…lightx2v_fl2v_turbo_4step_alpha128_v1.0_768p_bf16.safetensors` URL, `loras_multipliers: "1.0"`, `num_inference_steps: 4`, `guidance_scale: 1`, `flow_shift: 6`. `124 = 5 + 17·7` ✓.
+The profile file (`profiles/minimax_h3_fl2va/Lightx2v FL2V 4 Steps v1.0 768p.json`, read verbatim) supplies `activated_loras` = the `…lightx2v_fl2v_turbo_4step_alpha128_v1.0_768p_bf16.safetensors` URL, `loras_multipliers: "1.0"`, `num_inference_steps: 4`, `guidance_scale: 1`, `flow_shift: 6`. `124 = 5 + 17·7` ✓.
 
 **(b) `minimax_h3_fl2va` (full 33B) — first + last frame, 20 steps, First Block Cache**
 
@@ -1063,7 +1063,7 @@ The profile file (`profiles/minimax_h3/Turbo Lightx2v FL2V 4 Steps v1.0 768p.jso
 ```json
 {"input": {
   "model_type": "minimax_h3_fl2va_pruned",
-  "profile": "Turbo Lightx2v FL2V 4 Steps v1.0 768p",
+  "profile": "Lightx2v FL2V 4 Steps v1.0 768p",
   "settings": {
     "prompt": "integrated_multimodal_description: …\noverall_soundscape: Footsteps on gravel, distant traffic, a door latch.\nnon_diegetic_music: none",
     "video_prompt_type": "GV",
@@ -1640,7 +1640,7 @@ Effort estimates are for one engineer already familiar with the repo.
 **Blocking, decide before step 6:**
 
 1. **Which `model_type` is the product?** This plan assumes `minimax_h3_fl2va_pruned` (cheapest, and it covers text-only, start frame, end frame and control video). If Ref2VA character consistency is the actual product, note it costs the same footprint but **has no shipped accelerator LoRA** — it runs at 20 steps, roughly 3.5× the cost per clip.
-2. **Turbo LoRA by default?** 4 steps vs 20 is ~3.5× cheaper. `README.md:141` warns the 0.5 multiplier default exists because 1.0 can be too strong, and suggests the 8-step profile if quality suffers — though the profile this plan defaults to (`Turbo Lightx2v FL2V 4 Steps v1.0 768p`) ships `1.0` and `flow_shift: 6`. **A quality call I cannot make.**
+2. **Turbo LoRA by default?** 4 steps vs 20 is ~3.5× cheaper. `README.md:141` warns the 0.5 multiplier default exists because 1.0 can be too strong, and suggests the 8-step profile if quality suffers — though the profile this plan defaults to (`Lightx2v FL2V 4 Steps v1.0 768p`) ships `1.0` and `flow_shift: 6`. **A quality call I cannot make.**
 3. **Text encoder.** INT8 (26.72 GB, default) vs GGUF Q4_K_M (14.58 GB) vs Q2_K (8.49 GB). Only matters for phase 2 (baked image), where Q4_K_M is what makes the image fit. The handler warns more aggressive quantization "can slightly affect prompt interpretation."
 4. **Object storage.** Own bucket + `rp_upload` 7-day presigned URLs, or caller-supplied presigned PUT (no secrets on the worker, better for multi-tenant)? The chain supports both — which do you document first?
 5. **URL media inputs.** `ALLOW_URL_INPUTS=0` by default. Turning it on means owning an SSRF guard forever (per-hop redirect revalidation, IP pinning against DNS rebinding, metadata-endpoint blocking, streaming byte cap, magic-byte typing). Multi-tenant: leave it off.
@@ -1710,7 +1710,7 @@ Effort estimates are for one engineer already familiar with the repo.
 - `sample_solvers = [("Euler","euler"), ("RES Multistep","res_multistep")]`.
 - `sliding_window_defaults` — **identical for both variants**: `window_min 124, window_max 481, window_step 17, window_default 362, overlap_min 1, overlap_max 120, overlap_step 17, overlap_offset 1, overlap_default 18`.
 - `frames_maximum: 737` — **Ref2VA only**. FL2VA has no upper bound.
-- FL2VA letters: `image_prompt_types_allowed "TSEVL"`, `guide_custom_choices.letters_filter "GVKFI"`, `audio_prompt_type_sources.letters_filter "AK2"`, `mask_preprocessing {"", "A", "NA"}`, `one_image_ref_only: True`, `no_background_removal: True`, `output_audio_is_input_audio: True`, `end_frames_always_enabled: True`.
+- FL2VA letters: `image_prompt_types_allowed "TSEVL"`, `guide_custom_choices.letters_filter "GVKFI"`, `audio_prompt_type_sources.letters_filter "AKS2"`, `mask_preprocessing {"", "A", "NA"}`, `one_image_ref_only: True`, `no_background_removal: True`, `output_audio_is_input_audio: True`, `end_frames_always_enabled: True`.
 - Ref2VA letters: `image_ref_choices.letters_filter "KI"`, `guide_custom_choices.letters_filter "PDEV+-"`, `audio_prompt_type_sources.letters_filter "ABK"`, `image_refs_relative_size {min 50, max 400}`, `reference_video_max_frames 15*24`, `reference_video_max_size (768,1344)`.
 - `update_default_settings` writes exactly: `video_length 124, sliding_window_size 362, sliding_window_overlap 18, num_inference_steps 20, guidance_scale 1.0, flow_shift 12.0, sample_solver "euler", skip_steps_start_step_perc 25, skip_steps_multiplier 0.08, denoising_strength 1.0, audio_prompt_type "", video_prompt_type "", image_mode 0` (+ `image_refs_relative_size 100, remove_background_images_ref 0` for Ref2VA) at `:511-533`.
 - `validate_generative_settings` (`:345-445`): overlap via `normalize_overlap(v, 17, 1)`; FL2VA `frames_positions` count == `image_refs` count; `"2"` excludes `A`/`K` and requires `G`+`V`+`video_guide`; `"K"` requires the same plus a real audio track; Ref2VA ≤9 images, ≤2 videos (each ≥2 s, ≤15 s total), ≤2 audio (each 2–15 s, ≤15 s total), `#audio ≤ #images+#videos`, ≤12 files.

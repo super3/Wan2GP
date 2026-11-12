@@ -523,7 +523,9 @@ _FL2VA_MODEL_DEF: dict[str, Any] = {
     # NOTE there is no frames_maximum here: FL2VA has no upper frame bound
     # anywhere in the headless path, which is why WANGP_MAX_FRAMES exists.
     "guide_custom_choices": {"letters_filter": "GVUKFI", "default": ""},
-    "audio_prompt_type_sources": {"letters_filter": "AK2", "default": ""},
+    # upstream c8d47da: "AKS2" -- the kept soundtracks are spelled "AS"/"KS" as in
+    # Ref2VA; "A"/"K" alone still keep the soundtrack (output_audio_is_input_audio).
+    "audio_prompt_type_sources": {"letters_filter": "AKS2", "default": ""},
     # minimax_h3_handler.py:725 -- accelerator profiles moved from profiles/minimax_h3/
     # to per-variant folders; the shared folder is still searched first.
     "profiles_dir": ["minimax_h3", "minimax_h3_fl2va"],
@@ -718,7 +720,7 @@ _FALLBACK_LETTERS: dict[str, dict[str, str]] = {
         # "GVUKFI" from guide_custom_choices + "AN" from mask_preprocessing
         # (selection ["", "A", "NA"], filtered through wgp.py:11602's "XYZWNA").
         "video_prompt_type": "GVUKFIAN",
-        "audio_prompt_type": "AK2",
+        "audio_prompt_type": "AKS2",
     },
     "ref2va": {
         "image_prompt_type": "TSEVL",
@@ -1038,6 +1040,12 @@ def load_profile_fragment(
                 return fragment
             if folder_path.is_dir():
                 available.extend(sorted(item.stem for item in folder_path.glob("*.json")))
+
+    # Upstream c8d47da (WanGP config 1.31) dropped "Turbo " from the H3 accelerator
+    # profile names ("Turbo Lightx2v FL2V 4 Steps v1.0 768p" -> "Lightx2v FL2V 4 Steps
+    # v1.0 768p"); keep accepting the old names that existing callers send.
+    if label.startswith("Turbo ") and label[len("Turbo "):] in available:
+        return load_profile_fragment(label[len("Turbo "):], model_def=model_def, root=root)
 
     raise WorkerError(
         BAD_REQUEST,
