@@ -52,6 +52,10 @@ class ChunkStreamingPlugin(WAN2GPPlugin):
         with gr.Row():
             enabled = gr.Checkbox(label="Enable chunk streaming", value=False)
             out_dir = gr.Textbox(label="Segment output directory", value=default_dir)
+        decode_devices = gr.Textbox(
+            label="Multi-GPU decode devices (optional)", value="", placeholder="cuda:0, cuda:1",
+            info="Decode the video chunks round-robin across these GPUs, so chunks land sooner; the output is unchanged. "
+                 "Each GPU other than the one WanGP runs on keeps its own copy of the VAE decoder weights. Empty: one GPU.")
         status = gr.Markdown("Disabled.")
         with gr.Row():
             refresh = gr.Button("Refresh last generation stats")
@@ -60,18 +64,25 @@ class ChunkStreamingPlugin(WAN2GPPlugin):
             interactive=False,
         )
         summary = gr.Markdown("")
-        enabled.change(self._toggle, inputs=[enabled, out_dir], outputs=[status])
+        enabled.change(self._toggle, inputs=[enabled, out_dir, decode_devices], outputs=[status])
+        decode_devices.submit(self._toggle, inputs=[enabled, out_dir, decode_devices], outputs=[status])
+        decode_devices.blur(self._toggle, inputs=[enabled, out_dir, decode_devices], outputs=[status])
         refresh.click(self._refresh, inputs=[], outputs=[stats, summary])
 
-    def _toggle(self, enable: bool, out_dir: str):
+    def _toggle(self, enable: bool, out_dir: str, decode_devices: str = ""):
         streaming = _streaming()
         if enable:
             out_dir = (out_dir or "").strip() or os.path.join(os.path.abspath("outputs"), "streaming")
             os.makedirs(out_dir, exist_ok=True)
-            streaming.activate(store_frames=False, live_dir=out_dir, audio_first=True)
+            try:
+                streaming.activate(store_frames=False, live_dir=out_dir, audio_first=True, decode_devices=decode_devices)
+            except (RuntimeError, ValueError) as exc:  # an unparsable device name
+                return f"**Not enabled:** invalid decode devices `{decode_devices}`: {exc}"
+            devices = streaming.decode_devices()
+            split = f" Video chunks decode across {', '.join(devices)}." if devices else ""
             return (
                 f"**Enabled.** Segments will appear under `{out_dir}/gen_NNN/` during the "
-                "next MiniMax H3 generation."
+                f"next MiniMax H3 generation.{split}"
             )
         streaming.deactivate()
         return "Disabled."
@@ -108,4 +119,8 @@ class ChunkStreamingPlugin(WAN2GPPlugin):
                 f"Audio-first decode {'active' if rec.audio_first_effective else 'fell back to default order'}; "
                 f"audio decode took {rec.audio_s:.2f}s. Generated {time.strftime('%H:%M:%S')}."
             )
+            plan = rec.decode_plan
+            if plan:
+                note += (f" Multi-GPU decode fell back to {plan['devices'][0]}: {plan['fallback']}." if plan.get("fallback")
+                         else f" Video decoded across {', '.join(plan['devices'])}.")
         return rows, note
