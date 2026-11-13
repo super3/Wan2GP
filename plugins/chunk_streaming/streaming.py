@@ -21,6 +21,14 @@ wrapped for timing and output capture: audio decoding is independent of video
 decoding, so a streaming pipeline reorders it first and every video chunk
 shifts later by its duration (serial execution makes that shift exact).
 
+Above 480p one GPU decodes slower than playback. `set_decode_devices` (or
+`activate(decode_devices=...)`) splits the chunks of each video decode
+round-robin across several devices: the clips are independent, so they decode
+concurrently, one thread per extra device holding its own copy of the decoder,
+while the cross-fade, the conversion and the recorder callbacks stay in chunk
+order on the calling thread. Only latents and overlap frames cross devices,
+through the CPU, and the output is bit-identical to the single-device decode.
+
 The pure-math helpers at the bottom model the player: `no_buffer_start` is the
 oracle earliest start with zero rebuffering, `linear_estimate_start` is the
 deployable policy (observe the first chunks, fit a linear completion rate, pad
@@ -29,13 +37,16 @@ it, commit to a start time) that the bench validates against actual arrivals.
 
 from __future__ import annotations
 
+import concurrent.futures
 import queue
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+import types
 import wave
+import weakref
 from pathlib import Path
 
 import torch
@@ -74,6 +85,8 @@ class StreamRecorder:
         self.audio_cache: tuple[object, object] | None = None
         #: True when the audio-first hook actually decoded audio before video
         self.audio_first_effective = False
+        #: the last decode's multi-device plan: {"devices", "main", "fallback"}; None for a single-device decode
+        self.decode_plan: dict | None = None
 
     # -- hooks ------------------------------------------------------------
     def on_decode_start(self) -> None:
@@ -144,7 +157,7 @@ def _to_uint8_frames(vae, sl: torch.Tensor) -> torch.Tensor:
 
 
 _STATE: dict = {"active": False, "recorder": None, "orig_decode": None,
-                "orig_audio_decode": None, "orig_video_decode": None}
+                "orig_audio_decode": None, "orig_video_decode": None, "decode_devices": None}
 
 
 def recorder() -> StreamRecorder | None:
@@ -198,14 +211,354 @@ def _maybe_prefetch_audio(frame, rec: StreamRecorder) -> bool:
         return False
 
 
+# -- multi-device decode ----------------------------------------------------
+#
+# `_decode` runs one `_decode_clip` per temporal chunk on the latents
+# z[:, :, i * tokens_chunk_size : i * tokens_chunk_size + tokens_chunk_size + token_overlap]
+# and nothing else: no state flows from one clip to the next. What couples
+# consecutive chunks is only the finalization that follows each clip: the
+# first `frame_overlap` frames of chunk i are cross-faded (`_blend`) with the
+# trailing `frame_overlap` frames of clip i-1 (its j == 1 part, the `overlap`),
+# and the finalized frames are converted and written to the CPU output in
+# order. So the clips can be decoded anywhere, concurrently, as long as the
+# blend, the conversion, the CPU writes and the recorder callbacks run in chunk
+# order on the calling thread. That is what `_ChunkDispatcher` does: chunk i
+# decodes on decode device i % N, the calling thread decodes the chunks that
+# fall on the VAE's own device itself (through the original, MMGP-managed
+# module: offloading, progress and abort hooks unchanged) and finalizes every
+# chunk in order exactly as the single-device loop does.
+#
+# Each other device gets a `_Replica`: a copy of the decode path only
+# (`post_quant_conv` and `decoder`, plus the root's plain attributes) whose
+# weights are copied once to that device and kept there. It is built from the
+# live VAE module rather than reloaded from disk, so it has the same
+# quantization, qkv splitting, dtype and patched forwards whatever loader and
+# MMGP profile produced it. MMGP's per-module offload hooks are stripped (they
+# would load the original weights onto the main GPU); see `_replicate_module`.
+
+_DECODE_LOOKAHEAD = 2  # chunks queued per replica device ahead of the in-order finalization
+_REPLICAS: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()  # vae -> {(device, ordinal): _Replica}
+_REPLICA_LOCK = threading.Lock()
+
+
+class ReplicaUnsupported(RuntimeError):
+    """The VAE carries a hook or wrapper that `_replicate_module` cannot copy faithfully."""
+
+
+def _normalize_device(device) -> torch.device:
+    device = torch.device(device)
+    if device.type == "cuda" and device.index is None:
+        device = torch.device("cuda", torch.cuda.current_device() if torch.cuda.is_available() else 0)
+    return device
+
+
+def parse_decode_devices(devices) -> list[str] | None:
+    """A decode device list from a list of names or a comma/space separated string; None when empty.
+
+    Every entry must name a torch device ("cuda:1", "cuda", "cpu"); "cuda" means the current CUDA device.
+    Entries may repeat (two slots on one device decode two chunks at once there, which the CPU tests use).
+    """
+    if devices is None:
+        return None
+    if isinstance(devices, str):
+        devices = devices.replace(",", " ").split()
+    names = [str(_normalize_device(str(d).strip())) for d in devices if str(d).strip()]
+    return names or None
+
+
+def set_decode_devices(devices) -> list[str] | None:
+    """Set the multi-device decode list (None/empty: off, the single-device decode of today)."""
+    names = parse_decode_devices(devices)
+    if names != _STATE.get("decode_devices"):
+        release_decode_replicas()
+    _STATE["decode_devices"] = names
+    return names
+
+
+def decode_devices() -> list[str] | None:
+    return _STATE.get("decode_devices")
+
+
+def release_decode_replicas() -> None:
+    """Drop every cached replica (their weights free on their devices once no decode is using them)."""
+    with _REPLICA_LOCK:
+        _REPLICAS.clear()
+
+
+def _main_decode_device(z: torch.Tensor) -> torch.device:
+    """The device the original VAE decodes on: the latents' device (MMGP moves them to the GPU before `_decode`)."""
+    if z.device.type != "cpu":
+        return _normalize_device(z.device)
+    if torch.cuda.is_available():
+        return _normalize_device("cuda")
+    return torch.device("cpu")
+
+
+def _move_tensor(tensor: torch.Tensor, device: torch.device) -> torch.Tensor:
+    """`tensor` on `device`; between two GPUs through the CPU, so no peer-to-peer access (NVLink, P2P) is ever needed."""
+    tensor = tensor.detach()
+    if tensor.device == device:
+        return tensor
+    if tensor.device.type != "cpu" and device.type != "cpu":
+        tensor = tensor.to("cpu")
+    return tensor.to(device)
+
+
+def _rebind(value, memo: dict):
+    """A method bound to a module of the copied tree, bound to its copy instead; anything else unchanged."""
+    owner = getattr(value, "__self__", None)
+    if isinstance(value, types.MethodType) and id(owner) in memo:
+        return types.MethodType(value.__func__, memo[id(owner)])
+    return value
+
+
+_HOOK_DICTS = ("_forward_hooks", "_forward_pre_hooks", "_backward_hooks", "_backward_pre_hooks",
+               "_state_dict_hooks", "_state_dict_pre_hooks", "_load_state_dict_pre_hooks", "_load_state_dict_post_hooks")
+
+
+def _replicate_module(module: torch.nn.Module, device: torch.device, keep_children=None, memo: dict | None = None) -> torch.nn.Module:
+    """A copy of `module` with its parameters and buffers on `device`, without MMGP's offload hooks.
+
+    MMGP hooks a module by replacing its instance `forward` with a partial that first makes the model's weights resident on the main
+    GPU, keeping the previous forward in `_mm_forward` (`_mm_<method>` for other methods). The copy runs that previous forward:
+    the class forward, or a forward the loader installed on the instance (an INT8 precision rule, a ConvRot embedding), which is
+    rebound to the copy, as are other methods bound to the module. MMGP's attributes (`_mm_*`, `_hf_hook`) are dropped. A forward or a
+    module hook of any other kind is refused (`ReplicaUnsupported`) rather than guessed at. Parameters and buffers are copied with
+    `.to(device)` (quantized weight tensors move with their scales); on their own device they are shared, not copied.
+    """
+    memo = {} if memo is None else memo
+    # first pass: one empty copy per module, so methods bound to any module of the tree can be rebound
+    originals = []
+
+    def allocate(mod, keep):
+        clone = type(mod).__new__(type(mod))
+        memo[id(mod)] = clone
+        originals.append(mod)
+        for name, child in mod._modules.items():
+            if child is not None and (keep is None or name in keep):
+                allocate(child, None)
+
+    allocate(module, keep_children)
+    for mod in originals:
+        clone = memo[id(mod)]
+        if getattr(mod, "_compiled_call_impl", None) is not None:
+            raise ReplicaUnsupported(f"{type(mod).__name__} is torch.compile'd")
+        state = {}
+        for key, value in mod.__dict__.items():
+            if key.startswith("_mm_") or key in ("_hf_hook", "forward", "_parameters", "_buffers", "_modules") or key in _HOOK_DICTS:
+                continue
+            if torch.is_tensor(value):
+                value = _move_tensor(value, device)
+            state[key] = _rebind(value, memo)
+        forward = mod.__dict__.get("_mm_forward", mod.__dict__.get("forward"))
+        if "_mm_lora_old_forward" in mod.__dict__:
+            raise ReplicaUnsupported(f"{type(mod).__name__} carries LoRA hooks")
+        if forward is not None:
+            if not (isinstance(forward, types.MethodType) and forward.__self__ is mod):
+                raise ReplicaUnsupported(f"{type(mod).__name__}.forward is wrapped by {type(forward).__name__}")
+            if forward.__func__ is not type(mod).forward:
+                state["forward"] = types.MethodType(forward.__func__, clone)
+        for key in _HOOK_DICTS:
+            hooks = mod.__dict__.get(key)
+            if hooks is None:
+                continue
+            copied = type(hooks)()
+            for hook_id, hook in hooks.items():
+                rebound = _rebind(hook, memo)
+                if rebound is hook:
+                    raise ReplicaUnsupported(f"{type(mod).__name__} has a {key[1:]} entry that is not a method of the copied modules")
+                copied[hook_id] = rebound
+            state[key] = copied
+        params = {}
+        for name, param in mod._parameters.items():
+            if param is None:
+                params[name] = None
+                continue
+            moved = _move_tensor(param, device)
+            params[name] = torch.nn.Parameter(moved, requires_grad=False) if isinstance(param, torch.nn.Parameter) else moved
+        state["_parameters"] = params
+        state["_buffers"] = {name: None if buf is None else _move_tensor(buf, device) for name, buf in mod._buffers.items()}
+        state["_modules"] = {name: memo[id(child)] for name, child in mod._modules.items() if child is not None and id(child) in memo}
+        clone.__dict__.update(state)
+    return memo[id(module)]
+
+
+_ROOT_DECODE_MODULES = ("post_quant_conv", "decoder")
+
+
+class _Replica:
+    """The decode path of one VAE on one extra device, with the CUDA stream its decodes run on."""
+
+    def __init__(self, vae, device: torch.device):
+        self.device = device
+        self.module = _replicate_module(vae, device, keep_children=_ROOT_DECODE_MODULES)
+        missing = [name for name in _ROOT_DECODE_MODULES if name not in self.module._modules]
+        if missing:
+            raise ReplicaUnsupported(f"the VAE has no {', '.join(missing)}")
+        self.stream = torch.cuda.Stream(device) if device.type == "cuda" else None
+
+    def sync_from(self, vae) -> None:
+        """Mirror the root's plain settings (tiling, tile sizes) the UI may have changed since the copy, and clear a past abort."""
+        for key, value in vae.__dict__.items():
+            if (key.startswith("_mm_") or key in ("_hf_hook", "forward", "_parameters", "_buffers", "_modules")
+                    or key in _HOOK_DICTS or torch.is_tensor(value) or isinstance(value, (types.MethodType, torch.nn.Module))):
+                continue
+            self.module.__dict__[key] = value
+        self.set_interrupt(False)
+
+    def set_interrupt(self, value: bool) -> None:
+        decoder = self.module._modules["decoder"]
+        decoder.__dict__["_interrupt"] = bool(value)
+
+    def decode(self, z_part: torch.Tensor, grad_enabled: bool, inference: bool) -> torch.Tensor:
+        """`_decode_clip` of one chunk on this device, on a worker thread; returns once the clip is computed."""
+        mode = torch.inference_mode() if inference else torch.set_grad_enabled(grad_enabled)
+        if self.stream is None:
+            with mode:
+                return self.module._decode_clip(z_part.to(self.device))
+        torch.cuda.set_device(self.device)
+        with mode, torch.cuda.stream(self.stream):
+            clip = self.module._decode_clip(z_part.to(self.device))
+            self.stream.synchronize()
+        return clip
+
+
+def _replicas_for(vae, slots: list[torch.device]) -> list["_Replica"]:
+    """One replica per extra decode slot, built once per VAE and slot and cached while the device list is unchanged."""
+    with _REPLICA_LOCK:
+        cache = _REPLICAS.get(vae)
+        if cache is None:
+            cache = _REPLICAS[vae] = {}
+        replicas, ordinal = [], {}
+        for device in slots:
+            key = (str(device), ordinal.setdefault(str(device), 0))
+            ordinal[str(device)] += 1
+            replica = cache.get(key)
+            if replica is None:
+                if device.type == "cuda":
+                    torch.cuda.synchronize()  # no MMGP prefetch of these weights is still in flight while they are read
+                replica = cache[key] = _Replica(vae, device)
+            replica.sync_from(vae)
+            replicas.append(replica)
+        return replicas
+
+
+class _ChunkDispatcher:
+    """Decodes the clips of `_decode`'s chunk loop across devices; `clip(i)` is called in chunk order by the calling thread.
+
+    Slot k of the device list takes chunks k, k + N, k + 2N... The first slot on the VAE's own device is decoded by the calling
+    thread with the original module; every other slot has a replica and a worker thread. At most `_DECODE_LOOKAHEAD` chunks per
+    replica are queued ahead of the chunk being finalized, which bounds the decoded clips waiting on each device.
+    """
+
+    def __init__(self, vae, z: torch.Tensor, slots: list, num_chunks: int, tokens_chunk_size: int, clip_tokens: int):
+        self.vae = vae
+        self.z = z
+        self.slots = slots  # None: the calling thread with the original module; else a _Replica
+        self.num_chunks = num_chunks
+        self.tokens_chunk_size = tokens_chunk_size
+        self.clip_tokens = clip_tokens
+        self.progress = None
+        self.spatial_tiles = 1
+        # only the latents leave the main device (a few MB), through the CPU
+        self.z_host = z.detach().to("cpu")
+        self.grad_enabled = torch.is_grad_enabled()
+        self.inference = torch.is_inference_mode_enabled()
+        self.executors = {}
+        for k, slot in enumerate(slots):
+            if slot is not None:
+                self.executors[id(slot)] = concurrent.futures.ThreadPoolExecutor(
+                    max_workers=1, thread_name_prefix=f"h3-decode-slot{k}-{slot.device}")
+        self.futures: dict[int, concurrent.futures.Future] = {}
+        self.next_submit = 0
+
+    def _submit_until(self, limit: int) -> None:
+        while self.next_submit < min(limit, self.num_chunks):
+            i = self.next_submit
+            slot = self.slots[i % len(self.slots)]
+            if slot is not None:
+                start = i * self.tokens_chunk_size
+                z_part = self.z_host[:, :, start : start + self.clip_tokens]
+                self.futures[i] = self.executors[id(slot)].submit(slot.decode, z_part, self.grad_enabled, self.inference)
+            self.next_submit += 1
+
+    def _interrupt_requested(self) -> bool:
+        return bool(getattr(self.vae.decoder, "_interrupt", False))
+
+    def clip(self, i: int) -> torch.Tensor:
+        self._submit_until(i + 1 + _DECODE_LOOKAHEAD * len(self.slots))
+        slot = self.slots[i % len(self.slots)]
+        if slot is None:
+            start = i * self.tokens_chunk_size
+            return self.vae._decode_clip(self.z[:, :, start : start + self.clip_tokens])
+        future = self.futures.pop(i)
+        while True:
+            try:
+                clip = future.result(timeout=0.05)
+                break
+            except concurrent.futures.TimeoutError:
+                if self._interrupt_requested():
+                    for other in self.slots:
+                        if other is not None:
+                            other.set_interrupt(True)
+        if clip.device.type == "cuda":
+            # allocated on the replica's stream, finalized on this thread's: its memory must outlive this stream's reads
+            clip.record_stream(torch.cuda.current_stream(clip.device))
+        if self.progress is not None:
+            self.progress.advance(self.spatial_tiles)  # the replica's decoder carries no progress hook
+        return clip
+
+    def close(self, failed: bool) -> None:
+        """Stop and join the workers. On failure, abort in-flight replica decodes at their next block first."""
+        for future in self.futures.values():
+            future.cancel()
+        if failed:
+            for slot in self.slots:
+                if slot is not None:
+                    slot.set_interrupt(True)
+        for executor in self.executors.values():
+            executor.shutdown(wait=True)
+        for slot in self.slots:
+            if slot is not None:
+                slot.set_interrupt(False)
+        self.futures.clear()
+
+
+def _make_dispatcher(vae, z: torch.Tensor, num_chunks: int, tokens_chunk_size: int, clip_tokens: int,
+                     rec: "StreamRecorder") -> "_ChunkDispatcher | None":
+    """The multi-device dispatcher for this decode, or None for the single-device loop (option off, or nothing to split)."""
+    names = _STATE.get("decode_devices")
+    rec.decode_plan = None
+    if not names or num_chunks < 2:
+        return None
+    main = _main_decode_device(z)
+    devices = [_normalize_device(name) for name in names]
+    if len(devices) == 1 and devices[0] == main:
+        return None
+    main_slot = next((k for k, device in enumerate(devices) if device == main), None)
+    extra = [device for k, device in enumerate(devices) if k != main_slot]
+    try:
+        replicas = iter(_replicas_for(vae, extra))
+    except Exception as exc:  # noqa: BLE001 - fall back to the single-device decode, which is always correct
+        rec.decode_plan = {"devices": [str(main)], "fallback": f"{type(exc).__name__}: {exc}"[:300]}
+        print(f"[Chunk Streaming] multi-device decode unavailable, decoding on {main} only: {exc}")
+        return None
+    slots = [None if k == main_slot else next(replicas) for k in range(len(devices))]
+    rec.decode_plan = {"devices": [str(device) for device in devices], "main": str(main), "fallback": None}
+    return _ChunkDispatcher(vae, z, slots, num_chunks, tokens_chunk_size, clip_tokens)
+
+
 def _instrumented_decode(self, z: torch.Tensor, uint8_rounding: str | None = None) -> torch.Tensor:
     """`AutoencoderKLMiniMaxH3._decode` with recorder callbacks.
 
     The body is copied verbatim from components/video_autoencoder.py (upstream
     9f30419: single-frame decoder and single-latent still paths, CPU output
-    buffer filled by `write_chunk`, `PhaseProgress`); the callbacks only read finalized regions
+    buffer filled by `write_chunk`, `PhaseProgress`), its chunk loop moved into
+    `_instrumented_decode_loop`; the callbacks only read finalized regions
     of that buffer, so the returned tensor is bit-identical to the original
-    implementation's.
+    implementation's. With decode devices set (`set_decode_devices`), the
+    clips of the chunk loop are decoded across them (`_ChunkDispatcher`) and
+    still finalized here in chunk order, so the output is unchanged.
     """
     rec: StreamRecorder = _STATE["recorder"]
     rec.on_decode_start()
@@ -244,7 +597,31 @@ def _instrumented_decode(self, z: torch.Tensor, uint8_rounding: str | None = Non
         rows = self._split_tiles(height, self.tile_sample_min_height, self.tile_sample_min_overlap_height)[0]
         cols = self._split_tiles(width, self.tile_sample_min_width, self.tile_sample_min_overlap_width)[0]
         spatial_tiles = len(rows) * len(cols)
+    # multi-device decode (`set_decode_devices`): None keeps the single-device loop below exactly as upstream. Taken before the
+    # progress hook is registered on the decoder, which the replicas must not copy.
+    dispatcher = _make_dispatcher(self, z, num_chunks, tokens_chunk_size, tokens_chunk_size + self.token_overlap, rec)
+    if dispatcher is None:
+        return _instrumented_decode_loop(self, z, uint8_rounding, rec, None, num_chunks, output_frames, frame_pre_padding,
+                                         spatial_tiles)
+    failed = True
+    try:
+        decoded = _instrumented_decode_loop(self, z, uint8_rounding, rec, dispatcher, num_chunks, output_frames, frame_pre_padding,
+                                            spatial_tiles)
+        failed = False
+        return decoded
+    finally:
+        dispatcher.close(failed)
+
+
+def _instrumented_decode_loop(self, z, uint8_rounding, rec, dispatcher, num_chunks, output_frames, frame_pre_padding,
+                              spatial_tiles):
+    """The chunk loop of `_instrumented_decode`; with a dispatcher, each clip comes from `dispatcher.clip(i)`."""
+    tokens_chunk_size = self.tokens_chunk_size
+    token_drop = self.config.token_drop
+    chunk_num_frames = tokens_chunk_size * self.temporal_compression_ratio
     with PhaseProgress(max(1, num_chunks) * spatial_tiles) as progress, progress.track(self.decoder, spatial_tiles):
+        if dispatcher is not None:
+            dispatcher.progress, dispatcher.spatial_tiles = progress, spatial_tiles
         decoded = None
         write_position = 0
         overlap = None
@@ -270,14 +647,19 @@ def _instrumented_decode(self, z: torch.Tensor, uint8_rounding: str | None = Non
             return decoded
 
         for i in range(num_chunks):
-            start = i * tokens_chunk_size
-            clip = self._decode_clip(z[:, :, start : start + tokens_chunk_size + self.token_overlap])
+            if dispatcher is None:
+                start = i * tokens_chunk_size
+                clip = self._decode_clip(z[:, :, start : start + tokens_chunk_size + self.token_overlap])
+            else:
+                clip = dispatcher.clip(i)  # decoded on decode device i % N; finalized here, in chunk order
             for j in range(int(token_drop > 0) + 1):
                 frame_start = j * chunk_num_frames
                 chunk = clip[:, :, frame_start : frame_start + chunk_num_frames]
                 chunk = chunk[:, :, self.frame_pre_padding :]
                 if j == 0:
                     if overlap is not None:
+                        if overlap.device != chunk.device:  # the previous clip was decoded on another device
+                            overlap = _move_tensor(overlap, chunk.device)
                         chunk = self._blend(overlap, chunk, self.frame_overlap, dim=-3)
                     write_chunk(chunk)
                     if i < num_chunks - 1 and write_position > reported:
@@ -297,26 +679,32 @@ def _instrumented_decode(self, z: torch.Tensor, uint8_rounding: str | None = Non
 
 
 def activate(store_frames: bool = True, live_dir: str | None = None,
-             audio_first: bool = False) -> StreamRecorder:
+             audio_first: bool = False, decode_devices=None) -> StreamRecorder:
     """Install the instrumented decode paths; returns the shared recorder.
 
     `live_dir` turns on the live segmenter: every finalized chunk is muxed to
     a standalone fMP4 segment in a background thread as it lands, under
     `live_dir/gen_NNN/`. `audio_first` additionally decodes the audio before
     the video decode starts (see `_maybe_prefetch_audio`), so live segments
-    carry their audio slice from the first chunk onward.
+    carry their audio slice from the first chunk onward. `decode_devices`
+    (e.g. ["cuda:0", "cuda:1"] or "cuda:0,cuda:1") splits each video decode's
+    chunks round-robin across those devices (see `set_decode_devices`);
+    None keeps the single-device decode.
     """
+    names = parse_decode_devices(decode_devices)  # validated before anything is patched
     if _STATE["active"]:
         rec = _STATE["recorder"]
         rec.store_frames = store_frames
         rec.live_dir = live_dir
         rec.audio_first = audio_first
+        set_decode_devices(names)
         return rec
     from models.minimax_h3 import audio_vae as _audio_mod
     from models.minimax_h3 import video_vae as _video_mod
 
     rec = StreamRecorder(store_frames=store_frames, live_dir=live_dir, audio_first=audio_first)
     _STATE["recorder"] = rec
+    set_decode_devices(names)
     _STATE["orig_decode"] = _va.AutoencoderKLMiniMaxH3._decode
     _va.AutoencoderKLMiniMaxH3._decode = _instrumented_decode
 
@@ -370,6 +758,7 @@ def deactivate() -> None:
     _video_mod.MiniMaxH3VideoVAE.decode = _STATE["orig_video_decode"]
     _STATE.update({"active": False, "recorder": None, "orig_decode": None,
                    "orig_audio_decode": None, "orig_video_decode": None})
+    set_decode_devices(None)
 
 
 # -- segment muxing -------------------------------------------------------

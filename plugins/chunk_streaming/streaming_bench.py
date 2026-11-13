@@ -15,6 +15,9 @@ duration (a streaming pipeline decodes audio first; execution is serial on one
 GPU so the shift is exact) and add each segment's own mux cost (conservative:
 a real worker muxes segment i while chunk i+1 decodes).
 
+$STREAM_DECODE_DEVICES (e.g. "cuda:0,cuda:1") runs the streaming legs with the
+multi-GPU decode; each leg records the plan it used in "decode_plan".
+
 Requires the worker image environment (runpod_worker + weights). Prints one
 STREAM_LEG JSON line per leg and a final STREAM_TABLE summary, POSTed to
 $LOG_SHIP_URL if set.
@@ -125,7 +128,8 @@ def main() -> int:
             rec = None
             if mode == "streaming":
                 rec = streaming.activate(store_frames=False,
-                                         live_dir=f"{out_root}/{tag}", audio_first=True)
+                                         live_dir=f"{out_root}/{tag}", audio_first=True,
+                                         decode_devices=os.environ.get("STREAM_DECODE_DEVICES") or None)
                 rec.reset()
             started = time.monotonic()
             response = H.run_job(_job(resolution, frames, f"{tag}-{mode}"))
@@ -156,6 +160,7 @@ def main() -> int:
                         "chunk_ready_rel_s": [round(c, 3) for c in chunk_rel],
                         "segments": [{k: v for k, v in s.items() if k != "path"} for s in segments],
                         "segment_ready_s": [round(r, 3) for r in ready],
+                        "decode_plan": rec.decode_plan,
                     })
                     if ready and len(ready) == len(durations):
                         oracle = streaming.no_buffer_start(ready, durations)

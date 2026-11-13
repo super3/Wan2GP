@@ -1,21 +1,27 @@
 # Copyright 2026. Licensed under the Apache License, Version 2.0.
 """CPU tests for plugins/chunk_streaming/streaming.py.
 
-Three properties are load-bearing enough to gate a GPU bench on:
+Four properties are load-bearing enough to gate a GPU bench on:
 1. The instrumented `_decode` returns a tensor bit-identical to the original
    and its finalized-frame events tile the output exactly (tiny CPU VAE).
 2. The segment muxer produces playable fMP4 segments whose ffprobe frame
    counts match the finalized ranges.
 3. The player schedule math: the oracle start never rebuffers, and the linear
    estimator flags exactly the arrival patterns that would stall.
+4. The multi-device decode (chunks split across devices, here CPU slots on
+   worker threads) is bit-identical to the single-device decode, finalizes and
+   reports chunks in order whatever order they finish in, and propagates errors.
 """
 
 from __future__ import annotations
 
+import functools
 import json
 import math
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -519,3 +525,385 @@ def test_instrumented_decode_feeds_live_segmenter(tmp_path):
     for r in results:
         assert "error" not in r, r
         assert not r["has_audio"]  # no audio was set in this run
+
+
+# -- multi-device decode ----------------------------------------------------
+#
+# A device list like ["cpu", "cpu", "cpu"] runs the real dispatcher: the first
+# "cpu" is the VAE's own device (decoded on the calling thread), every other
+# entry gets a replica of the decoder and a worker thread, so the chunks decode
+# concurrently on CPU exactly as they would across GPUs.
+
+_MULTI_LENGTHS = (2, 5, 8, 12, 21, 37)  # 0, 1, 1, 2, 4 and 7 chunks
+_REFERENCE_CACHE: dict = {}
+
+
+def _reference_decode(z_tokens, uint8_rounding):
+    """Original `decode` output (no plugin) of the tiny adapter VAE for a seeded latent."""
+    key = (z_tokens, uint8_rounding)
+    if key not in _REFERENCE_CACHE:
+        vae = _tiny_adapter_vae()
+        z = torch.randn(1, 4, z_tokens, 8, 8, generator=torch.Generator().manual_seed(z_tokens))
+        with torch.no_grad():
+            _REFERENCE_CACHE[key] = (z, AutoencoderKLMiniMaxH3.decode(vae, z, False, uint8_rounding)[0])
+    return _REFERENCE_CACHE[key]
+
+
+def _decode_threads():
+    return [t for t in threading.enumerate() if t.name.startswith("h3-decode")]
+
+
+def _assert_tiling_events(rec, total_frames):
+    assert [c["chunk"] for c in rec.chunks] == list(range(len(rec.chunks)))
+    assert rec.chunks[0]["frame_start"] == 0
+    for k in range(1, len(rec.chunks)):
+        assert rec.chunks[k]["frame_start"] == rec.chunks[k - 1]["frame_end"]
+    assert rec.chunks[-1]["frame_end"] == total_frames
+    ts = [c["t"] for c in rec.chunks]
+    assert ts == sorted(ts)
+
+
+@pytest.mark.parametrize("uint8_rounding", ["truncate", "round", None])
+@pytest.mark.parametrize("num_devices", [1, 2, 3, 4])
+def test_multi_device_decode_bit_identical(num_devices, uint8_rounding):
+    """Every latent length, 1-4 decode slots and every rounding mode give the original output, frames and in-order events."""
+    vae = _tiny_adapter_vae()
+    rec = streaming.activate(store_frames=True, decode_devices=["cpu"] * num_devices)
+    try:
+        for z_tokens in _MULTI_LENGTHS:
+            z, expected = _reference_decode(z_tokens, uint8_rounding)
+            rec.reset()
+            with torch.no_grad():
+                got = AutoencoderKLMiniMaxH3.decode(vae, z, False, uint8_rounding)[0]
+            assert got.dtype == expected.dtype
+            assert torch.equal(expected, got), f"multi-device decode diverged: {z_tokens} latents, {num_devices} devices"
+            _assert_tiling_events(rec, expected.shape[2])
+            frames = torch.cat(rec.frames)
+            reference = expected if uint8_rounding else expected.clamp(-1.0, 1.0).add(1.0).mul(127.5).round().to(torch.uint8)
+            assert torch.equal(frames, reference[0].permute(1, 2, 3, 0))
+            split = num_devices > 1 and len(rec.chunks) > 1
+            assert (rec.decode_plan is not None) == split
+            if split:
+                assert rec.decode_plan["devices"] == ["cpu"] * num_devices and rec.decode_plan["fallback"] is None
+    finally:
+        streaming.deactivate()
+    assert not _decode_threads()
+
+
+def test_multi_device_decode_raw_vae_and_tiling(monkeypatch):
+    """The base class (identity `_prepare_decoded_chunk`) with spatial tiling: same output, same progress count."""
+    vae = _tiny_vae()
+    vae.tile_sample_min_height = vae.tile_sample_min_width = 64
+    vae.tile_sample_min_overlap_height = vae.tile_sample_min_overlap_width = 32
+    z = torch.randn(1, 4, 21, 8, 8)
+    totals = []
+
+    class CountingProgress(streaming.PhaseProgress):
+        def __exit__(self, *exc):
+            totals.append((self.completed, self.total))
+            return super().__exit__(*exc)
+
+    monkeypatch.setattr(streaming, "PhaseProgress", CountingProgress)
+
+    class FakeGeneration:  # PhaseProgress counts only inside a generation
+        pipeline = types.SimpleNamespace(_interrupt=False)
+        callback = None
+        set_status = None
+        next_update = 0.0
+
+        def check_abort(self):
+            pass
+
+    phase_progress = importlib.import_module("shared.utils.phase_progress")
+    token = phase_progress._generation.set(FakeGeneration())
+    try:
+        results = []
+        for devices in (None, ["cpu"] * 3):
+            streaming.activate(store_frames=False, decode_devices=devices)
+            try:
+                with torch.no_grad():
+                    results.append(AutoencoderKLMiniMaxH3._decode(vae, z))
+            finally:
+                streaming.deactivate()
+    finally:
+        phase_progress._generation.reset(token)
+    assert torch.equal(results[0], results[1])
+    assert totals[0] == totals[1] and totals[0][0] == totals[0][1] > 4  # 4 chunks x several tiles, all counted
+
+
+def test_multi_device_decode_runs_concurrently(monkeypatch):
+    """The first clip of every slot is in flight at the same time: a 3-party barrier only passes if they run concurrently."""
+    vae = _tiny_vae()
+    z = torch.randn(1, 4, 37, 8, 8)
+    with torch.no_grad():
+        expected = AutoencoderKLMiniMaxH3._decode(vae, z)
+    original = AutoencoderKLMiniMaxH3._decode_clip
+    barrier = threading.Barrier(3, timeout=20)
+    seen = set()
+    lock = threading.Lock()
+
+    def gated(self, z_part):
+        name = threading.current_thread().name
+        with lock:
+            first = name not in seen
+            seen.add(name)
+        if first:
+            barrier.wait()
+        return original(self, z_part)
+
+    monkeypatch.setattr(AutoencoderKLMiniMaxH3, "_decode_clip", gated)
+    streaming.activate(store_frames=False, decode_devices=["cpu", "cpu", "cpu"])
+    try:
+        with torch.no_grad():
+            got = AutoencoderKLMiniMaxH3._decode(vae, z)
+    finally:
+        streaming.deactivate()
+    assert torch.equal(expected, got)
+    assert len(seen) == 3 and sum(name.startswith("h3-decode") for name in seen) == 2
+
+
+def _chunk_index(z_part, z_padded, tokens_chunk_size):
+    for i in range(z_padded.shape[2] // tokens_chunk_size):
+        start = i * tokens_chunk_size
+        candidate = z_padded[:, :, start : start + z_part.shape[2]]
+        if candidate.shape == z_part.shape and torch.equal(candidate, z_part):
+            return i
+    raise AssertionError("unknown latent slice")
+
+
+def test_multi_device_decode_finalizes_in_order_when_chunks_finish_out_of_order(monkeypatch, tmp_path):
+    """A slow device finishes its chunks after later ones: output, events and live segments stay in chunk order."""
+    vae = _tiny_vae()
+    z = torch.randn(1, 4, 37, 8, 8)  # 7 chunks, no padding (37 + 3 is a multiple of 5)
+    with torch.no_grad():
+        expected = AutoencoderKLMiniMaxH3._decode(vae, z)
+    original = AutoencoderKLMiniMaxH3._decode_clip
+    finished = []
+    lock = threading.Lock()
+    slow_thread = []
+
+    def uneven(self, z_part):
+        name = threading.current_thread().name
+        with lock:
+            if name.startswith("h3-decode") and not slow_thread:
+                slow_thread.append(name)
+        if slow_thread and name == slow_thread[0]:
+            time.sleep(0.4)
+        clip = original(self, z_part)
+        with lock:
+            finished.append(_chunk_index(z_part, z, vae.tokens_chunk_size))
+        return clip
+
+    monkeypatch.setattr(AutoencoderKLMiniMaxH3, "_decode_clip", uneven)
+    rec = streaming.activate(store_frames=True, live_dir=str(tmp_path), decode_devices=["cpu", "cpu", "cpu"])
+    try:
+        with torch.no_grad():
+            got = AutoencoderKLMiniMaxH3._decode(vae, z)
+        segments = rec.live.close()
+    finally:
+        streaming.deactivate()
+    assert sorted(finished) == list(range(7))
+    assert finished != sorted(finished), "the slow device should have finished after later chunks"
+    assert torch.equal(expected, got)
+    _assert_tiling_events(rec, expected.shape[2])
+    assert [(s["frame_start"], s["frame_end"]) for s in segments] == [(c["frame_start"], c["frame_end"]) for c in rec.chunks]
+    assert all("error" not in s for s in segments)
+
+
+def test_multi_device_decode_option_off_is_unchanged(monkeypatch):
+    """Without decode devices no dispatcher, replica or thread is created and the output is the original one."""
+    created = []
+    monkeypatch.setattr(streaming, "_ChunkDispatcher", lambda *a, **k: created.append(a))
+    vae = _tiny_vae()
+    z = torch.randn(1, 4, 21, 8, 8)
+    with torch.no_grad():
+        expected = AutoencoderKLMiniMaxH3._decode(vae, z)
+    for devices in (None, [], "", ["cpu"]):  # a single slot on the VAE's own device is the plain decode too
+        rec = streaming.activate(store_frames=True, decode_devices=devices)
+        try:
+            with torch.no_grad():
+                got = AutoencoderKLMiniMaxH3._decode(vae, z)
+        finally:
+            streaming.deactivate()
+        assert torch.equal(expected, got)
+        assert rec.decode_plan is None
+    assert not created and not _decode_threads()
+    assert streaming.decode_devices() is None
+
+
+@pytest.mark.parametrize("failing", ["worker", "main"])
+def test_multi_device_decode_propagates_errors(monkeypatch, failing):
+    """A decode that raises on a worker (or on the calling thread) surfaces its exception; workers are joined and reusable."""
+    vae = _tiny_vae()
+    z = torch.randn(1, 4, 37, 8, 8)
+    with torch.no_grad():
+        expected = AutoencoderKLMiniMaxH3._decode(vae, z)
+    original = AutoencoderKLMiniMaxH3._decode_clip
+    calls = {"worker": 0, "main": 0}
+
+    def flaky(self, z_part):
+        side = "worker" if threading.current_thread().name.startswith("h3-decode") else "main"
+        calls[side] += 1
+        if side == failing and calls[side] == 2:
+            raise ValueError(f"boom on {side}")
+        return original(self, z_part)
+
+    rec = streaming.activate(store_frames=True, decode_devices=["cpu"] * 3)
+    try:
+        monkeypatch.setattr(AutoencoderKLMiniMaxH3, "_decode_clip", flaky)
+        with pytest.raises(ValueError, match=f"boom on {failing}"), torch.no_grad():
+            AutoencoderKLMiniMaxH3._decode(vae, z)
+        assert not _decode_threads()
+        assert rec.decode_end_t is None
+        # the cached replicas are left usable (no stale abort flag) and the next decode is exact
+        monkeypatch.setattr(AutoencoderKLMiniMaxH3, "_decode_clip", original)
+        rec.reset()
+        with torch.no_grad():
+            got = AutoencoderKLMiniMaxH3._decode(vae, z)
+        assert torch.equal(expected, got)
+        _assert_tiling_events(rec, expected.shape[2])
+    finally:
+        streaming.deactivate()
+    assert not _decode_threads()
+
+
+def test_multi_device_decode_aborts_replicas_on_interrupt(monkeypatch):
+    """The pipeline's abort flag on the original decoder reaches a replica mid-decode, which stops with GenerationInterrupted."""
+    interrupt = importlib.import_module("models.minimax_h3.interrupt")
+    vae = _tiny_vae()
+    z = torch.randn(1, 4, 37, 8, 8)
+    original = AutoencoderKLMiniMaxH3._decode_clip
+    interrupted_on = []
+
+    def abort_after_first(self, z_part):
+        if threading.current_thread().name.startswith("h3-decode"):
+            time.sleep(0.3)  # still decoding when the calling thread asks for this clip and sees the abort
+            try:
+                return original(self, z_part)
+            except interrupt.GenerationInterrupted:
+                interrupted_on.append(threading.current_thread().name)
+                raise
+        out = original(self, z_part)
+        vae.decoder._interrupt = True  # what `MiniMaxH3VideoVAE._interrupt = True` does, after chunk 0
+        return out
+
+    monkeypatch.setattr(AutoencoderKLMiniMaxH3, "_decode_clip", abort_after_first)
+    streaming.activate(store_frames=False, decode_devices=["cpu", "cpu"])  # chunk 0 on the calling thread, chunk 1 on a replica
+    try:
+        with pytest.raises(interrupt.GenerationInterrupted), torch.no_grad():
+            AutoencoderKLMiniMaxH3._decode(vae, z)
+        replica = next(iter(streaming._REPLICAS[vae].values()))
+        assert replica.module.decoder._interrupt is False  # reset for the next decode
+    finally:
+        vae.decoder._interrupt = False
+        streaming.deactivate()
+    assert interrupted_on and not _decode_threads()
+
+
+def test_multi_device_single_frame_and_still_paths_stay_on_one_device():
+    torch.manual_seed(0)
+    single = AutoencoderKLMiniMaxH3(
+        latent_channels=4, block_out_channels=(8, 8, 8, 8, 8, 8), layers_per_block=1, norm_num_groups=4,
+        decoder_num_layers=1, decoder_num_attention_heads=1, decoder_attention_head_dim=8,
+        decoder_num_register_tokens=1, decoder_ffn_mult=1, decoder_patch_size_t=1).eval()
+    for vae in (_tiny_vae(), single):
+        z = torch.randn(1, 4, 1, 8, 8)
+        with torch.no_grad():
+            expected = AutoencoderKLMiniMaxH3._decode(vae, z)
+        rec = streaming.activate(store_frames=True, decode_devices=["cpu"] * 3)
+        try:
+            with torch.no_grad():
+                got = AutoencoderKLMiniMaxH3._decode(vae, z)
+        finally:
+            streaming.deactivate()
+        assert torch.equal(expected, got) and expected.shape[2] == 1
+        assert rec.decode_plan is None
+        assert [(c["frame_start"], c["frame_end"]) for c in rec.chunks] == [(0, 1)]
+
+
+def _mmgp_style_hooks(vae, calls):
+    """Hook the decode path like MMGP's offload: an instance forward partial that would load the weights on the main GPU,
+    the previous forward kept in `_mm_forward`, plus `_hf_hook` and `_mm_*` bookkeeping. A loader-installed instance forward
+    (bound method, like the INT8 precision rules) sits under it on one linear."""
+    linear = vae.decoder.proj_out
+    linear._int8_precision_forward = linear.forward
+
+    def precision_forward(module, input):
+        calls.append(("precision", threading.current_thread().name, module is linear))
+        return module._int8_precision_forward(input)
+
+    linear.forward = types.MethodType(precision_forward, linear)
+    for module in [vae.post_quant_conv, *vae.decoder.modules()]:
+        previous = module.forward
+
+        def check_load(module, *args, _previous=previous, **kwargs):
+            calls.append(("mmgp", threading.current_thread().name))
+            return _previous(*args, **kwargs)
+
+        module._mm_id = "vae"
+        module._mm_manager = object()
+        module._mm_forward = previous
+        module._hf_hook = object()
+        module.forward = functools.update_wrapper(functools.partial(check_load, module), previous)
+
+
+def test_replica_strips_mmgp_offload_hooks():
+    vae = _tiny_vae()
+    z = torch.randn(1, 4, 21, 8, 8)
+    with torch.no_grad():
+        expected = AutoencoderKLMiniMaxH3._decode(vae, z)
+    calls = []
+    _mmgp_style_hooks(vae, calls)
+    rec = streaming.activate(store_frames=False, decode_devices=["cpu"] * 3)
+    try:
+        with torch.no_grad():
+            got = AutoencoderKLMiniMaxH3._decode(vae, z)
+        replica = next(iter(streaming._REPLICAS[vae].values())).module
+    finally:
+        streaming.deactivate()
+    assert torch.equal(expected, got) and rec.decode_plan["fallback"] is None
+    # MMGP's hook only ever runs on the calling thread; replicas run the loader's forward, bound to their own module
+    assert {c[1] for c in calls if c[0] == "mmgp"} == {"MainThread"}
+    worker_precision = [c for c in calls if c[0] == "precision" and c[1].startswith("h3-decode")]
+    assert worker_precision and all(c[2] is False for c in worker_precision)
+    for module in replica.modules():
+        assert not any(key.startswith("_mm_") or key == "_hf_hook" for key in module.__dict__)
+    assert replica.decoder.proj_out.forward.__self__ is replica.decoder.proj_out
+    assert "encoder" not in replica._modules  # the decode path only
+    # on its own device a replica shares the weights instead of copying them
+    assert replica.decoder.proj_out.weight.data_ptr() == vae.decoder.proj_out.weight.data_ptr()
+
+
+def test_replica_refuses_unknown_wrappers_and_falls_back():
+    vae = _tiny_vae()
+    z = torch.randn(1, 4, 21, 8, 8)
+    with torch.no_grad():
+        expected = AutoencoderKLMiniMaxH3._decode(vae, z)
+    previous = vae.decoder.x_embedder.forward
+    vae.decoder.x_embedder.forward = lambda x: previous(x)  # a closure: what it does cannot be copied safely
+    rec = streaming.activate(store_frames=True, decode_devices=["cpu", "cpu"])
+    try:
+        with torch.no_grad():
+            got = AutoencoderKLMiniMaxH3._decode(vae, z)
+    finally:
+        streaming.deactivate()
+    assert torch.equal(expected, got)
+    assert "ReplicaUnsupported" in rec.decode_plan["fallback"]
+    _assert_tiling_events(rec, expected.shape[2])
+
+
+def test_decode_device_parsing():
+    assert streaming.parse_decode_devices("cpu, cpu cpu") == ["cpu", "cpu", "cpu"]
+    assert streaming.parse_decode_devices(["cpu", " "]) == ["cpu"]
+    assert streaming.parse_decode_devices("") is None and streaming.parse_decode_devices(None) is None
+    with pytest.raises(RuntimeError):
+        streaming.parse_decode_devices("gpu7")
+    with pytest.raises(RuntimeError):
+        streaming.activate(decode_devices="gpu7")
+    assert not streaming._STATE["active"]
+    rec = streaming.activate(decode_devices="cpu,cpu")
+    try:
+        assert streaming.decode_devices() == ["cpu", "cpu"]
+        assert streaming.activate(decode_devices=None) is rec and streaming.decode_devices() is None
+    finally:
+        streaming.deactivate()
