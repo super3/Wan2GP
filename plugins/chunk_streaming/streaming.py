@@ -313,6 +313,23 @@ def _rebind(value, memo: dict):
     return value
 
 
+def _replicate_value(value, memo: dict, device: torch.device, where: str):
+    """An attribute of a copied module, for its copy: tensors moved to `device`, modules and their bound methods replaced by their
+    copies, through lists, tuples and dicts. A module outside the copied tree is refused: sharing it would run its weights, on their
+    own device, against the replica's inputs (mmgp's row views keep their fused module in `__dict__`, not as a submodule)."""
+    if torch.is_tensor(value):
+        return _move_tensor(value, device)
+    if isinstance(value, torch.nn.Module):
+        if id(value) not in memo:
+            raise ReplicaUnsupported(f"{where} refers to a {type(value).__name__} outside the copied modules")
+        return memo[id(value)]
+    if type(value) in (list, tuple):
+        return type(value)(_replicate_value(item, memo, device, where) for item in value)
+    if type(value) is dict:
+        return {key: _replicate_value(item, memo, device, where) for key, item in value.items()}
+    return _rebind(value, memo)
+
+
 _HOOK_DICTS = ("_forward_hooks", "_forward_pre_hooks", "_backward_hooks", "_backward_pre_hooks",
                "_state_dict_hooks", "_state_dict_pre_hooks", "_load_state_dict_pre_hooks", "_load_state_dict_post_hooks")
 
@@ -348,9 +365,7 @@ def _replicate_module(module: torch.nn.Module, device: torch.device, keep_childr
         for key, value in mod.__dict__.items():
             if key.startswith("_mm_") or key in ("_hf_hook", "forward", "_parameters", "_buffers", "_modules") or key in _HOOK_DICTS:
                 continue
-            if torch.is_tensor(value):
-                value = _move_tensor(value, device)
-            state[key] = _rebind(value, memo)
+            state[key] = _replicate_value(value, memo, device, f"{type(mod).__name__}.{key}")
         forward = mod.__dict__.get("_mm_forward", mod.__dict__.get("forward"))
         if "_mm_lora_old_forward" in mod.__dict__:
             raise ReplicaUnsupported(f"{type(mod).__name__} carries LoRA hooks")

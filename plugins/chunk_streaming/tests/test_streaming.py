@@ -945,3 +945,37 @@ def test_multi_device_decode_with_mmgp_int8_weights(decode_mode):
     finally:
         streaming.deactivate()
     assert not _decode_threads()
+
+
+def test_replica_repoints_module_references_into_the_copy():
+    """mmgp's row views keep their fused module in __dict__, not as a submodule: the replica's views must use the replica's fused
+    weight. Sharing the original one ran GPU-0 INT8 weights against GPU-1 inputs ("INT8 GEMM launch failed (CUDA error 1)")."""
+    from mmgp.row_views import RowViewLinear
+
+    class Attention(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.to_qkv = torch.nn.Linear(8, 24)
+            self.to_q, self.to_k, self.to_v = (RowViewLinear(self.to_qkv, slot, 3, 4) for slot in range(3))
+            self.pair = (self.to_qkv, torch.zeros(2))
+            self.by_name = {"fused": self.to_qkv, "views": [self.to_q, self.to_k]}
+
+    root = torch.nn.Module()
+    root.attn = Attention()
+    clone = streaming._replicate_module(root, torch.device("cpu"))
+    attn = clone.attn
+    assert attn is not root.attn and attn.to_qkv is not root.attn.to_qkv
+    for view in (attn.to_q, attn.to_k, attn.to_v):
+        assert view.__dict__["fused"] is attn.to_qkv
+    assert attn.pair[0] is attn.to_qkv and torch.is_tensor(attn.pair[1])
+    assert attn.by_name["fused"] is attn.to_qkv and attn.by_name["views"] == [attn.to_q, attn.to_k]
+    assert torch.equal(attn.to_k.materialize(), root.attn.to_k.materialize())
+
+
+def test_replica_refuses_a_reference_to_a_module_outside_the_copy():
+    outside = torch.nn.Linear(2, 2)
+    root = torch.nn.Module()
+    root.layer = torch.nn.Linear(2, 2)
+    root.layer.__dict__["peer"] = outside
+    with pytest.raises(streaming.ReplicaUnsupported):
+        streaming._replicate_module(root, torch.device("cpu"))
