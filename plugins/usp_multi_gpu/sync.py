@@ -242,6 +242,28 @@ class Follower:
             # a stray "task" cannot arrive before "end": rank 0 sends one task per job
 
 
+def queue_hook(original, get_leader):
+    """Wrap ``wgp.generate_media`` so each queue job is a lockstep job when multi-GPU is running.
+
+    ``functools.wraps`` is load-bearing: WanGP's queue keeps only the task params that appear in
+    ``inspect.signature(generate_media)``, and ``wraps`` makes that signature the original's. A bare
+    ``(task, send_cmd, *args, **kwargs)`` wrapper would have every param (``state`` included) dropped.
+    """
+
+    @functools.wraps(original)
+    def generate_media(task, send_cmd, *args, **kwargs):
+        lead = get_leader()
+        if lead is None:
+            return original(task, send_cmd, *args, **kwargs)
+        lead.begin_task(task.get("params", {}) if isinstance(task, dict) else {})
+        try:
+            return original(task, send_cmd, *args, **kwargs)
+        finally:
+            lead.end_task()
+
+    return generate_media
+
+
 def serve(follower: Follower, run_task, after_task=lambda: None) -> None:
     """A helper's main loop: run each task rank 0 sends, until ``shutdown``.
 

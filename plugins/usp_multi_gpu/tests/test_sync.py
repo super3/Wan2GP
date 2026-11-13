@@ -269,3 +269,46 @@ def test_a_dead_helper_marks_the_leader_broken():
     leader.begin_task({})
     with pytest.raises(sync.HelperStopped, match="restart"):
         gated_generate(leader, FakeModel(), [], 1)
+
+
+# -- queue hook ---------------------------------------------------------------
+
+def _generate_media(task, send_cmd, state, prompt, resolution="832x480", plugin_data=None):
+    return {"state": state, "prompt": prompt, "resolution": resolution}
+
+
+class _RecordingLeader:
+    def __init__(self):
+        self.events = []
+
+    def begin_task(self, params):
+        self.events.append(("begin", params))
+
+    def end_task(self):
+        self.events.append(("end",))
+
+
+def test_queue_hook_keeps_the_signature_wgp_filters_params_by():
+    # wgp keeps only the task params named in inspect.signature(generate_media): the wrapper must expose the original's.
+    wrapped = sync.queue_hook(_generate_media, lambda: None)
+    assert list(inspect.signature(wrapped).parameters) == list(inspect.signature(_generate_media).parameters)
+    params = {"state": {"gen": 1}, "prompt": "p", "resolution": "1280x704", "not_an_arg": 3}
+    expected = set(inspect.signature(wrapped).parameters)
+    filtered = {k: v for k, v in params.items() if k in expected}
+    assert filtered == {"state": {"gen": 1}, "prompt": "p", "resolution": "1280x704"}
+    assert wrapped({"params": params}, None, plugin_data={}, **filtered)["state"] == {"gen": 1}
+
+
+def test_queue_hook_brackets_each_job_and_ends_on_error():
+    lead = _RecordingLeader()
+    wrapped = sync.queue_hook(_generate_media, lambda: lead)
+    wrapped({"params": {"prompt": "a"}}, None, state=None, prompt="a")
+    assert lead.events == [("begin", {"prompt": "a"}), ("end",)]
+
+    def boom(task, send_cmd, **kwargs):
+        raise ValueError("x")
+
+    lead.events.clear()
+    with pytest.raises(ValueError):
+        sync.queue_hook(boom, lambda: lead)({"params": {}}, None)
+    assert lead.events == [("begin", {}), ("end",)]
