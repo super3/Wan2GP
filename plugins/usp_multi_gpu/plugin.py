@@ -167,20 +167,11 @@ class UspMultiGpuPlugin(WAN2GPPlugin):
         if self._orig_generate_media is not None:
             return
         original = self.generate_media
-        launcher = _launcher()
+        from .sync import queue_hook
 
-        def generate_media(task, send_cmd, *args, **kwargs):
-            lead = launcher.leader()
-            if lead is None:
-                return original(task, send_cmd, *args, **kwargs)
-            lead.begin_task(task.get("params", {}) if isinstance(task, dict) else {})
-            try:
-                return original(task, send_cmd, *args, **kwargs)
-            finally:
-                lead.end_task()
-
+        wrapped = queue_hook(original, _launcher().leader)
         self._orig_generate_media = original
-        self.set_global("generate_media", generate_media)
+        self.set_global("generate_media", wrapped)
 
     def _unwrap_generate_media(self):
         if self._orig_generate_media is None:
