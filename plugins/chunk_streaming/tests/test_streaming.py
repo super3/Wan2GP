@@ -907,3 +907,26 @@ def test_decode_device_parsing():
         assert streaming.activate(decode_devices=None) is rec and streaming.decode_devices() is None
     finally:
         streaming.deactivate()
+
+
+@pytest.mark.parametrize("decode_mode", ["no_grad", "inference_mode"])
+def test_multi_device_decode_with_quantized_inference_weights(decode_mode):
+    """INT8 (quanto) decoder weights loaded under inference mode, as WanGP's loader does: replicas build and stay bit-identical."""
+    quanto = pytest.importorskip("optimum.quanto")
+    vae = _tiny_adapter_vae()
+    with torch.inference_mode():
+        quanto.quantize(vae.decoder, weights=quanto.qint8)
+        quanto.freeze(vae.decoder)
+    z = torch.randn(1, 4, _MULTI_LENGTHS[-1], 8, 8, generator=torch.Generator().manual_seed(7))
+    mode = torch.inference_mode if decode_mode == "inference_mode" else torch.no_grad
+    with mode():
+        expected = AutoencoderKLMiniMaxH3.decode(vae, z, False, "round")[0]
+    rec = streaming.activate(store_frames=False, decode_devices=["cpu", "cpu"])
+    try:
+        with mode():
+            got = AutoencoderKLMiniMaxH3.decode(vae, z, False, "round")[0]
+        assert rec.decode_plan is not None and rec.decode_plan["fallback"] is None, rec.decode_plan
+        assert torch.equal(expected, got)
+    finally:
+        streaming.deactivate()
+    assert not _decode_threads()

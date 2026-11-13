@@ -392,7 +392,11 @@ class _Replica:
 
     def __init__(self, vae, device: torch.device):
         self.device = device
-        self.module = _replicate_module(vae, device, keep_children=_ROOT_DECODE_MODULES)
+        # Built under inference mode: the loader may create weights (quantized ones included) as inference tensors, and copying
+        # those outside inference mode makes PyTorch set a version counter on them ("Cannot set version_counter for inference
+        # tensor", seen with WanGP's INT8 VAE on 2x RTX PRO 6000). The copy is only ever used to decode without gradients.
+        with torch.inference_mode():
+            self.module = _replicate_module(vae, device, keep_children=_ROOT_DECODE_MODULES)
         missing = [name for name in _ROOT_DECODE_MODULES if name not in self.module._modules]
         if missing:
             raise ReplicaUnsupported(f"the VAE has no {', '.join(missing)}")
