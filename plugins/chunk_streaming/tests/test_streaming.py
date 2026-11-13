@@ -909,14 +909,29 @@ def test_decode_device_parsing():
         streaming.deactivate()
 
 
-@pytest.mark.parametrize("decode_mode", ["no_grad", "inference_mode"])
-def test_multi_device_decode_with_quantized_inference_weights(decode_mode):
-    """INT8 (quanto) decoder weights loaded under inference mode, as WanGP's loader does: replicas build and stay bit-identical."""
+def _mmgp_style_int8(module):
+    """INT8 (quanto) weights quantized under inference mode, each wrapped in a Parameter outside it, as mmgp's loader does."""
     quanto = pytest.importorskip("optimum.quanto")
-    vae = _tiny_adapter_vae()
     with torch.inference_mode():
-        quanto.quantize(vae.decoder, weights=quanto.qint8)
-        quanto.freeze(vae.decoder)
+        quanto.quantize(module, weights=quanto.qint8)
+        quanto.freeze(module)
+        with torch.inference_mode(False):
+            for mod in module.modules():
+                for name, param in list(mod._parameters.items()):
+                    if param is not None and isinstance(param.data, quanto.QTensor):
+                        mod._parameters[name] = torch.nn.Parameter(param.data, requires_grad=False)
+    return module
+
+
+@pytest.mark.parametrize("decode_mode", ["no_grad", "inference_mode"])
+def test_multi_device_decode_with_mmgp_int8_weights(decode_mode):
+    """WanGP's INT8 VAE (mmgp-loaded quanto weights) decoded under inference mode: the replicas build and stay bit-identical.
+
+    Copying those weights inside inference mode raised "Cannot set version_counter for inference tensor" on 2x RTX PRO 6000 and
+    every decode fell back to one GPU.
+    """
+    vae = _tiny_adapter_vae()
+    _mmgp_style_int8(vae.decoder)
     z = torch.randn(1, 4, _MULTI_LENGTHS[-1], 8, 8, generator=torch.Generator().manual_seed(7))
     mode = torch.inference_mode if decode_mode == "inference_mode" else torch.no_grad
     with mode():

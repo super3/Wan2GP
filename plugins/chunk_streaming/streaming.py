@@ -392,10 +392,11 @@ class _Replica:
 
     def __init__(self, vae, device: torch.device):
         self.device = device
-        # Built under inference mode: the loader may create weights (quantized ones included) as inference tensors, and copying
-        # those outside inference mode makes PyTorch set a version counter on them ("Cannot set version_counter for inference
-        # tensor", seen with WanGP's INT8 VAE on 2x RTX PRO 6000). The copy is only ever used to decode without gradients.
-        with torch.inference_mode():
+        # Built with inference mode off, as mmgp makes its Parameters (`_make_parameter`): the decode runs inside inference mode,
+        # and detaching an mmgp-loaded INT8 (quanto) weight there yields an inference tensor that cannot share the weight's
+        # version counter ("Cannot set version_counter for inference tensor": every decode fell back to one GPU on 2x RTX PRO
+        # 6000). The copy is ordinary tensors, which the replica then decodes with under inference mode.
+        with torch.inference_mode(False):
             self.module = _replicate_module(vae, device, keep_children=_ROOT_DECODE_MODULES)
         missing = [name for name in _ROOT_DECODE_MODULES if name not in self.module._modules]
         if missing:
