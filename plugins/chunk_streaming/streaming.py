@@ -44,6 +44,7 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 import types
 import wave
 import weakref
@@ -540,7 +541,9 @@ def _make_dispatcher(vae, z: torch.Tensor, num_chunks: int, tokens_chunk_size: i
     try:
         replicas = iter(_replicas_for(vae, extra))
     except Exception as exc:  # noqa: BLE001 - fall back to the single-device decode, which is always correct
-        rec.decode_plan = {"devices": [str(main)], "fallback": f"{type(exc).__name__}: {exc}"[:300]}
+        where = " <- ".join(f"{frame.name}@{frame.filename.rsplit('/', 1)[-1]}:{frame.lineno}"
+                            for frame in reversed(traceback.extract_tb(exc.__traceback__)[-4:]))
+        rec.decode_plan = {"devices": [str(main)], "fallback": f"{type(exc).__name__}: {exc}"[:300], "where": where[:400]}
         print(f"[Chunk Streaming] multi-device decode unavailable, decoding on {main} only: {exc}")
         return None
     slots = [None if k == main_slot else next(replicas) for k in range(len(devices))]
