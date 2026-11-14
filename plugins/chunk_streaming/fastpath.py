@@ -1,13 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 """Opt-in cuts of the fixed per-job overhead of a MiniMax H3 generation (prototypes, off by default).
 
-keep_models_resident: the H3 pipeline unloads its shared components (text encoder, VAEs) before the denoising
-(`MiniMaxH3Pipeline._use_transformer`) and the DiT before the decode (`_use_shared_components`), so every job moves the DiT and the
-VAEs from RAM back to the GPU (MMGP reloads a model at its first forward). When the GPU has room for all of them, skipping these two
-unloads keeps the models in VRAM from one job to the next; MMGP still evicts a model when an allocation needs its memory. The prompt
-embeddings are already cached (`text_encoder_cache`), so a repeated prompt does not need the text encoder at all.
+keep_models_resident: MMGP keeps one model of the pipeline on the GPU at a time: the first forward of another model (the DiT, the
+audio VAE, the video VAE in turn) calls `unload_all` first, and WanGP unloads everything again at the end of each job. On a 2x RTX PRO
+4500 run (H3, profile 1) every job reloaded the DiT (about 0.85 s) and paid three `unload_all` of 0.8-1.2 s each (mostly
+`torch.cuda.empty_cache`). This marks every model of WanGP's offload object as a cotenant of all the others (`cotenants_map`, "*"),
+so they stay loaded together, and skips the explicit `unload_all` calls; MMGP still evicts when an allocation needs the memory.
+For GPUs with room for the DiT, the VAEs and the activations together (the text encoder is not needed again for a cached prompt).
 
-Turn it on with CHUNK_STREAMING_KEEP_RESIDENT=1, or `keep_models_resident(True)`.
+Turn it on with CHUNK_STREAMING_KEEP_RESIDENT=1, or `keep_models_resident(True, wgp)`.
 
 save_from_segments: with chunk streaming, every chunk of the video is already encoded once (the live fMP4 segments: libx264, CRF 18,
 preset veryfast), and WanGP then encodes all the frames again for its saved file (3.5-8 s on a 2x RTX PRO 4500 run). This writes
@@ -29,23 +30,58 @@ import time
 _STATE: dict = {"originals": None, "save_video": None, "last_save": None}
 
 
-def keep_models_resident(enable: bool = True) -> bool:
-    """Skip (enable=True) or restore (False) the pipeline's unloads between its stages; returns whether they are skipped."""
+def _resident(offloadobj) -> None:
+    """Every model of an MMGP offload object a cotenant of all the others, and its unload_all a no-op (undone by _restore)."""
+    if offloadobj is None or "_fastpath_unload_all" in vars(offloadobj):
+        return
+    cotenants = getattr(offloadobj, "cotenants_map", None)
+    if not isinstance(cotenants, dict):
+        return
+    vars(offloadobj)["_fastpath_cotenants"] = dict(cotenants)
+    for model_id in list(getattr(offloadobj, "models", {})):
+        cotenants[model_id] = "*"
+    vars(offloadobj)["_fastpath_unload_all"] = offloadobj.unload_all
+    offloadobj.unload_all = lambda *args, **kwargs: None
+    release = offloadobj.release
+
+    def release_all(*args, **kwargs):  # releasing the models (a model change) unloads them for real: MMGP's release calls unload_all
+        _restore(offloadobj)
+        return release(*args, **kwargs)
+
+    offloadobj.release = release_all
+
+
+def _restore(offloadobj) -> None:
+    if offloadobj is None or "_fastpath_unload_all" not in vars(offloadobj):
+        return
+    offloadobj.cotenants_map.clear()
+    offloadobj.cotenants_map.update(vars(offloadobj).pop("_fastpath_cotenants"))
+    for name in ("unload_all", "release"):  # the class methods again
+        vars(offloadobj).pop(name, None)
+    vars(offloadobj).pop("_fastpath_unload_all")
+
+
+def keep_models_resident(enable: bool = True, wgp=None) -> bool:
+    """Keep the pipeline's models loaded together between its stages and jobs (enable=True), or restore MMGP's one-model-at-a-time
+    swapping (False); returns whether it is on. Applied to WanGP's offload object at each H3 generation (a model change makes a new
+    one). `wgp`: WanGP's module (default: the loaded `wgp`)."""
     from models.minimax_h3.pipeline import MiniMaxH3Pipeline
 
+    wgp = wgp if wgp is not None else _STATE.get("wgp") or sys.modules.get("wgp")
     if enable and _STATE["originals"] is None:
-        _STATE["originals"] = (MiniMaxH3Pipeline._use_transformer, MiniMaxH3Pipeline._use_shared_components)
+        original = MiniMaxH3Pipeline.generate
 
-        def _use_transformer(self):  # the shared components stay where MMGP put them
-            return None
+        def generate(self, *args, **kwargs):
+            _resident(getattr(_STATE.get("wgp_resident"), "offloadobj", None))
+            return original(self, *args, **kwargs)
 
-        def _use_shared_components(self):  # the DiT stays where MMGP put it
-            return None
-
-        MiniMaxH3Pipeline._use_transformer, MiniMaxH3Pipeline._use_shared_components = _use_transformer, _use_shared_components
+        generate.__wrapped__ = original  # inspect.signature (the USP plugin reads generate's parameters) sees the original
+        _STATE["originals"], _STATE["wgp_resident"] = original, wgp
+        MiniMaxH3Pipeline.generate = generate
     elif not enable and _STATE["originals"] is not None:
-        MiniMaxH3Pipeline._use_transformer, MiniMaxH3Pipeline._use_shared_components = _STATE["originals"]
-        _STATE["originals"] = None
+        MiniMaxH3Pipeline.generate = _STATE["originals"]
+        _restore(getattr(_STATE.get("wgp_resident"), "offloadobj", None))
+        _STATE["originals"] = _STATE["wgp_resident"] = None
     return _STATE["originals"] is not None
 
 
