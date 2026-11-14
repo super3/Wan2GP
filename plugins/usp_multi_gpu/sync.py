@@ -297,7 +297,74 @@ def _reset_rank_check() -> None:
     usp._S.checked_forward = False  # one cross-rank input checksum per generation
 
 
-_STATE: dict[str, Any] = {"role": None, "orig_generate": None}
+_STATE: dict[str, Any] = {"role": None, "orig_generate": None, "orig_decode": None}
+_BLANK = "_usp_blank_decode"
+
+
+def is_last_window(gen: dict | None) -> bool:
+    """Whether WanGP's generation state (``state["gen"]``) is in the task's last sliding window.
+
+    WanGP sets ``window_no`` (1-based) and ``total_windows`` before each window's ``generate`` call. When either is
+    missing the answer is no: the caller then keeps its decode."""
+    gen = gen or {}
+    window_no, total = gen.get("window_no"), gen.get("total_windows")
+    return isinstance(window_no, int) and isinstance(total, int) and total > 0 and window_no >= total
+
+
+def install_decode_skip(last_window, vae_class=None) -> None:
+    """Helper only: the final video decode of a task's last window gets blank clips instead of the VAE decoder.
+
+    A helper's output is thrown away, yet its pipeline decodes the whole video on its GPU at the end, at the same time
+    as rank 0 decodes it (with multi-GPU decode, on that same GPU too). Only that last decode is never read back: a
+    sliding window's frames condition the next window and the draft decode (rounding "round") conditions the tiled
+    phase 2, so those keep running, and so do image and refinement decodes (no rounding). The skipped decode is the
+    one with rounding "truncate" (WanGP's uint8 video) while ``last_window()`` is true. ``_decode`` still runs around
+    the blank clips, so the video keeps its frame count, size and dtype and the rest of the helper's task is unchanged.
+    """
+    if vae_class is None:
+        from models.minimax_h3.video_vae import MiniMaxH3VideoVAE as vae_class
+    if _STATE["orig_decode"] is not None:
+        return
+    original_decode, original_clip = vae_class.decode, vae_class._decode_clip
+
+    @functools.wraps(original_decode)
+    def decode(self, latents, *args, **kwargs):
+        rounding = kwargs.get("uint8_rounding", args[0] if args else None)
+        if rounding != "truncate" or not last_window():
+            return original_decode(self, latents, *args, **kwargs)
+        self.__dict__[_BLANK] = True
+        try:
+            return original_decode(self, latents, *args, **kwargs)
+        finally:
+            self.__dict__.pop(_BLANK, None)
+
+    @functools.wraps(original_clip)
+    def _decode_clip(self, z):
+        if not self.__dict__.get(_BLANK):
+            return original_clip(self, z)
+        # the shape the decoder gives one clip (see AutoencoderKLMiniMaxH3._decode_clip), without running it
+        ratio = self.spatial_compression_ratio
+        return z.new_zeros(z.shape[0], self.decoder.out_channels, z.shape[2] * self.decoder.patch_size_t,
+                           z.shape[-2] * ratio, z.shape[-1] * ratio)
+
+    # what each attribute was in the class's own __dict__ (None: inherited), to put back exactly
+    _STATE["orig_decode"] = (vae_class, {"decode": (decode, vae_class.__dict__.get("decode")),
+                                         "_decode_clip": (_decode_clip, vae_class.__dict__.get("_decode_clip"))})
+    vae_class.decode, vae_class._decode_clip = decode, _decode_clip
+
+
+def uninstall_decode_skip() -> None:
+    if _STATE["orig_decode"] is None:
+        return
+    vae_class, attributes = _STATE["orig_decode"]
+    for name, (wrapper, own) in attributes.items():
+        if vae_class.__dict__.get(name) is not wrapper:
+            continue  # patched again on top of ours (e.g. last_frame.activate): leave that patch in place
+        if own is None:
+            delattr(vae_class, name)
+        else:
+            setattr(vae_class, name, own)
+    _STATE["orig_decode"] = None
 
 
 def install(role: Leader | Follower) -> None:
@@ -341,5 +408,6 @@ def uninstall() -> None:
     if _STATE["orig_generate"] is not None:
         MiniMaxH3Pipeline.generate = _STATE["orig_generate"]
         _STATE["orig_generate"] = None
+    uninstall_decode_skip()
     _STATE["role"] = None
     usp._S.sync = None
