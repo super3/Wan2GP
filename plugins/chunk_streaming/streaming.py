@@ -38,6 +38,8 @@ it, commit to a start time) that the bench validates against actual arrivals.
 from __future__ import annotations
 
 import concurrent.futures
+import functools
+import os
 import queue
 import subprocess
 import sys
@@ -283,6 +285,10 @@ def decode_devices() -> list[str] | None:
 def release_decode_replicas() -> None:
     """Drop every cached replica (their weights free on their devices once no decode is using them)."""
     with _REPLICA_LOCK:
+        for cache in list(_REPLICAS.values()):
+            for replica in cache.values():
+                if isinstance(replica, _ProcessReplica):
+                    replica.close()
         _REPLICAS.clear()
 
 
@@ -444,8 +450,190 @@ class _Replica:
         return clip
 
 
-def _replicas_for(vae, slots: list[torch.device]) -> list["_Replica"]:
-    """One replica per extra decode slot, built once per VAE and slot and cached while the device list is unchanged."""
+_RECIPE_ATTR = "_decode_worker_recipe"  # set on a VAE by the loader hook: how a decode worker loads the same VAE
+_WORKER_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "decode_worker.py")
+_WORKER_BOOT_TIMEOUT_S = 900
+_INHERITED_FLAGS = {  # the WanGP flags a decode worker shares with this process (the USP helper's set)
+    "--config", "--loras", "--lora-config", "--profile", "--attention", "--compile", "--fp16", "--bf16",
+    "--vae-config", "--perc-reserved-mem-max", "--vram-safety-coefficient", "--max-vram", "--max-ram",
+    "--preload", "--offline", "--convrot", "--ram-allocator", "--vram-allocator", "--settings", "--verbose",
+}
+
+
+def install_recipe_hook() -> bool:
+    """Record, on every H3 video VAE WanGP loads from now on, the loader call that rebuilds it (`_RECIPE_ATTR`), so a decode
+    worker can load the same weights with the same quantization. False when the H3 loader cannot be imported."""
+    if _STATE.get("recipe_hook") is not None:
+        return _STATE["recipe_hook"]
+    try:
+        from models.minimax_h3 import minimax_h3_main as h3_main
+    except Exception:  # noqa: BLE001 - outside WanGP (or its H3 loader cannot import here): in-process copies only
+        _STATE["recipe_hook"] = False
+        return False
+    loader = h3_main._load_video_vae
+    if getattr(loader, "_records_recipe", False):
+        return True
+
+    @functools.wraps(loader)
+    def load_video_vae(*args, **kwargs):
+        vae = loader(*args, **kwargs)
+        vae.__dict__[_RECIPE_ATTR] = {"factory": "models.minimax_h3.minimax_h3_main:_load_video_vae", "args": list(args),
+                                      "kwargs": dict(kwargs), "wangp": True}
+        return vae
+
+    load_video_vae._records_recipe = True
+    h3_main._load_video_vae = load_video_vae
+    _STATE["recipe_hook"] = True
+    return True
+
+
+def _inherited_cli_args(argv: list[str]) -> list[str]:
+    out, index = [], 0
+    while index < len(argv):
+        token = argv[index]
+        if token.split("=", 1)[0] in _INHERITED_FLAGS:
+            out.append(token)
+            if "=" not in token and index + 1 < len(argv) and not argv[index + 1].startswith("--"):
+                out.append(argv[index + 1])
+                index += 1
+        index += 1
+    return out
+
+
+def _worker_settings() -> dict:
+    """What a decode worker's WanGP session shares with this one: folder, command-line flags and the INT8 / FP8 kernel choices."""
+    wgp = sys.modules.get("wgp")
+    root = os.path.dirname(os.path.abspath(wgp.__file__)) if getattr(wgp, "__file__", None) else os.getcwd()
+    return {"root": root, "cli_args": _inherited_cli_args(sys.argv[1:]),
+            "int8_kernels": getattr(wgp, "int8_kernels", None), "fp8_kernels": getattr(wgp, "fp8_kernels", None)}
+
+
+def _physical_gpu(index: int) -> str:
+    """The CUDA_VISIBLE_DEVICES entry of this process's GPU `index`."""
+    visible = [entry.strip() for entry in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",") if entry.strip()]
+    return visible[index] if visible else str(index)
+
+
+def _plain_settings(vae) -> dict:
+    """The root VAE's plain settings (tiling, tile sizes), which the UI may change between decodes."""
+    plain = (bool, int, float, str, type(None))
+    return {key: value for key, value in vae.__dict__.items()
+            if not (key.startswith("_mm_") or key.startswith("_") and key not in ("_model_dtype",))
+            and (isinstance(value, plain) or isinstance(value, tuple) and all(isinstance(item, plain) for item in value))}
+
+
+class _ProcessReplica:
+    """An extra decode device served by a decode worker process (decode_worker.py): one GPU and one thread per process for every
+    kernel, so per-process kernel state (WGPKernels' INT8 GEMM setup and buffers) never meets a second GPU or a second thread."""
+
+    def __init__(self, recipe: dict, device: torch.device, main: torch.device):
+        from multiprocessing.connection import Listener
+
+        self.device, self.main = device, main
+        self.attrs, self.lock, self.proc, self.conn = {}, threading.Lock(), None, None
+        settings = _worker_settings()
+        authkey = os.urandom(16)
+        self.listener = Listener(("127.0.0.1", 0), authkey=authkey)
+        host, port = self.listener.address
+        env = dict(os.environ, DECODE_WORKER_AUTHKEY=authkey.hex(), PYTHONUNBUFFERED="1")
+        if device.type == "cuda":
+            env["CUDA_VISIBLE_DEVICES"], worker_device = _physical_gpu(device.index), "cuda:0"
+        else:
+            env["CUDA_VISIBLE_DEVICES"], worker_device = "", "cpu"
+        command = [sys.executable, _WORKER_PATH, "--address", f"{host}:{port}", "--device", worker_device]
+        if recipe.get("wangp"):
+            command += ["--root", settings["root"]]
+        self.log_path = os.path.join(tempfile.gettempdir(), f"decode_worker_{os.getpid()}_{str(device).replace(':', '')}.log")
+        self.log = open(self.log_path, "w")
+        try:
+            self.proc = subprocess.Popen(command, env=env, stdout=self.log, stderr=subprocess.STDOUT)
+            self.conn = self._accept()
+            self.conn.send(("load", recipe, settings))
+            reply = self._recv(_WORKER_BOOT_TIMEOUT_S)
+            if reply[0] != "ready":
+                raise ReplicaUnsupported(f"decode worker on {device} could not load the VAE: {reply[1]}")
+            self.info = reply[1]
+        except BaseException:
+            self.close()
+            raise
+
+    def _alive_or_raise(self):
+        if self.proc is not None and self.proc.poll() is not None:
+            raise ReplicaUnsupported(f"decode worker on {self.device} exited ({self.proc.returncode}): {self._tail()}")
+
+    def _tail(self, lines: int = 12) -> str:
+        try:
+            with open(self.log_path, encoding="utf-8", errors="replace") as handle:
+                return "".join(handle.readlines()[-lines:])[-800:]
+        except OSError:
+            return ""
+
+    def _accept(self):
+        result = {}
+        thread = threading.Thread(target=lambda: result.setdefault("conn", self.listener.accept()), daemon=True)
+        thread.start()
+        deadline = time.monotonic() + _WORKER_BOOT_TIMEOUT_S
+        while thread.is_alive() and time.monotonic() < deadline:
+            thread.join(0.5)
+            self._alive_or_raise()
+        if "conn" not in result:
+            raise ReplicaUnsupported(f"decode worker on {self.device} did not connect")
+        return result["conn"]
+
+    def _recv(self, timeout_s: float):
+        deadline = time.monotonic() + timeout_s
+        while not self.conn.poll(0.5):
+            self._alive_or_raise()
+            if time.monotonic() > deadline:
+                raise ReplicaUnsupported(f"decode worker on {self.device} did not answer in {timeout_s:.0f} s")
+        return self.conn.recv()
+
+    def sync_from(self, vae) -> None:
+        self.attrs = _plain_settings(vae)
+
+    def set_interrupt(self, value: bool) -> None:
+        # a clip in flight finishes in the worker (one chunk); the dispatcher drops it
+        pass
+
+    def decode(self, z_part: torch.Tensor, grad_enabled: bool, inference: bool) -> torch.Tensor:
+        from . import decode_worker as worker
+
+        meta, buffer = worker.pack(z_part)
+        with self.lock:
+            self.conn.send(("decode", meta, self.attrs, grad_enabled, inference))
+            self.conn.send_bytes(buffer)
+            reply = self._recv(_WORKER_BOOT_TIMEOUT_S)
+            if reply[0] != "clip":
+                raise RuntimeError(f"decode worker on {self.device}: {reply[1]}\n{reply[2] if len(reply) > 2 else ''}")
+            clip = worker.unpack(reply[1], self.conn.recv_bytes())
+        return clip.to(self.main)
+
+    def close(self) -> None:
+        try:
+            if self.conn is not None:
+                self.conn.send(("exit",))
+        except (OSError, EOFError, ValueError):
+            pass
+        if self.proc is not None:
+            try:
+                self.proc.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+        for closable in (self.conn, self.listener, self.log):
+            try:
+                if closable is not None:
+                    closable.close()
+            except OSError:
+                pass
+        self.proc = self.conn = None
+
+    def __del__(self):
+        self.close()
+
+
+def _replicas_for(vae, slots: list[torch.device], main: torch.device | None = None) -> list:
+    """One replica per extra decode slot, built once per VAE and slot and cached while the device list is unchanged: a decode
+    worker process when the VAE carries a loader recipe (WanGP's H3 VAEs, `install_recipe_hook`), else an in-process copy."""
     with _REPLICA_LOCK:
         cache = _REPLICAS.get(vae)
         if cache is None:
@@ -458,7 +646,11 @@ def _replicas_for(vae, slots: list[torch.device]) -> list["_Replica"]:
             if replica is None:
                 if device.type == "cuda":
                     torch.cuda.synchronize()  # no MMGP prefetch of these weights is still in flight while they are read
-                replica = cache[key] = _Replica(vae, device)
+                recipe = vae.__dict__.get(_RECIPE_ATTR)
+                if recipe is not None:
+                    replica = cache[key] = _ProcessReplica(recipe, device, main if main is not None else _normalize_device("cuda"))
+                else:
+                    replica = cache[key] = _Replica(vae, device)
             replica.sync_from(vae)
             replicas.append(replica)
         return replicas
@@ -580,7 +772,7 @@ def _make_dispatcher(vae, z: torch.Tensor, num_chunks: int, tokens_chunk_size: i
     devices = [_normalize_device(name) for name in names]
     if len(devices) == 1 and devices[0] == main:
         return None
-    reason = _single_device_reason(vae)
+    reason = None if _RECIPE_ATTR in vae.__dict__ else _single_device_reason(vae)
     if reason is not None:
         rec.decode_plan = {"devices": [str(main)], "fallback": reason}
         if not _STATE.get("single_device_noted"):
@@ -590,7 +782,7 @@ def _make_dispatcher(vae, z: torch.Tensor, num_chunks: int, tokens_chunk_size: i
     main_slot = next((k for k, device in enumerate(devices) if device == main), None)
     extra = [device for k, device in enumerate(devices) if k != main_slot]
     try:
-        replicas = iter(_replicas_for(vae, extra))
+        replicas = iter(_replicas_for(vae, extra, main))
     except Exception as exc:  # noqa: BLE001 - fall back to the single-device decode, which is always correct
         where = " <- ".join(f"{frame.name}@{frame.filename.rsplit('/', 1)[-1]}:{frame.lineno}"
                             for frame in reversed(traceback.extract_tb(exc.__traceback__)[-4:]))
@@ -746,6 +938,8 @@ def activate(store_frames: bool = True, live_dir: str | None = None,
     None keeps the single-device decode.
     """
     names = parse_decode_devices(decode_devices)  # validated before anything is patched
+    if names:
+        install_recipe_hook()  # VAEs loaded from now on can be decoded by worker processes
     if _STATE["active"]:
         rec = _STATE["recorder"]
         rec.store_frames = store_frames

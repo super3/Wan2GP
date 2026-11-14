@@ -1003,3 +1003,66 @@ def test_split_decode_stays_on_one_gpu_with_wgpkernels_int8(monkeypatch, quantiz
     finally:
         streaming.deactivate()
     assert not _decode_threads()
+
+
+# -- decode worker processes ----------------------------------------------------------------------------------------------------
+
+_WORKER_RECIPE = {"factory": "worker_vae:tiny_vae", "sys_path": [str(Path(__file__).resolve().parent)]}
+
+
+def test_worker_process_decode_is_bit_identical():
+    """A VAE with a loader recipe decodes its extra slot in a worker process (one device per process), bit-identical."""
+    vae = _tiny_vae()
+    z = torch.randn(1, 4, _MULTI_LENGTHS[-1], 8, 8, generator=torch.Generator().manual_seed(5))
+    with torch.inference_mode():
+        expected = AutoencoderKLMiniMaxH3.decode(vae, z, False, "round")[0]
+    vae.__dict__[streaming._RECIPE_ATTR] = dict(_WORKER_RECIPE)
+    rec = streaming.activate(store_frames=False, decode_devices=["cpu", "cpu"])
+    try:
+        with torch.inference_mode():
+            got = AutoencoderKLMiniMaxH3.decode(vae, z, False, "round")[0]
+        assert rec.decode_plan == {"devices": ["cpu", "cpu"], "main": "cpu", "fallback": None}
+        replica = next(iter(streaming._REPLICAS[vae].values()))
+        assert isinstance(replica, streaming._ProcessReplica) and replica.info["pid"] != __import__("os").getpid()
+        assert torch.equal(expected, got)
+        with torch.inference_mode():  # the worker stays up for the next decode
+            again = AutoencoderKLMiniMaxH3.decode(vae, z, False, "round")[0]
+        assert torch.equal(expected, again) and next(iter(streaming._REPLICAS[vae].values())) is replica
+        proc = replica.proc
+    finally:
+        streaming.deactivate()
+    assert proc.wait(timeout=30) == 0  # released with the decode devices
+    assert not _decode_threads()
+
+
+def test_worker_process_that_cannot_load_falls_back_to_one_device():
+    vae = _tiny_vae()
+    z = torch.randn(1, 4, _MULTI_LENGTHS[-1], 8, 8, generator=torch.Generator().manual_seed(6))
+    with torch.inference_mode():
+        expected = AutoencoderKLMiniMaxH3.decode(vae, z, False, "round")[0]
+    vae.__dict__[streaming._RECIPE_ATTR] = dict(_WORKER_RECIPE, kwargs={"fail": True})
+    rec = streaming.activate(store_frames=False, decode_devices=["cpu", "cpu"])
+    try:
+        with torch.inference_mode():
+            got = AutoencoderKLMiniMaxH3.decode(vae, z, False, "round")[0]
+        assert rec.decode_plan["devices"] == ["cpu"] and "this recipe fails on purpose" in rec.decode_plan["fallback"]
+        assert torch.equal(expected, got)
+    finally:
+        streaming.deactivate()
+
+
+def test_worker_processes_bypass_the_wgpkernels_guard(monkeypatch):
+    """The WGPKernels INT8 limits are per process: with a recipe, an INT8 VAE still splits (through a worker process)."""
+    monkeypatch.setattr(streaming, "_wgp_int8_active", lambda: True)
+    vae = _tiny_vae()
+    _mmgp_style_int8(vae.decoder)
+    vae.__dict__[streaming._RECIPE_ATTR] = dict(_WORKER_RECIPE)
+    assert streaming._single_device_reason(vae) is not None  # an in-process copy would be refused
+    z = torch.randn(1, 4, _MULTI_LENGTHS[-1], 8, 8, generator=torch.Generator().manual_seed(8))
+    rec = streaming.activate(store_frames=False, decode_devices=["cpu", "cpu"])
+    try:
+        with torch.inference_mode():
+            AutoencoderKLMiniMaxH3.decode(vae, z, False, "round")
+        assert rec.decode_plan["devices"] == ["cpu", "cpu"] and rec.decode_plan["fallback"] is None
+    finally:
+        streaming.deactivate()
