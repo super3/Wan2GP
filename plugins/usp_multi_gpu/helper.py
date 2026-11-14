@@ -5,7 +5,8 @@ Started by the plugin (``launcher.start``), one per extra GPU, with
 ``CUDA_VISIBLE_DEVICES`` set to that GPU. It joins rank 0's NCCL group, opens a
 headless WanGP session on the same WanGP folder and config, then runs each task
 rank 0 sends, in lockstep (``sync.Follower``). Its own output files are thrown
-away: rank 0 saves the result.
+away: rank 0 saves the result. For the same reason it skips the final video
+decode of a task's last window (``sync.install_decode_skip``).
 
     python plugins/usp_multi_gpu/helper.py --root <WanGP> --address 127.0.0.1:PORT \\
         --rank 1 --world 2 --master-port PORT [--cli-args '<json list>']
@@ -65,6 +66,8 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     follower = sync.Follower(conn)
     sync.install(follower)
+    # this helper's video is thrown away: its last decode would only compete with rank 0's decode for the GPU
+    sync.install_decode_skip(lambda: sync.is_last_window(session._state.get("gen")))
     conn.send(("booted",))
 
     def run_task(settings):

@@ -312,3 +312,94 @@ def test_queue_hook_brackets_each_job_and_ends_on_error():
     with pytest.raises(ValueError):
         sync.queue_hook(boom, lambda: lead)({"params": {}}, None)
     assert lead.events == [("begin", {}), ("end",)]
+
+
+# -- the helper's skipped final decode ------------------------------------------------------------------------------
+
+class FakeLatents:
+    def __init__(self, shape):
+        self.shape = tuple(shape)
+
+    def new_zeros(self, *shape):
+        return ("blank", shape)
+
+
+class FakeAutoencoder:
+    spatial_compression_ratio = 16
+
+    def _decode_clip(self, z):
+        self.decoder_runs += 1
+        return ("decoded", z.shape)
+
+
+class FakeVAE(FakeAutoencoder):
+    """The parts of MiniMaxH3VideoVAE the skip touches: decode -> _decode -> one _decode_clip (inherited) per clip."""
+
+    def __init__(self):
+        self.decoder = type("Decoder", (), {"out_channels": 3, "patch_size_t": 4})()
+        self.decoder_runs = 0
+
+    def decode(self, latents, uint8_rounding=None):
+        return [self._decode_clip(latents), self._decode_clip(latents)]
+
+
+@pytest.fixture
+def skip():
+    windows = {"gen": {"window_no": 1, "total_windows": 1}}
+    original = FakeVAE.decode, FakeVAE._decode_clip
+    sync.install_decode_skip(lambda: sync.is_last_window(windows["gen"]), FakeVAE)
+    try:
+        yield windows
+    finally:
+        sync.uninstall_decode_skip()
+    assert (FakeVAE.decode, FakeVAE._decode_clip) == original and "_decode_clip" not in FakeVAE.__dict__
+
+
+def test_helper_skips_only_the_last_windows_final_decode(skip):
+    vae, z = FakeVAE(), FakeLatents((1, 24, 5, 30, 52))
+    assert vae.decode(z, "truncate") == [("blank", (1, 3, 20, 480, 832))] * 2  # one clip's shape, decoder never run
+    assert vae.decoder_runs == 0 and "_usp_blank_decode" not in vae.__dict__
+    assert vae.decode(z, uint8_rounding="truncate")[0][0] == "blank"
+    assert vae.decoder_runs == 0
+
+
+@pytest.mark.parametrize("rounding", ["round", None])
+def test_helper_keeps_draft_phase2_image_and_refiner_decodes(skip, rounding):
+    # "round": the draft decode that conditions the tiled phase 2 (and phase 2's own); None: images and refinements
+    vae = FakeVAE()
+    assert vae.decode(FakeLatents((1, 24, 5, 30, 52)), rounding)[0][0] == "decoded"
+    assert vae.decoder_runs == 2
+
+
+def test_helper_keeps_decodes_whose_frames_condition_the_next_window(skip):
+    vae, z = FakeVAE(), FakeLatents((1, 24, 5, 30, 52))
+    skip["gen"] = {"window_no": 1, "total_windows": 3}
+    assert vae.decode(z, "truncate")[0][0] == "decoded"
+    skip["gen"] = {"window_no": 3, "total_windows": 3}
+    assert vae.decode(z, "truncate")[0][0] == "blank"
+    skip["gen"] = {}  # no window bookkeeping: keep the decode
+    assert vae.decode(z, "truncate")[0][0] == "decoded"
+    assert vae.decoder_runs == 4
+
+
+def test_is_last_window():
+    assert sync.is_last_window({"window_no": 2, "total_windows": 2})
+    assert not sync.is_last_window({"window_no": 1, "total_windows": 2})
+    assert not sync.is_last_window(None)
+    assert not sync.is_last_window({"window_no": 1})
+
+
+def test_uninstall_leaves_a_patch_made_on_top_of_ours():
+    original = FakeVAE.decode
+    sync.install_decode_skip(lambda: True, FakeVAE)
+    ours = FakeVAE.decode
+
+    def later(self, latents, *args, **kwargs):  # e.g. last_frame.activate, wrapping whatever decode it finds
+        return ours(self, latents, *args, **kwargs)
+
+    FakeVAE.decode = later
+    try:
+        sync.uninstall_decode_skip()
+        assert FakeVAE.decode is later and "_decode_clip" not in FakeVAE.__dict__
+    finally:
+        FakeVAE.decode = original

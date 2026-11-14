@@ -37,7 +37,10 @@ The world size must divide H3's 56 attention heads, hence 2, 4, 7 or 8.
 - **Same task everywhere.** A rank runs the whole pipeline (text encoders, VAE, sampling loop) and shards only the DiT
   sequence. When WanGP's queue reaches the model, the plugin sends the task's settings to the helpers. That happens only
   once rank 0 has loaded the model, so weights are never downloaded twice at once. Each helper adopts rank 0's resolved
-  prompt (after the prompt enhancer), negative prompt and seed. Its own saved file is deleted.
+  prompt (after the prompt enhancer), negative prompt and seed. Its own saved file is deleted, and it skips the
+  final video decode of the last window, which only that file would use (earlier windows' decodes and H3's draft
+  decode still run: their frames feed the next steps). The helper's GPU is then free for rank 0's decode, e.g. a
+  multi-GPU decode worker on that GPU.
 - **Lockstep** (`sync.py`). A localhost control connection per helper gates every `generate` call (sliding windows,
   dialogue segments) and every DiT forward:
   - At a `generate` call, the frame count, size, steps, solver and model must match, or the job stops with an error
@@ -70,7 +73,7 @@ The world size must divide H3's 56 attention heads, hence 2, 4, 7 or 8.
 | `helper.py` | A helper process: a headless WanGP session serving rank 0's tasks |
 | `sync.py` | The lockstep protocol (rank 0 `Leader`, helper `Follower`) |
 | `usp.py` | The sequence-parallel H3 forward and attention hooks (also used by `torchrun` benchmarks) |
-| `tests/test_sync.py` | CPU tests of the protocol: normal runs, aborts at each point, helper failure, mismatch, recovery |
+| `tests/test_sync.py` | CPU tests of the protocol: normal runs, aborts at each point, helper failure, mismatch, recovery, the helper's skipped decode |
 
 `usp.py` also works without the plugin, under `torchrun`
 (`runpod_worker/scripts/usp_bench.py`, `usp_fasth3_bench.py`). Its CPU checks are
