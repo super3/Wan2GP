@@ -79,3 +79,7 @@ The world size must divide H3's 56 attention heads, hence 2, 4, 7 or 8.
 (`runpod_worker/scripts/usp_bench.py`, `usp_fasth3_bench.py`). Its CPU checks are
 `runpod_worker/scripts/test_usp_gloo.py` and `test_usp_vsa_cpu.py`. `runpod_worker/tests/test_usp_drift.py` fails when
 upstream changes the H3 code that `usp.py` mirrors.
+
+The plugin's timing tables come from `runpod_worker/scripts/h3_bench_usp.py` (USP alone, or with the multi-GPU decode, with a
+per-phase breakdown) and `h3_bench_models.py` (one GPU); `h3_bench_runpod.sh` runs them on a Runpod pod. See
+[docs/H3_BENCHMARKS.md](../../docs/H3_BENCHMARKS.md).
