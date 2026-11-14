@@ -90,10 +90,10 @@ def save_video_from_segments(live, tensor, save_file: str, container: str, finge
     return out
 
 
-def save_from_segments(enable: bool = True) -> bool:
+def save_from_segments(enable: bool = True, wgp=None) -> bool:
     """Write WanGP's saved video from the streamed segments when they hold the same frames (enable=True), or restore WanGP's
-    encode (False); returns whether it is on."""
-    wgp = sys.modules.get("wgp")
+    encode (False); returns whether it is on. `wgp`: WanGP's module (default: the loaded `wgp`)."""
+    wgp = wgp if wgp is not None else _STATE.get("wgp") or sys.modules.get("wgp")
     if wgp is None or not hasattr(wgp, "save_video"):
         return False
     if enable and _STATE["save_video"] is None:
@@ -111,7 +111,7 @@ def save_from_segments(enable: bool = True) -> bool:
                 return path
             return original(tensor, save_file, fps, codec_type, container, *args, **kwargs)
 
-        _STATE["save_video"] = original
+        _STATE["save_video"], _STATE["wgp"] = original, wgp
         wgp.save_video = save_video
     elif not enable and _STATE["save_video"] is not None:
         wgp.save_video = _STATE["save_video"]
