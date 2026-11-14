@@ -161,15 +161,19 @@ def output_fingerprint(decoded: torch.Tensor) -> tuple:
 
 
 def matches_fingerprint(fingerprint: tuple | None, video: torch.Tensor) -> bool:
-    """Whether a [-1, 1] float video (3, frames, height, width) holds the frames of `fingerprint`, within one level of rounding."""
+    """Whether a video (3, frames, height, width), uint8 or [-1, 1] float, holds the frames of `fingerprint`, within one level of
+    rounding."""
     if fingerprint is None:
         return False
     frames, height, width, values = fingerprint
     if tuple(video.shape[-3:]) != (frames, height, width):
         return False
     ts, ys, xs = _fingerprint_positions(frames, height, width)
-    sample = video.reshape(-1, *video.shape[-4:])[0][:, ts][:, :, ys][:, :, :, xs].float().cpu()
-    levels = ((sample + 1.0) * 127.5).round().to(torch.int16)
+    sample = video.reshape(-1, *video.shape[-4:])[0][:, ts][:, :, ys][:, :, :, xs].cpu()
+    if sample.dtype == torch.uint8:  # WanGP saves the decode's uint8 frames as they are
+        levels = sample.to(torch.int16)
+    else:
+        levels = ((sample.float() + 1.0) * 127.5).round().to(torch.int16)
     return bool((levels - values).abs().max() <= 1)
 
 

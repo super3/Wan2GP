@@ -16,6 +16,7 @@ Four properties are load-bearing enough to gate a GPU bench on:
 from __future__ import annotations
 
 import functools
+import inspect
 import json
 import math
 import os
@@ -1150,33 +1151,58 @@ def test_tuning_snapshot_and_receive(monkeypatch):
     assert tuning_sync.flush() == 1 and late._tuned == {"k": [1, 1]} and tuning_sync.pending() == 0
 
 
-def test_keep_models_resident_skips_and_restores_the_stage_unloads(monkeypatch):
+def test_keep_models_resident_makes_models_cotenants_and_skips_unloads(monkeypatch):
     from chunk_streaming import fastpath
 
-    unloads = []
+    calls = []
+
+    class FakeOffload:
+        def __init__(self):
+            self.models = {"transformer": object(), "vae": object(), "audio_vae": object()}
+            self.cotenants_map = {"tiny_vae": "*"}
+
+        def unload_all(self, keep=()):
+            calls.append("unload")
+
+        def release(self):
+            self.unload_all()
+            calls.append("released")
 
     class FakePipeline:
-        def _use_transformer(self):
-            unloads.append("shared")
-
-        def _use_shared_components(self):
-            unloads.append("dit")
+        def generate(self, input_prompt, seed=0, **kwargs):
+            return "video"
 
     module = types.ModuleType("models.minimax_h3.pipeline")
     module.MiniMaxH3Pipeline = FakePipeline
     monkeypatch.setitem(sys.modules, "models.minimax_h3.pipeline", module)
-    original = (FakePipeline._use_transformer, FakePipeline._use_shared_components)
-    assert fastpath.keep_models_resident(True)
-    FakePipeline()._use_transformer()
-    FakePipeline()._use_shared_components()
-    assert unloads == []
+    wgp = types.SimpleNamespace(offloadobj=FakeOffload())
+    original = FakePipeline.generate
+    assert fastpath.keep_models_resident(True, wgp)
+    assert list(inspect.signature(FakePipeline.generate).parameters)[:3] == ["self", "input_prompt", "seed"]
+    assert FakePipeline().generate("p") == "video"
+    obj = wgp.offloadobj
+    assert obj.cotenants_map == {"tiny_vae": "*", "transformer": "*", "vae": "*", "audio_vae": "*"}
+    obj.unload_all()
+    assert calls == []  # skipped while resident
+    second = FakeOffload()
+    fastpath._resident(second)
+    second.release()  # a model change: the release unloads for real, and the object is back to normal
+    assert calls == ["unload", "released"] and second.cotenants_map == {"tiny_vae": "*"} and "unload_all" not in vars(second)
+    calls.clear()
     assert not fastpath.keep_models_resident(False)
-    assert (FakePipeline._use_transformer, FakePipeline._use_shared_components) == original
-    FakePipeline()._use_transformer()
-    assert unloads == ["shared"]
-    monkeypatch.setenv("CHUNK_STREAMING_KEEP_RESIDENT", "1")
-    assert fastpath.apply_environment()["keep_models_resident"] is True
-    fastpath.keep_models_resident(False)
+    assert FakePipeline.generate is original and obj.cotenants_map == {"tiny_vae": "*"}
+    obj.unload_all()
+    assert calls == ["unload"]
+
+
+def test_fingerprint_matches_uint8_and_float_videos():
+    decoded = torch.randint(0, 256, (1, 3, 9, 16, 24), dtype=torch.uint8)
+    print_ = streaming.output_fingerprint(decoded)
+    assert streaming.matches_fingerprint(print_, decoded[0])
+    assert streaming.matches_fingerprint(print_, decoded[0].float() / 127.5 - 1.0)
+    other = decoded[0].clone()
+    other[:, 0] = 255 - other[:, 0]
+    assert not streaming.matches_fingerprint(print_, other)
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="needs ffmpeg")
