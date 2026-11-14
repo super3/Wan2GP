@@ -522,6 +522,16 @@ def _plain_settings(vae) -> dict:
             and (isinstance(value, plain) or isinstance(value, tuple) and all(isinstance(item, plain) for item in value))}
 
 
+def _shared_state_snapshot() -> dict:
+    """mmgp's shared state values a generation sets (attention mode, its fallback, Sage V scaling, ...): plain ones only."""
+    try:
+        from mmgp import offload
+    except Exception:  # noqa: BLE001 - outside WanGP
+        return {}
+    plain = (bool, int, float, str, type(None))
+    return {key: value for key, value in offload.shared_state.items() if isinstance(value, plain)}
+
+
 class _ProcessReplica:
     """An extra decode device served by a decode worker process (decode_worker.py): one GPU and one thread per process for every
     kernel, so per-process kernel state (WGPKernels' INT8 GEMM setup and buffers) never meets a second GPU or a second thread."""
@@ -600,7 +610,7 @@ class _ProcessReplica:
 
         meta, buffer = worker.pack(z_part)
         with self.lock:
-            self.conn.send(("decode", meta, self.attrs, grad_enabled, inference))
+            self.conn.send(("decode", meta, self.attrs, grad_enabled, inference, _shared_state_snapshot()))
             self.conn.send_bytes(buffer)
             reply = self._recv(_WORKER_BOOT_TIMEOUT_S)
             if reply[0] != "clip":
