@@ -1297,3 +1297,26 @@ def test_save_from_segments_keeps_the_timeline(tmp_path):
                             "stream=nb_read_frames,duration", "-of", "csv=p=0", out], capture_output=True, text=True).stdout.strip()
     frames, duration = probe.split(",")[-1], float(probe.split(",")[0])
     assert frames == "124" and abs(duration - 124 / 24) < 0.05, probe
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="needs ffmpeg")
+def test_segments_use_wangps_default_crf_and_save_only_for_a_matching_codec(tmp_path, monkeypatch):
+    """Segments are libx264 CRF 10 (WanGP's default "libx264_8"); a save with another codec setting is left to WanGP."""
+    from chunk_streaming import fastpath
+
+    torch.manual_seed(5)
+    decoded = torch.randint(0, 256, (1, 3, 12, 32, 48), dtype=torch.uint8)
+    live = streaming.LiveSegmenter(tmp_path / "segments", fps=24)
+    assert live.crf == 10
+    for start in range(0, 12, 6):
+        live.submit({"chunk": start // 6, "frame_start": start, "frame_end": start + 6, "t": 0.0},
+                    decoded[0, :, start:start + 6].permute(1, 2, 3, 0).contiguous())
+    records = live.close()
+    assert [r["crf"] for r in records] == [10, 10]
+    fingerprint = streaming.output_fingerprint(decoded)
+    assert fastpath.save_video_from_segments(live, [decoded[0]], str(tmp_path / "x265.mp4"), "mp4", fingerprint, "libx265_28") is None
+    assert "libx265_28" in fastpath.last_refusal()
+    assert fastpath.save_video_from_segments(live, [decoded[0]], str(tmp_path / "default.mp4"), "mp4", fingerprint, "libx264_8")
+    monkeypatch.setenv("CHUNK_STREAMING_SEGMENT_CRF", "18")
+    assert streaming.LiveSegmenter(tmp_path / "other", fps=24).crf == 18  # then only a CRF 18 codec setting would match
+    assert not fastpath.codec_matches_segments("libx264_8", "mp4", 18)

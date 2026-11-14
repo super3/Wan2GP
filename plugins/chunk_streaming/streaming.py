@@ -1306,6 +1306,7 @@ class LiveSegmenter:
         self.audio: torch.Tensor | None = None
         self.results: list[dict] = []
         self.frame_size: tuple | None = None
+        self.crf = segment_crf()  # every segment of this generation: libx264 at this CRF
         self._queue: queue.Queue = queue.Queue()
         self._closed = False
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -1343,7 +1344,8 @@ class LiveSegmenter:
                         wav = str(seg_path.with_suffix(".wav"))
                         write_wav(wav, self.audio[:, s0:s1], self.sample_rate)
                         record["has_audio"] = True
-                record["mux_s"] = round(mux_segment(frames, wav, seg_path, fps=self.fps), 4)
+                record["mux_s"] = round(mux_segment(frames, wav, seg_path, fps=self.fps, crf=self.crf), 4)
+                record["crf"] = self.crf
                 if wav:
                     Path(wav).unlink(missing_ok=True)
                 record["path"] = str(seg_path)
@@ -1383,12 +1385,25 @@ def write_wav(path: str | Path, samples, sample_rate: int) -> None:
         w.writeframes(pcm.tobytes())
 
 
-def mux_segment(frames_u8: torch.Tensor, audio_wav: str | None, out_path: str | Path, fps: int = 24) -> float:
-    """Encode one finished chunk as a standalone fragmented MP4 segment.
+#: x264 CRF of the streamed segments: WanGP's default video codec ("libx264_8": libx264, CRF 10), so a video saved from the segments
+#: (fastpath.save_from_segments) has the quality of WanGP's own save. CHUNK_STREAMING_SEGMENT_CRF overrides it.
+DEFAULT_SEGMENT_CRF = 10
+
+
+def segment_crf() -> int:
+    try:
+        return int(os.environ.get("CHUNK_STREAMING_SEGMENT_CRF", DEFAULT_SEGMENT_CRF))
+    except ValueError:
+        return DEFAULT_SEGMENT_CRF
+
+
+def mux_segment(frames_u8: torch.Tensor, audio_wav: str | None, out_path: str | Path, fps: int = 24, crf: int | None = None) -> float:
+    """Encode one finished chunk as a standalone fragmented MP4 segment (libx264, `crf`, default `segment_crf()`, preset veryfast).
 
     `frames_u8` is (frames, H, W, 3) uint8. Returns the encode wall seconds,
     which is the per-segment cost a streaming worker pays off the GPU path.
     """
+    crf = segment_crf() if crf is None else crf
     frames_u8 = frames_u8.contiguous()
     n, height, width, _ = frames_u8.shape
     cmd = ["ffmpeg", "-y", "-loglevel", "error",
@@ -1397,7 +1412,7 @@ def mux_segment(frames_u8: torch.Tensor, audio_wav: str | None, out_path: str | 
         # No -shortest: AAC frames quantize to 1024 samples, so the audio can
         # land a few ms short of the video and -shortest would drop a frame.
         cmd += ["-i", audio_wav, "-c:a", "aac", "-b:a", "128k"]
-    cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p",
+    cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", str(crf), "-pix_fmt", "yuv420p",
             "-movflags", "+frag_keyframe+empty_moov+default_base_moof", str(out_path)]
     started = time.monotonic()
     proc = subprocess.run(cmd, input=frames_u8.numpy().tobytes(), capture_output=True)
