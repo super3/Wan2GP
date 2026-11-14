@@ -11,7 +11,7 @@ weights, quantization and kernel backends match. It then decodes the clips it is
 
 Protocol (multiprocessing.connection, authenticated; tensors travel as raw bytes, never pickled):
   main -> worker  ("load", recipe, settings)                  worker -> main  ("ready", info) | ("error", summary, traceback)
-  main -> worker  ("decode", meta, attrs, grad, inference) + bytes   worker -> main  ("clip", meta) + bytes | ("error", summary, traceback)
+  main -> worker  ("decode", meta, attrs, grad, inference, shared_state) + bytes   worker -> main  ("clip", meta) + bytes | ("error", summary, traceback)
   main -> worker  ("exit",)
 """
 
@@ -109,8 +109,12 @@ def serve(conn, device_name: str) -> int:
         if message[0] != "decode":
             conn.send(("error", f"unknown request {message[0]!r}"))
             continue
-        _, meta, attrs, grad_enabled, inference = message
+        _, meta, attrs, grad_enabled, inference, shared_state = message
         try:
+            if shared_state:  # the generation's attention settings (WanGP sets them in mmgp's shared state at each generation)
+                from mmgp import offload
+
+                offload.shared_state.update(shared_state)
             z = unpack(meta, conn.recv_bytes()).to(device)
             for key, value in attrs.items():
                 vae.__dict__[key] = value
