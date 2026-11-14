@@ -979,3 +979,27 @@ def test_replica_refuses_a_reference_to_a_module_outside_the_copy():
     root.layer.__dict__["peer"] = outside
     with pytest.raises(streaming.ReplicaUnsupported):
         streaming._replicate_module(root, torch.device("cpu"))
+
+
+@pytest.mark.parametrize("quantized", [True, False])
+def test_split_decode_stays_on_one_gpu_with_wgpkernels_int8(monkeypatch, quantized):
+    """WGPKernels INT8 cannot serve two GPUs from one process: an INT8 VAE decodes on its own device, bit-identical; a BF16 one splits."""
+    monkeypatch.setattr(streaming, "_wgp_int8_active", lambda: True)
+    vae = _tiny_adapter_vae()
+    if quantized:
+        _mmgp_style_int8(vae.decoder)
+    z = torch.randn(1, 4, _MULTI_LENGTHS[-1], 8, 8, generator=torch.Generator().manual_seed(11))
+    with torch.inference_mode():
+        expected = AutoencoderKLMiniMaxH3.decode(vae, z, False, "round")[0]
+    rec = streaming.activate(store_frames=False, decode_devices=["cpu", "cpu"])
+    try:
+        with torch.inference_mode():
+            got = AutoencoderKLMiniMaxH3.decode(vae, z, False, "round")[0]
+        if quantized:
+            assert rec.decode_plan["devices"] == ["cpu"] and "WGPKernels" in rec.decode_plan["fallback"]
+        else:
+            assert rec.decode_plan["devices"] == ["cpu", "cpu"] and rec.decode_plan["fallback"] is None
+        assert torch.equal(expected, got)
+    finally:
+        streaming.deactivate()
+    assert not _decode_threads()

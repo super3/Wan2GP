@@ -545,6 +545,30 @@ class _ChunkDispatcher:
         self.futures.clear()
 
 
+def _wgp_int8_active() -> bool:
+    """Whether WanGP runs its INT8 layers with WGPKernels (False outside WanGP or when the backend module is unavailable)."""
+    try:
+        from shared.kernels import int8_backend
+    except Exception:  # noqa: BLE001 - outside WanGP, or its kernels cannot load: no WGPKernels INT8 in use
+        return False
+    return bool(int8_backend.wgp_enabled())
+
+
+def _single_device_reason(vae) -> str | None:
+    """Why this VAE's decode must stay on one GPU in this process, or None.
+
+    WGPKernels 1.4.3 INT8 cannot serve a split decode: its GEMM sets the kernel's shared-memory attribute once per process, so the
+    second GPU fails ("INT8 GEMM launch failed (CUDA error 1)", confirmed on 2x RTX PRO 6000), and its Python wrapper shares one
+    workspace-size buffer and one autotuning buffer between threads (with that fixed, the split decode hit an illegal memory access).
+    """
+    decoder = vae._modules.get("decoder")
+    if decoder is None or not _wgp_int8_active():
+        return None
+    if any(getattr(param, "_qtype", None) is not None for param in decoder.parameters()):
+        return "WGPKernels INT8 decodes on one GPU per process: the INT8 VAE stays on its own GPU"
+    return None
+
+
 def _make_dispatcher(vae, z: torch.Tensor, num_chunks: int, tokens_chunk_size: int, clip_tokens: int,
                      rec: "StreamRecorder") -> "_ChunkDispatcher | None":
     """The multi-device dispatcher for this decode, or None for the single-device loop (option off, or nothing to split)."""
@@ -555,6 +579,13 @@ def _make_dispatcher(vae, z: torch.Tensor, num_chunks: int, tokens_chunk_size: i
     main = _main_decode_device(z)
     devices = [_normalize_device(name) for name in names]
     if len(devices) == 1 and devices[0] == main:
+        return None
+    reason = _single_device_reason(vae)
+    if reason is not None:
+        rec.decode_plan = {"devices": [str(main)], "fallback": reason}
+        if not _STATE.get("single_device_noted"):
+            _STATE["single_device_noted"] = True
+            print(f"[Chunk Streaming] multi-device decode off: {reason}")
         return None
     main_slot = next((k for k, device in enumerate(devices) if device == main), None)
     extra = [device for k, device in enumerate(devices) if k != main_slot]
