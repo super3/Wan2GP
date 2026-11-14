@@ -11,8 +11,14 @@ weights, quantization and kernel backends match. It then decodes the clips it is
 
 Protocol (multiprocessing.connection, authenticated; tensors travel as raw bytes, never pickled):
   main -> worker  ("load", recipe, settings)                  worker -> main  ("ready", info) | ("error", summary, traceback)
+  main -> worker  ("tuning", tables)                          worker -> main  ("tuned", entries applied, entries pending)
+  main -> worker  ("tuning_dump",)                            worker -> main  ("tuning", tables)
   main -> worker  ("decode", meta, attrs, grad, inference, shared_state) + bytes   worker -> main  ("clip", meta) + bytes | ("error", summary, traceback)
   main -> worker  ("exit",)
+
+"tuning" carries the main process's kernel tuning tables (tuning_sync.py): the worker adopts them before it decodes, so both
+processes run the same launch configurations and the split decode is bit-identical. A clip's meta also carries the worker's
+decode and pack times ("decode_s", "pack_s").
 """
 
 from __future__ import annotations
@@ -21,6 +27,7 @@ import argparse
 import importlib
 import os
 import sys
+import time
 import traceback
 
 _DTYPES = {"float32": "float32", "float16": "float16", "bfloat16": "bfloat16", "uint8": "uint8", "int16": "int16"}
@@ -81,6 +88,15 @@ def build_vae(recipe: dict, settings: dict):
     return vae.eval()
 
 
+def _flush_tuning() -> None:
+    try:
+        from chunk_streaming import tuning_sync
+
+        tuning_sync.flush()
+    except Exception:  # noqa: BLE001 - alignment is best effort; the decode itself must go on
+        pass
+
+
 def serve(conn, device_name: str) -> int:
     import torch
 
@@ -106,6 +122,18 @@ def serve(conn, device_name: str) -> int:
             return 0
         if message[0] == "exit":
             return 0
+        if message[0] in ("tuning", "tuning_dump"):
+            try:
+                from chunk_streaming import tuning_sync
+
+                if message[0] == "tuning":
+                    applied = tuning_sync.receive(message[1])
+                    conn.send(("tuned", applied, tuning_sync.pending()))
+                else:
+                    conn.send(("tuning", tuning_sync.snapshot()))
+            except Exception as exc:  # noqa: BLE001
+                conn.send(failure(exc))
+            continue
         if message[0] != "decode":
             conn.send(("error", f"unknown request {message[0]!r}"))
             continue
@@ -119,10 +147,16 @@ def serve(conn, device_name: str) -> int:
             for key, value in attrs.items():
                 vae.__dict__[key] = value
             vae.decoder.__dict__["_interrupt"] = False
+            _flush_tuning()  # tables whose library loaded since the last "tuning" message
+            started = time.monotonic()
             mode = torch.inference_mode() if inference else torch.set_grad_enabled(grad_enabled)
             with mode:
                 clip = vae._decode_clip(z)
+            if clip.device.type == "cuda":
+                torch.cuda.synchronize(clip.device)
+            decoded = time.monotonic()
             meta, buffer = pack(clip)
+            meta.update(decode_s=round(decoded - started, 4), pack_s=round(time.monotonic() - decoded, 4))
             conn.send(("clip", meta))
             conn.send_bytes(buffer)
         except Exception as exc:  # noqa: BLE001
