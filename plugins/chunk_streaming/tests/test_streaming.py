@@ -1021,13 +1021,17 @@ def test_worker_process_decode_is_bit_identical():
     try:
         with torch.inference_mode():
             got = AutoencoderKLMiniMaxH3.decode(vae, z, False, "round")[0]
+        timing = rec.decode_plan.pop("timing")
         assert rec.decode_plan == {"devices": ["cpu", "cpu"], "main": "cpu", "fallback": None}
+        # a new worker waits for the main device's first clip of a new shape (kernel tuning), then takes the odd clips
+        assert timing["held_first_clip"] and timing["worker_clips"] >= 1 and timing["worker_roundtrip_s"] > 0
         replica = next(iter(streaming._REPLICAS[vae].values()))
         assert isinstance(replica, streaming._ProcessReplica) and replica.info["pid"] != __import__("os").getpid()
         assert torch.equal(expected, got)
-        with torch.inference_mode():  # the worker stays up for the next decode
+        with torch.inference_mode():  # the worker stays up for the next decode, and no longer waits at this shape
             again = AutoencoderKLMiniMaxH3.decode(vae, z, False, "round")[0]
         assert torch.equal(expected, again) and next(iter(streaming._REPLICAS[vae].values())) is replica
+        assert not rec.decode_plan["timing"]["held_first_clip"]
         proc = replica.proc
     finally:
         streaming.deactivate()
@@ -1066,3 +1070,63 @@ def test_worker_processes_bypass_the_wgpkernels_guard(monkeypatch):
         assert rec.decode_plan["devices"] == ["cpu", "cpu"] and rec.decode_plan["fallback"] is None
     finally:
         streaming.deactivate()
+
+
+def test_worker_adopts_the_main_process_tuning_tables():
+    """The worker answers "tuning" (adopting the main process's kernel tuning tables, or keeping them pending until their library
+    loads) and "tuning_dump"; CHUNK_STREAMING_TUNING_SYNC=0 turns the hold of the first clip off."""
+    vae = _tiny_vae()
+    vae.__dict__[streaming._RECIPE_ATTR] = dict(_WORKER_RECIPE)
+    z = torch.randn(1, 4, _MULTI_LENGTHS[-1], 8, 8, generator=torch.Generator().manual_seed(9))
+    rec = streaming.activate(store_frames=False, decode_devices=["cpu", "cpu"])
+    try:
+        with torch.inference_mode():
+            AutoencoderKLMiniMaxH3.decode(vae, z, False, "round")
+        replica = next(iter(streaming._REPLICAS[vae].values()))
+        table = {"module:wgpkernels.int8": {"row|64x8x8|Some GPU": [2, 0]}}  # wgpkernels is absent here: the entry stays pending
+        replica.tuning_sent = -1
+        replica.sync_tuning(table, 1)
+        assert replica.tuning_sent == 1
+        assert replica.tuning_dump() == {}  # nothing tuned in the worker, and the pending entry is not a loaded table
+    finally:
+        streaming.deactivate()
+
+
+def test_tuning_off_switch_splits_from_the_first_clip(monkeypatch):
+    monkeypatch.setenv("CHUNK_STREAMING_TUNING_SYNC", "0")
+    vae = _tiny_vae()
+    vae.__dict__[streaming._RECIPE_ATTR] = dict(_WORKER_RECIPE)
+    z = torch.randn(1, 4, _MULTI_LENGTHS[-1], 8, 8, generator=torch.Generator().manual_seed(10))
+    with torch.inference_mode():
+        expected = AutoencoderKLMiniMaxH3.decode(vae, z, False, "round")[0]
+    rec = streaming.activate(store_frames=False, decode_devices=["cpu", "cpu"])
+    try:
+        with torch.inference_mode():
+            got = AutoencoderKLMiniMaxH3.decode(vae, z, False, "round")[0]
+        assert not rec.decode_plan["timing"]["held_first_clip"] and torch.equal(expected, got)
+    finally:
+        streaming.deactivate()
+
+
+def test_tuning_snapshot_and_receive(monkeypatch):
+    """snapshot() reads every loaded tuning table; receive() lets the other process's entries win, clears the plans built from the
+    old choices, and keeps entries for tables that are not loaded yet until a later flush()."""
+    from chunk_streaming import tuning_sync
+
+    lib = types.ModuleType("fake_tuned_lib")
+    lib._tuned = {"row|64x8x8|GPU": [0, 1]}
+    lib._plans = {("row", 64, 8, 8, 0): (0, 1, 0, 0)}
+    lib._cache = lambda: lib._tuned
+    monkeypatch.setitem(sys.modules, "fake_tuned_lib", lib)
+    monkeypatch.setattr(tuning_sync, "_MODULES", ("fake_tuned_lib", "not_loaded_lib"))
+    tuning_sync._PENDING.clear()
+    snap = tuning_sync.snapshot()
+    assert snap == {"module:fake_tuned_lib": {"row|64x8x8|GPU": [0, 1]}} and tuning_sync.size(snap) == 1
+    applied = tuning_sync.receive({"module:fake_tuned_lib": {"row|64x8x8|GPU": [6, 0], "row|128x8x8|GPU": [2, 1]},
+                                   "module:not_loaded_lib": {"k": [1, 1]}})
+    assert applied == 2 and lib._tuned == {"row|64x8x8|GPU": [6, 0], "row|128x8x8|GPU": [2, 1]} and lib._plans == {}
+    assert tuning_sync.pending() == 1
+    late = types.ModuleType("not_loaded_lib")
+    late._tuned = {}
+    monkeypatch.setitem(sys.modules, "not_loaded_lib", late)
+    assert tuning_sync.flush() == 1 and late._tuned == {"k": [1, 1]} and tuning_sync.pending() == 0

@@ -239,6 +239,8 @@ def _maybe_prefetch_audio(frame, rec: StreamRecorder) -> bool:
 # MMGP profile produced it. MMGP's per-module offload hooks are stripped (they
 # would load the original weights onto the main GPU); see `_replicate_module`.
 
+from . import tuning_sync  # noqa: E402 - kernel tuning shared with the decode workers
+
 _DECODE_LOOKAHEAD = 2  # chunks queued per replica device ahead of the in-order finalization
 _REPLICAS: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()  # vae -> {(device, ordinal): _Replica}
 _REPLICA_LOCK = threading.Lock()
@@ -541,6 +543,9 @@ class _ProcessReplica:
 
         self.device, self.main = device, main
         self.attrs, self.lock, self.proc, self.conn = {}, threading.Lock(), None, None
+        self.tuning_sent = -1  # entries of the main process's tuning tables already sent (tuning_sync.size)
+        self.shapes_seen: set = set()  # clip shapes this worker has decoded with tables from the main process
+        self.timings: list[dict] = []  # per clip: worker decode and pack, round trip and unpack seconds
         settings = _worker_settings()
         authkey = os.urandom(16)
         self.listener = Listener(("127.0.0.1", 0), authkey=authkey)
@@ -601,6 +606,24 @@ class _ProcessReplica:
     def sync_from(self, vae) -> None:
         self.attrs = _plain_settings(vae)
 
+    def sync_tuning(self, snap: dict, count: int) -> None:
+        """Send the main process's kernel tuning tables when they grew since the last send (tuning_sync.py)."""
+        if count == self.tuning_sent:
+            return
+        with self.lock:
+            self.conn.send(("tuning", snap))
+            reply = self._recv(_WORKER_BOOT_TIMEOUT_S)
+        if reply[0] != "tuned":
+            raise RuntimeError(f"decode worker on {self.device} could not adopt the tuning tables: {reply[1]}")
+        self.tuning_sent = count
+
+    def tuning_dump(self) -> dict:
+        """The worker's own tuning tables (diagnostics)."""
+        with self.lock:
+            self.conn.send(("tuning_dump",))
+            reply = self._recv(_WORKER_BOOT_TIMEOUT_S)
+        return reply[1] if reply[0] == "tuning" else {}
+
     def set_interrupt(self, value: bool) -> None:
         # a clip in flight finishes in the worker (one chunk); the dispatcher drops it
         pass
@@ -608,6 +631,7 @@ class _ProcessReplica:
     def decode(self, z_part: torch.Tensor, grad_enabled: bool, inference: bool) -> torch.Tensor:
         from . import decode_worker as worker
 
+        started = time.monotonic()
         meta, buffer = worker.pack(z_part)
         with self.lock:
             self.conn.send(("decode", meta, self.attrs, grad_enabled, inference, _shared_state_snapshot()))
@@ -615,8 +639,12 @@ class _ProcessReplica:
             reply = self._recv(_WORKER_BOOT_TIMEOUT_S)
             if reply[0] != "clip":
                 raise RuntimeError(f"decode worker on {self.device}: {reply[1]}\n{reply[2] if len(reply) > 2 else ''}")
+            received = time.monotonic()
             clip = worker.unpack(reply[1], self.conn.recv_bytes())
-        return clip.to(self.main)
+        clip = clip.to(self.main)
+        self.timings.append({"decode_s": reply[1].get("decode_s", 0.0), "pack_s": reply[1].get("pack_s", 0.0),
+                             "roundtrip_s": received - started, "unpack_s": time.monotonic() - received})
+        return clip
 
     def close(self) -> None:
         try:
@@ -674,8 +702,16 @@ class _ChunkDispatcher:
     replica are queued ahead of the chunk being finalized, which bounds the decoded clips waiting on each device.
     """
 
-    def __init__(self, vae, z: torch.Tensor, slots: list, num_chunks: int, tokens_chunk_size: int, clip_tokens: int):
+    def __init__(self, vae, z: torch.Tensor, slots: list, num_chunks: int, tokens_chunk_size: int, clip_tokens: int,
+                 rec: "StreamRecorder | None" = None, hold: bool = False, signature=None):
         self.vae = vae
+        self.rec = rec
+        # hold: the first clip decodes on the main device before any worker starts (see _make_dispatcher), then _release
+        self.hold, self.held, self.signature = hold, hold, signature
+        self.wait_s = self.main_clip_s = 0.0
+        for slot in slots:
+            if isinstance(slot, _ProcessReplica):
+                slot.timings = []
         self.z = z
         self.slots = slots  # None: the calling thread with the original module; else a _Replica
         self.num_chunks = num_chunks
@@ -708,13 +744,33 @@ class _ChunkDispatcher:
     def _interrupt_requested(self) -> bool:
         return bool(getattr(self.vae.decoder, "_interrupt", False))
 
+    def _release(self) -> None:
+        """After the main device's first clip of a new shape: send its tuning tables to the workers, then let them start."""
+        snap = tuning_sync.snapshot()
+        for slot in self.slots:
+            if isinstance(slot, _ProcessReplica):
+                slot.sync_tuning(snap, tuning_sync.size(snap))
+                slot.shapes_seen.add(self.signature)
+        self.hold = False
+
+    def _main_clip(self, i: int) -> torch.Tensor:
+        started = time.monotonic()
+        start = i * self.tokens_chunk_size
+        clip = self.vae._decode_clip(self.z[:, :, start : start + self.clip_tokens])
+        self.main_clip_s += time.monotonic() - started
+        return clip
+
     def clip(self, i: int) -> torch.Tensor:
+        if self.hold:  # nothing was submitted yet: this clip decodes here, whatever its slot, and tunes the kernels first
+            clip = self._main_clip(i)
+            self._release()
+            return clip
         self._submit_until(i + 1 + _DECODE_LOOKAHEAD * len(self.slots))
         slot = self.slots[i % len(self.slots)]
         if slot is None:
-            start = i * self.tokens_chunk_size
-            return self.vae._decode_clip(self.z[:, :, start : start + self.clip_tokens])
+            return self._main_clip(i)
         future = self.futures.pop(i)
+        waited = time.monotonic()
         while True:
             try:
                 clip = future.result(timeout=0.05)
@@ -724,6 +780,7 @@ class _ChunkDispatcher:
                     for other in self.slots:
                         if other is not None:
                             other.set_interrupt(True)
+        self.wait_s += time.monotonic() - waited
         if clip.device.type == "cuda":
             # allocated on the replica's stream, finalized on this thread's: its memory must outlive this stream's reads
             clip.record_stream(torch.cuda.current_stream(clip.device))
@@ -745,6 +802,18 @@ class _ChunkDispatcher:
             if slot is not None:
                 slot.set_interrupt(False)
         self.futures.clear()
+        if self.rec is not None and isinstance(self.rec.decode_plan, dict):
+            self.rec.decode_plan["timing"] = self.stats()
+
+    def stats(self) -> dict:
+        """Where this decode's time went: the main thread's own clips and its waits for workers, and per worker clip the worker's
+        decode and pack, the round trip seen from here and the unpack."""
+        timings = [t for slot in self.slots if isinstance(slot, _ProcessReplica) for t in slot.timings]
+        out = {"held_first_clip": self.held, "main_clip_s": round(self.main_clip_s, 3), "wait_s": round(self.wait_s, 3),
+               "worker_clips": len(timings)}
+        for key in ("decode_s", "pack_s", "roundtrip_s", "unpack_s"):
+            out[f"worker_{key}"] = round(sum(t[key] for t in timings), 3)
+        return out
 
 
 def _wgp_int8_active() -> bool:
@@ -801,7 +870,18 @@ def _make_dispatcher(vae, z: torch.Tensor, num_chunks: int, tokens_chunk_size: i
         return None
     slots = [None if k == main_slot else next(replicas) for k in range(len(devices))]
     rec.decode_plan = {"devices": [str(device) for device in devices], "main": str(main), "fallback": None}
-    return _ChunkDispatcher(vae, z, slots, num_chunks, tokens_chunk_size, clip_tokens)
+    workers = [slot for slot in slots if isinstance(slot, _ProcessReplica)]
+    signature = (tuple(z.shape[:2]), clip_tokens, tuple(z.shape[-2:]), str(z.dtype), tuple(sorted(_plain_settings(vae).items())))
+    hold = False
+    if workers and tuning_sync.enabled():
+        # a worker that never decoded this clip shape waits for the main GPU's first clip (which tunes every kernel shape of the
+        # clip), then adopts the main process's tables; otherwise it gets any entries added since its last decode now
+        hold = any(signature not in worker.shapes_seen for worker in workers)
+        if not hold:
+            snap = tuning_sync.snapshot()
+            for worker in workers:
+                worker.sync_tuning(snap, tuning_sync.size(snap))
+    return _ChunkDispatcher(vae, z, slots, num_chunks, tokens_chunk_size, clip_tokens, rec=rec, hold=hold, signature=signature)
 
 
 def _instrumented_decode(self, z: torch.Tensor, uint8_rounding: str | None = None) -> torch.Tensor:
