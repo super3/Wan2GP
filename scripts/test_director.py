@@ -345,8 +345,177 @@ class FrameTests(TempDirTest):
         self.assertLess(abs(red - 175), 6)
 
 
+class CutawayTests(TempDirTest):
+    def cutaway_plan(self, **overrides) -> dict:
+        raw = {"cutaway": {"image": "a.png"}, "subjects": [{"image": "b.png", "description": "the dog from {picture}"}],
+               "shots": [{"keyframe": "Close-up of <Subject 1> in the rain.", "action": "<Subject 1> shakes off the water.",
+                          "seconds": 10}] * 3}
+        raw.update(overrides)
+        return self.plan(**raw)
+
+    def test_latent_boundary(self):
+        self.assertEqual([D.latent_boundary(f) for f in (0.4, 1, 2, 12, 13, 16, 18)], [1, 1, 5, 13, 13, 17, 18])
+
+    def test_frames_trim_and_no_storyboard(self):
+        plan = self.cutaway_plan()
+        cut = plan["cutaway"]
+        self.assertEqual((cut["cut_frame"], cut["trim_frames"]), (13, 19))  # 0.5 s -> the latent boundary at frame 13
+        shot = plan["shots"][0]
+        self.assertEqual(shot["frames"], D.fit_frames(10 * 24 + 19, plan["frames_rule"]))
+        self.assertAlmostEqual(shot["duration"], (shot["frames"] - 19) / 24)
+        self.assertGreaterEqual(shot["duration"], 10.0)
+        self.assertEqual(D.plan_boards(plan), [])
+        jobs, _ = D.build_jobs(plan, self.tmp / "run")
+        self.assertEqual([job["kind"] for job in jobs], ["clip"] * 3)
+        for job in jobs:
+            self.assertEqual(job["deps"], [])  # every clip can start at once
+            self.assertEqual(job["settings"]["image_start"], str(self.tmp / "a.png"))
+            self.assertEqual(job["settings"]["image_refs"], [str(self.tmp / "b.png")])
+            self.assertEqual(job["trim"], {"cut_frame": 13, "trim_frames": 19, "guard_frames": 2, "frames": shot["frames"], "fps": 24})
+            self.assertTrue(job["raw_output"].endswith(f"clip_{job['index']:03d}_raw.mp4"))
+            self.assertAlmostEqual(job["play_seconds"], shot["duration"])
+            self.assertAlmostEqual(job["seconds"], shot["frames"] / 24)
+        rows = D.estimate(jobs, [3], parallel_start=True, warmup=False)
+        self.assertAlmostEqual(rows[0]["video_s"], 3 * shot["duration"])
+
+    def test_supplied_keyframe_and_validation(self):
+        plan = self.cutaway_plan(shots=[{"keyframe_image": "b.png", "action": "a", "seconds": 5}, {"action": "b", "seconds": 5}])
+        self.assertEqual([shot["cutaway"] for shot in plan["shots"]], [False, True])
+        jobs, _ = D.build_jobs(plan, self.tmp / "run")
+        self.assertNotIn("trim", jobs[0])
+        self.assertEqual(jobs[0]["settings"]["image_start"], str(self.tmp / "b.png"))
+        with self.assertRaises(D.PlanError):
+            self.cutaway_plan(end_images="next")
+        with self.assertRaises(D.PlanError):
+            self.cutaway_plan(cutaway={"image": "a.png", "seconds": 5})
+        self.assertTrue(any("cutaway image" in item for item in self.cutaway_plan(cutaway="nope.png")["missing_files"]))
+
+    def test_prompt_cuts_away_and_shifts_internal_cuts(self):
+        plan = self.cutaway_plan(shots=[{"keyframe": "Close-up of <Subject 1>.", "seconds": 10,
+                                         "action": "[Shot 1] <Subject 1> turns. [Shot 2] At 00:05.000, cut to the door."}])
+        prompt = D.build_jobs(plan, self.tmp / "run")[0][0]["settings"]["prompt"]
+        self.assertIn("<Picture 1> is the first frame of the target video at 0.00 seconds.", prompt)
+        self.assertIn("<Subject 1> is the dog from <Picture 2>.", prompt)
+        self.assertIn("[Shot 1] <Picture 1> holds still. [Shot 2] At 00:00.542, cut to close-up of <Subject 1>. <Subject 1> turns.", prompt)
+        self.assertIn("[Shot 3] At 00:05.542, cut to the door.", prompt)
+        self.assertIn("<Subject 1> (appears in [Shot 2], [Shot 3])", prompt)
+        self.assertEqual(D.shift_shots("[Shot 1] a. [Shot 2] At 01:59.900, cut to b.", 1, 0.2),
+                         "[Shot 2] a. [Shot 3] At 02:00.100, cut to b.")
+
+    def test_kept_soundtrack_slices_start_with_the_lead(self):
+        _write_wav(self.tmp / "song.wav", 30, rate=8000)
+        plan = self.cutaway_plan(audio={"mode": "kept", "soundtrack": "song.wav"})
+        D.prepare_audio(plan, self.tmp / "run", None)
+        shot = plan["shots"][0]
+        with wave.open(str(D.slice_path(self.tmp / "run", 0))) as handle:
+            self.assertEqual(handle.getnframes(), round(19 / 24 * 8000) + round(shot["duration"] * 8000))
+            self.assertEqual(handle.readframes(round(19 / 24 * 8000)), b"\x00\x00" * round(19 / 24 * 8000))
+
+    def test_detect_cut(self):
+        import numpy as np
+
+        rng = np.random.default_rng(0)
+        frames = np.full((12, 16, 16), 60.0) + rng.normal(0, 1.5, (12, 16, 16))
+        frames[7:] += 90
+        self.assertEqual(D.detect_cut(frames, first=10), 17)  # frame 7 of the window is the first of the new shot
+        ramp = np.stack([np.full((16, 16), 10.0 * k) for k in range(12)])  # a steady fade is not a cut
+        self.assertIsNone(D.detect_cut(ramp, first=0))
+        self.assertIsNone(D.detect_cut(frames[:1], first=0))
+
+
+class HostTests(unittest.TestCase):
+    def test_parse_cpu_list(self):
+        self.assertEqual(D.parse_cpu_list("0-3,8,10-11\n"), [0, 1, 2, 3, 8, 10, 11])
+
+    def test_cpu_sets_split_evenly_and_share_when_short(self):
+        self.assertEqual(D.plan_cpu_sets(["0", "1", "2", "3"], range(16)), [list(range(k, k + 4)) for k in (0, 4, 8, 12)])
+        self.assertEqual(D.plan_cpu_sets(["0", "0", "0"], range(4)), [[0, 1], [2], [3]])
+        self.assertEqual(D.plan_cpu_sets(["0", "1", "2"], [5, 6]), [[5], [6], [5]])
+
+    def test_cpu_sets_follow_numa_nodes(self):
+        nodes = {0: list(range(8)), 1: list(range(8, 16))}
+        sets = D.plan_cpu_sets(["0", "1", "2", "3"], range(16), {"0": 1, "1": 0, "2": 1, "3": 0}, nodes)
+        self.assertEqual(sets, [[8, 9, 10, 11], [0, 1, 2, 3], [12, 13, 14, 15], [4, 5, 6, 7]])
+        # a GPU with no known node gets the CPUs no node-bound worker uses
+        sets = D.plan_cpu_sets(["0", "9"], range(16), {"0": 0}, nodes)
+        self.assertEqual(sets, [list(range(8)), list(range(8, 16))])
+
+    def test_pin_worker_sets_thread_budgets(self):
+        saved = {name: D.os.environ.get(name) for name in D.THREAD_ENV}
+        try:
+            cpus = sorted(D.os.sched_getaffinity(0)) if hasattr(D.os, "sched_getaffinity") else [0]
+            self.assertEqual(D.pin_worker(cpus), len(cpus))
+            self.assertTrue(all(D.os.environ[name] == str(len(cpus)) for name in D.THREAD_ENV))
+            self.assertIsNone(D.pin_worker(None))
+        finally:
+            for name, value in saved.items():
+                if value is None:
+                    D.os.environ.pop(name, None)
+                else:
+                    D.os.environ[name] = value
+
+    def test_encode_args_and_codec_patch(self):
+        self.assertEqual(D.clip_encode_args("x264", 8)[-4:], ["-pix_fmt", "yuv420p", "-threads", "8"])
+        self.assertIn("veryfast", D.clip_encode_args("x264"))
+        self.assertNotIn("-preset", D.clip_encode_args("wangp"))
+        self.assertIn("h264_nvenc", D.clip_encode_args("nvenc"))
+
+        def original(codec_key, container):
+            return ("libx264", "yuv420p", ["-crf", "10"]) if str(codec_key).startswith("libx264") else ("libx265", "yuv420p", ["-crf", "28"])
+
+        state = {"encoder": "x264", "threads": 4, "preset": "veryfast"}
+        spec = D.patch_codec_spec(original, state)
+        self.assertIs(spec.__wrapped__, original)
+        self.assertEqual(spec("libx264_8", "mp4"), ("libx264", "yuv420p", ["-crf", "10", "-preset", "veryfast", "-threads", "4"]))
+        state["preset"] = "ultrafast"
+        self.assertEqual(spec("libx264_8", "mp4")[2][3], "ultrafast")
+        self.assertEqual(spec("libx265_28", "mp4"), ("libx265", "yuv420p", ["-crf", "28"]))
+        state["encoder"] = "nvenc"
+        self.assertEqual(spec("libx264_8", "mp4")[0], "h264_nvenc")
+        self.assertEqual(spec("libx264_10", "mp4")[0], "libx264")  # CRF 0 output stays x264
+        state["encoder"] = "wangp"
+        self.assertEqual(spec("libx264_8", "mp4"), ("libx264", "yuv420p", ["-crf", "10"]))
+
+
 @unittest.skipUnless(HAVE_FFMPEG, "ffmpeg not available")
 class FakeRunTests(TempDirTest):
+    def _frames(self, video) -> int:
+        result = D.subprocess.run([D.find_ffmpeg(), "-hide_banner", "-i", str(video), "-map", "0:v", "-f", "null", "-"],
+                                  capture_output=True, text=True)
+        return int(re.findall(r"frame=\s*(\d+)", result.stderr)[-1])
+
+    def test_cutaway_run_trims_the_lead(self):
+        import numpy as np
+        from PIL import Image
+
+        plan = self.plan(cutaway={"image": "a.png"}, subjects=[],
+                         shots=[{"action": f"a{n}", "seconds": 5} for n in range(3)])
+        frames = plan["shots"][0]["frames"]
+        out = self.tmp / "run"
+        report = D.run(plan, out, ["0", "0"], backend="fake", parallel_start=True, warmup=False, log=lambda *_: None)
+        self.assertFalse((out / "storyboards").exists())
+        for index in range(3):
+            job = report["jobs"][f"clip{index}"]
+            self.assertEqual((job["cut"], job["trim_start"], job["cut_frame"]), ("on time", 19, 13))
+            self.assertEqual(self._frames(D.clip_path(out, index)), frames - 19)
+            self.assertEqual(self._frames(out / "clips" / f"clip_{index:03d}_raw.mp4"), frames)
+        D.extract_frame_file(D.find_ffmpeg(), D.clip_path(out, 0), 0, self.tmp / "first.png")
+        self.assertGreater(float(np.asarray(Image.open(self.tmp / "first.png")).std()), 20)  # the pattern, not the grey lead
+        playlist = (out / "stream" / "playlist.m3u8").read_text()
+        self.assertEqual(playlist.count(f"#EXTINF:{(frames - 19) / 24:.3f},"), 3)
+        self.assertEqual(report["cutaway"], str(self.tmp / "a.png"))
+        self.assertTrue(all(worker["encoder"] in ("x264", "nvenc") for worker in report["workers"].values()))
+
+    def test_late_cut_is_trimmed_after_it(self):
+        plan = self.plan(cutaway={"image": "a.png"}, subjects=[], shots=[{"action": "a", "seconds": 5}])
+        frames = plan["shots"][0]["frames"]
+        report = D.run(plan, self.tmp / "run", ["0"], backend="fake", hls=True, warmup=False, fake_cut_offset=8, log=lambda *_: None)
+        job = report["jobs"]["clip0"]
+        self.assertEqual((job["cut"], job["cut_frame"], job["trim_start"]), ("late", 21, 23))
+        self.assertAlmostEqual(report["clips"][0]["duration_s"], round((frames - 23) / 24, 3))
+        self.assertIn(f"#EXTINF:{(frames - 23) / 24:.3f},", (self.tmp / "run" / "stream" / "playlist.m3u8").read_text())
+
+
     def test_full_run_with_music_bed(self):
         _write_wav(self.tmp / "bed.wav", 70, rate=16000)
         plan = self.plan(storyboard={"shot_seconds": 1.0, "shots_per_board": 2}, end_images="next",

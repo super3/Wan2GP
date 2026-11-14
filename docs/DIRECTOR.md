@@ -7,6 +7,8 @@
 3. **Clips.** There is one H3 generation per shot. Each starts exactly on its keyframe (`image_start`), uses the same subject reference images, and can optionally end on the next keyframe (`image_end`). Each GPU runs its own WanGP process, and the clips render in parallel.
 4. **Stream.** Each clip is appended to `stream/playlist.m3u8` (HLS) as soon as it and every clip before it are done. At the end everything is stitched into `film.mp4`.
 
+The [cut-away mode](#cut-away-mode-no-storyboard) skips steps 1 and 2: every clip starts on one source image and cuts away from it at once, so all clips start together.
+
 It has run on RTX 5090s: see [Measured on RTX 5090](#measured-on-rtx-5090).
 
 ## Running it
@@ -32,15 +34,18 @@ python scripts/director.py my_plan.json --out runs/rehearsal --backend fake --gp
 | `--parallel-start` | Skips holding the other GPUs until the first job finishes. The hold exists because a first job may download the weights, and concurrent downloads into one checkpoint folder collide. Use this flag only when the weights are already present. With it, warmups run while the first storyboard renders. |
 | `--no-warmup` | Turns off warmups. By default, a GPU with no model loaded and nothing to run (for example while a storyboard renders) runs the shortest text-only generation (107 frames) to load the model, so its first clip does not pay the load. |
 | `--no-hls` | Skips the playlist and still writes `film.mp4`. |
+| `--encoder x264\|nvenc\|wangp` | How workers encode clips (default: the plan's `encoder`, `x264`). See [Several workers on one machine](#several-workers-on-one-machine). |
+| `--no-cpu-pinning` | Lets every worker use all CPU cores, as before. |
 | `--backend fake` | No GPU and no WanGP import. Checks that every input a job names exists, then renders a test pattern of the right length. |
 
 Watch the stream while it renders. `ffplay runs/signal/stream/playlist.m3u8` or VLC opens it directly. Alternatively, serve the folder (`python -m http.server -d runs/signal/stream`) and open it in Safari or an hls.js page.
 
 ## The plan
 
-Paths are relative to the plan file. Two complete six-clip, one-minute examples are included:
+Paths are relative to the plan file. Three complete six-clip, one-minute examples are included:
 - `scripts/director_example_plan.json` uses reference images for a character and a place.
 - `scripts/director_example_textonly_plan.json` needs no assets. It describes its character the same way in every shot, and the single storyboard generation keeps the look consistent.
+- `scripts/director_example_cutaway_plan.json` is the same film in [cut-away mode](#cut-away-mode-no-storyboard). It needs one source image, `scripts/refs/keeper_source.png`.
 
 ```json
 {
@@ -80,6 +85,8 @@ Paths are relative to the plan file. Two complete six-clip, one-minute examples 
 - `end_images`:
   - `"none"` (default): every clip boundary is a hard cut.
   - `"next"`: each clip also ends on the next clip's keyframe, for continuous action across a boundary. Over 10–15 s, the end can visibly snap onto that frame. `end_image_strength` (default 0.5) eases into it.
+- `cutaway`: turns on [cut-away mode](#cut-away-mode-no-storyboard): `{"image": "refs/source.png", "seconds": 0.5}`.
+- `encoder`: `x264` (default), `nvenc` or `wangp`. See [Several workers on one machine](#several-workers-on-one-machine).
 - `settings`: merged into every WanGP job, for example `config`, `num_inference_steps` or `overrides`. The director's own keys (prompt, images, audio, length, seed) always win.
 - `wgp_config`: overrides patched into each worker's copy of `wgp_config.json`, for example `{"int8_kernels": "kitchen", "compute_cache": true, "video_profile": 1, "profile": 1}`. This needs an existing `wgp_config.json` in the WanGP root, so start WanGP once first.
 - `cli_args`: WanGP startup flags for every worker.
@@ -95,6 +102,36 @@ Paths are relative to the plan file. Two complete six-clip, one-minute examples 
 - `action` describes what happens from that frame. It may contain its own internal cuts (`[Shot 2] At 00:05.000, …`), and H3 keeps continuity inside a clip.
 - `subjects` lists which subjects appear (default: all). Only those reference images are sent.
 - `dialogue` lines become `(S1) <d>[English] …</d>` in generated and bed modes. In kept mode they become a lip-sync instruction instead.
+
+## Cut-away mode (no storyboard)
+
+With `"cutaway": {"image": "refs/source.png"}`, there is no storyboard. Every clip starts on that one source image, holds it for about half a second, and cuts away to its planned shot inside the same generation. H3 keeps the world, light and wardrobe of the first frame across a cut within one clip, and the subject reference images keep faces consistent. Since no clip waits for another job, all GPUs start at once and the first clip is live after one clip's render.
+
+- **The cut** is placed on a latent boundary of the video VAE near `seconds` (default 0.5 s, so frame 13, 0.542 s), so no latent mixes the source image with the new shot.
+- **The trim.** Each clip renders its lead too: `seconds` in a shot is the length it keeps in the film, and the rendered clip is about 0.8 s longer (a 10 s shot renders 260 frames). The worker finds the cut in the first frames, then re-encodes the clip from frame `cut + margin_frames` (default 6, so frame 19), frame-exact for video and sample-exact for audio. A clip's length in the film is therefore known before it renders.
+  - If the cut comes later than planned, the clip starts `guard_frames` (default 2) after it and is a few frames shorter. The run log and `report.json` say `cut late`.
+  - If no cut is found, the clip is trimmed at the planned frame and the log says `cut not found`.
+- **Shots.** `keyframe` is optional and describes the first frame after the cut. `action` may contain its own cuts (`[Shot 2] At 00:05.000, …`): their numbers and times are shifted past the lead in the prompt. A shot with its own `keyframe_image` starts on that image instead, without a lead.
+- **Audio.** All three modes work. In `kept` mode, each slice starts with as much silence as the lead, so the soundtrack stays continuous after the trim.
+- `end_images` must be `"none"`.
+
+```json
+"cutaway": {"image": "refs/source.png", "seconds": 0.5, "margin_frames": 6, "guard_frames": 2}
+```
+
+The source image can come from H3-Image, any image tool, or a frame of an earlier render (`keyframes/kf_NNN.png`). The raw clips, lead included, stay in `clips/clip_NNN_raw.mp4`.
+
+## Several workers on one machine
+
+On the 4× RTX 5090 run below, the work after denoising (VAE decode, audio, saving) took about 3 s per clip with two clips at once but 8–12 s with four, while denoising itself did not slow down. The workers were competing for the CPU: each started a thread pool the size of the machine (256 threads there), and WanGP encodes its clips with x264 CRF 10 at the medium preset. The director now:
+
+- **Pins each worker to its own CPU cores**, on the NUMA node of its GPU when `nvidia-smi` and the kernel report it, and sizes every CPU thread pool (OpenMP, MKL, torch, x264) to them. `--no-cpu-pinning` turns this off.
+- **Encodes clips with x264 CRF 10 at the veryfast preset.** It keeps WanGP's quality setting for about a third of the CPU time (measured on a 243-frame 832×480 clip: 15.6 s of CPU instead of 48.3 s, similar file size).
+  - `"encoder": "nvenc"` (or `--encoder nvenc`) encodes on the GPU instead. Containers without the driver's video capability cannot use NVENC; the worker then falls back to x264 and the log says so.
+  - `"encoder": "wangp"` keeps WanGP's own settings.
+- **Processes finished clips for the stream in a background thread**, so the director keeps handing jobs to free GPUs meanwhile.
+
+`report.json` lists each worker's encoder and CPU thread count under `workers`.
 
 ## Audio
 
@@ -112,11 +149,12 @@ In kept mode, a clip that starts after the soundtrack ends generates its own aud
 |---|---|
 | `jobs.json` | Every job: WanGP settings, dependencies, priority, outputs |
 | `storyboards/board_NN.mp4`, `keyframes/kf_NNN.png` | Storyboards and the extracted keyframes |
-| `clips/clip_NNN.mp4` | Raw clips as WanGP saved them |
+| `clips/clip_NNN.mp4` | Clips as WanGP saved them; in cut-away mode, the trimmed clips |
+| `clips/clip_NNN_raw.mp4` | Cut-away mode: each clip with its lead, before the trim |
 | `audio/` | Soundtrack or bed as WAV, plus per-clip slices |
 | `stream/playlist.m3u8`, `stream/seg_NNN.{mp4,ts}` | The live stream: processed segments in film order |
 | `film.mp4` | The stitched film |
-| `report.json` | Per-job GPU and timings, when each clip went live, first-frame time, and stalls with the chosen prebuffer |
+| `report.json` | Per-job GPU and timings (and, in cut-away mode, where each cut was found and the clip trimmed), when each clip went live, first-frame time, stalls with the chosen prebuffer, and each worker's encoder and CPU threads |
 | `workers/workerN/` | Each worker's `wgp_config.json`, WanGP log and raw outputs |
 
 ## Sizing: how many GPUs
@@ -131,10 +169,12 @@ Measured times are the best case: they reuse a cached prompt and the fastest hos
 
 ## Known limits and open questions
 - **Weights in RAM.** Each worker loads its own copy of the weights into system RAM. Plan on about 40–50 GB of RAM per worker on one machine.
-- **Not yet measured:** Soundtrack Kept mode on FastH3, and plans with reference images.
+- **Not yet measured:** Soundtrack Kept mode on FastH3, plans with reference images, the cut-away mode on GPUs, and how much CPU pinning and veryfast encoding recover on a real multi-GPU run.
 - **No per-job timeout.** A WanGP process that hangs holds its GPU until you stop the run.
 
 ## Measured on RTX 5090
+
+These runs predate the cut-away mode and the [CPU pinning and veryfast encoding](#several-workers-on-one-machine).
 
 `scripts/director_example_textonly_plan.json` (one 6-shot storyboard, then six 10 s clips: 60.8 s of film) on FastH3 Omni NVFP4 at 832×480, with `"wgp_config": {"int8_kernels": "kitchen", "compute_cache": true, "video_profile": 1, "profile": 1, "kernel_precision": "fast"}`, weights already downloaded, `--parallel-start`.
 

@@ -10,9 +10,16 @@
    same subject references. Clips run in parallel, one WanGP process per GPU.
 4. Stream: finished clips are appended in order to an HLS playlist (stream/playlist.m3u8), then stitched into film.mp4.
 
+Cut-away mode (plan "cutaway"): no storyboard. Every clip starts on one source image, holds it for about half a second
+and cuts away to its planned shot inside the same generation, so all clips can start at once; the worker finds the cut
+and trims the lead before the clip is streamed.
+
 Audio modes: "generated" (each clip makes its own sound, with short fades at the cuts), "kept" (a master soundtrack is
 sliced per clip and kept: H3 animates to it, so the audio is continuous by construction), "bed" (each clip makes its own
 sound and a continuous music bed is mixed over it).
+
+Each worker gets its own CPU cores (next to its GPU when the machine reports it) and thread budget, and encodes its
+clips with x264 CRF 10 at the veryfast preset: several workers on one machine otherwise slow each other down.
 
     python scripts/director.py plan.json --out runs/film --dry-run         # jobs, prompts and a GPU-count estimate
     python scripts/director.py plan.json --out runs/film --gpus 0,1,2,3    # render
@@ -35,6 +42,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import traceback
 import wave
@@ -54,6 +62,18 @@ END_IMAGE_MODES = ("none", "next")
 MEASURED_GEN_S = ((5.17, 16.5), (10.13, 31.3), (15.08, 62.6))
 VIDEO_SUFFIXES = (".mp4", ".mkv", ".mov", ".webm")
 FAKE_FPS = 24
+# Cut-away: the source image is held, then the clip cuts to its shot on a VAE latent boundary near `seconds`. The lead is
+# trimmed `margin_frames` after the planned cut (a fixed length, so clip durations are known in advance), or `guard_frames`
+# after a cut found later than that.
+CUTAWAY_DEFAULTS = {"seconds": 0.5, "margin_frames": 6, "guard_frames": 2}
+VAE_CLIP_FRAMES, VAE_TEMPORAL_RATIO = 17, 4  # the H3 video VAE packs frame 0, then 4 frames per latent, in 17-frame clips
+CUT_MIN_DIFF = 12.0  # mean absolute luma change (0-255) between two frames that counts as a cut
+# How workers encode their clips. WanGP's default is x264 CRF 10 at the medium preset; veryfast keeps CRF 10 for about a
+# third of the CPU time, which matters when several workers share one machine.
+ENCODERS = ("x264", "nvenc", "wangp")
+X264_PRESET = "veryfast"
+NVENC_ARGS = ["-c:v", "h264_nvenc", "-preset", "p5", "-tune", "hq", "-rc", "vbr", "-cq", "14", "-b:v", "0"]
+THREAD_ENV = ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS")
 
 
 class PlanError(ValueError):
@@ -82,6 +102,17 @@ def shot_time(seconds: float) -> str:
     """H3's cut timestamp, MM:SS.mmm."""
     millis = int(round(seconds * 1000))
     return f"{millis // 60000:02d}:{millis % 60000 / 1000:06.3f}"
+
+
+def latent_boundary(frame: float) -> int:
+    """The first frame at or after `frame` that starts a latent of the H3 video VAE (frame 0, then 1 + 4k within each
+    17-frame clip): a cut there does not share a latent with the frames before it."""
+    frame = max(1, math.ceil(frame))
+    while True:
+        offset = frame % VAE_CLIP_FRAMES
+        if offset == 0 or (offset - 1) % VAE_TEMPORAL_RATIO == 0:
+            return frame
+        frame += 1
 
 
 def estimate_gen_s(clip_seconds: float, scale: float = 1.0) -> float:
@@ -168,10 +199,25 @@ def _normalize_plan(raw: dict, base: Path) -> dict:
         "settings": dict(raw.get("settings") or {}),
         "wgp_config": dict(raw.get("wgp_config") or {}),
         "cli_args": [str(arg) for arg in (raw.get("cli_args") or [])],
+        "encoder": str(raw.get("encoder") or "x264"),
     }
     width, _, height = plan["resolution"].partition("x")
     need(width.isdigit() and height.isdigit(), f"resolution must be WIDTHxHEIGHT, got {plan['resolution']!r}")
     need(plan["end_images"] in END_IMAGE_MODES, f"end_images must be one of {END_IMAGE_MODES}")
+    need(plan["encoder"] in ENCODERS, f"encoder must be one of {ENCODERS}")
+
+    cutaway = raw.get("cutaway")
+    plan["cutaway"] = None
+    if cutaway:
+        cutaway = {"image": cutaway} if isinstance(cutaway, str) else dict(cutaway)
+        need(cutaway.get("image"), "cutaway: needs an image")
+        settings = {key: type(default)(cutaway.get(key, default)) for key, default in CUTAWAY_DEFAULTS.items()}
+        cut_frame = latent_boundary(settings["seconds"] * rule["fps"])
+        plan["cutaway"] = {"image": file_field(cutaway.get("image"), "cutaway image"), **settings,
+                           "cut_frame": cut_frame, "trim_frames": cut_frame + settings["margin_frames"]}
+        need(0.25 <= settings["seconds"] <= 2.0, "cutaway.seconds must be between 0.25 and 2")
+        need(0 <= settings["guard_frames"] <= settings["margin_frames"], "cutaway: need 0 <= guard_frames <= margin_frames")
+        need(plan["end_images"] == "none", 'cutaway clips all start on the same image: set end_images to "none"')
 
     subjects = []
     for number, item in enumerate(raw.get("subjects") or [], 1):
@@ -236,22 +282,29 @@ def _normalize_plan(raw: dict, base: Path) -> dict:
             dialogue.append({"subject": sid, "speaker": str(line.get("speaker") or f"S{sid}"),
                              "language": str(line.get("language") or "English"), "text": " ".join(str(line.get("text") or "").split())})
         seconds = float(item.get("seconds") or plan["clip_seconds"])
-        frames = fit_frames(seconds * rule["fps"], rule)
-        need(frames <= WINDOW_MAX_FRAMES, f"{label}: {seconds} s is longer than one {WINDOW_MAX_FRAMES}-frame window")
+        keyframe_image = file_field(item.get("keyframe_image"), f"{label} keyframe_image")
+        cut = plan["cutaway"] if plan["cutaway"] and not keyframe_image else None  # a supplied keyframe starts the clip itself
+        trim = cut["trim_frames"] if cut else 0
+        frames = fit_frames(seconds * rule["fps"] + trim, rule)  # a cut-away clip also renders its lead
+        need(frames <= WINDOW_MAX_FRAMES, f"{label}: {seconds} s{' plus the cut-away lead' if trim else ''} is longer than one "
+             f"{WINDOW_MAX_FRAMES}-frame window")
         shot = {
             "index": index,
             "keyframe": " ".join(str(item.get("keyframe") or "").split()),
-            "keyframe_image": file_field(item.get("keyframe_image"), f"{label} keyframe_image"),
+            "keyframe_image": keyframe_image,
+            "cutaway": bool(cut),
+            "trim_frames": trim,
             "action": " ".join(str(item.get("action") or "").split()),
             "summary": " ".join(str(item.get("summary") or "").split()),
             "soundscape": " ".join(str(item.get("soundscape") or "").split()),
             "music": " ".join(str(item.get("music") or "N/A").split()),
             "dialogue": dialogue,
             "subjects": ids,
-            "frames": frames,
-            "duration": frames / rule["fps"],
+            "frames": frames,  # rendered
+            "duration": (frames - trim) / rule["fps"],  # in the film
         }
-        need(shot["keyframe"] or shot["keyframe_image"], f"{label}: needs a keyframe description or a keyframe_image")
+        need(shot["keyframe"] or shot["keyframe_image"] or shot["cutaway"],
+             f"{label}: needs a keyframe description or a keyframe_image")
         text = " ".join([shot["keyframe"], shot["action"], shot["summary"]])
         named = sorted({int(sid) for sid in re.findall(r"<Subject (\d+)>", text)} - set(ids))
         need(not named, f"{label}: mentions <Subject {named[0] if named else ''}> but does not list it in \"subjects\"")
@@ -292,7 +345,7 @@ def plan_boards(plan: dict) -> list[dict]:
     board's last keyframe as an extra leading shot (its start image) when link_boards is on."""
     board_def, fps, rule = plan["storyboard"], plan["frames_rule"]["fps"], plan["frames_rule"]
     shot_s, per_board = board_def["shot_seconds"], board_def["shots_per_board"]
-    pending = [shot["index"] for shot in plan["shots"] if not shot["keyframe_image"]]
+    pending = [shot["index"] for shot in plan["shots"] if not shot["keyframe_image"] and not shot["cutaway"]]
     boards = []
     for number, start in enumerate(range(0, len(pending), per_board)):
         shots = pending[start:start + per_board]
@@ -403,6 +456,47 @@ def clip_prompt(plan: dict, shot: dict, has_end: bool, voices: list[dict]) -> st
     return "\n".join(lines)
 
 
+_SHOT_MARK = re.compile(r"\[Shot (\d+)\]")
+_CUT_TIME = re.compile(r"\bAt (\d{2}):(\d{2}(?:\.\d+)?)")
+
+
+def shift_shots(text: str, shots: int, seconds: float) -> str:
+    """Renumber the '[Shot N]' markers of `text` by `shots` and delay its 'At MM:SS.mmm' cut times by `seconds`."""
+    text = _SHOT_MARK.sub(lambda match: f"[Shot {int(match.group(1)) + shots}]", text)
+    return _CUT_TIME.sub(lambda match: f"At {shot_time(int(match.group(1)) * 60 + float(match.group(2)) + seconds)}", text)
+
+
+def cutaway_prompt(plan: dict, shot: dict, voices: list[dict]) -> str:
+    """H3 Ref2VA prompt for a cut-away clip: [Shot 1] holds <Picture 1> (the plan's source image), then the clip cuts
+    away to the planned shot on a latent boundary; the director trims [Shot 1] off. The shot's own internal cuts follow,
+    renumbered and delayed by the lead. Then one reference image per subject, from <Picture 2>."""
+    cut_s = plan["cutaway"]["cut_frame"] / plan["frames_rule"]["fps"]
+    action = shot["action"] if shot["action"].startswith("[Shot 1]") else f"[Shot 1] {shot['action']}"
+    last_shot = 1 + action.count("[Shot ")
+    ids = shot["subjects"]
+    appears = ", ".join(f"[Shot {number}]" for number in range(2, last_shot + 1))
+    definitions, retention = _subject_block(plan, ids, 2, {sid: appears for sid in ids})
+    lines = ["subject_definitions:", "<Picture 1> is the first frame of the target video at 0.00 seconds."]
+    lines += definitions
+    lines += [f"<Audio {number}> is the voice of <Subject {voice['subject']}>." for number, voice in enumerate(voices, 1)]
+    tags = ["keyframe completion"] + (["reference generation"] if ids else []) + (["audio reference"] if voices else [])
+    summary = shot["summary"] or _SHOT_MARK.sub("", action).strip().split(". ")[0]
+    lines += ["summary:", f"[{' + '.join(tags)}] {_upper_first(_sentence(summary))}", "retention_analysis:",
+              "<Picture 1> (from [Shot 1]): fully_preserved - the opening frame; its world, lighting and wardrobe continue after the cut."]
+    lines += retention
+    lines += [f"<Audio {number}> (voice of <Subject {voice['subject']}>): reference - voice timbre and accent." for number, voice in enumerate(voices, 1)]
+    body = shift_shots(action, 1, cut_s).removeprefix("[Shot 2]").strip()
+    opening = _sentence(shot["keyframe"])
+    cut = (f"[Shot 2] At {shot_time(cut_s)}, cut to {_lower_first(opening)} {_upper_first(body)}" if opening
+           else f"[Shot 2] At {shot_time(cut_s)}, cut to a new shot. {_upper_first(body)}")
+    description = [_style_sentence(plan, ""), "[Shot 1] <Picture 1> holds still.", _sentence(cut),
+                   "After the cut, the same world, lighting and wardrobe continue.", _dialogue(plan, shot)]
+    lines += ["detailed_description:", " ".join(part for part in description if part),
+              f"overall_soundscape: {_sentence(shot['soundscape']) or 'Natural ambience that matches the scene.'}",
+              f"non_diegetic_music: {shot['music'] or 'N/A'}"]
+    return "\n".join(lines)
+
+
 # ------------------------------------------------------------------------------------------------------------ jobs
 def _base_settings(plan: dict, prompt: str, frames: int, seed: int) -> dict:
     settings = dict(plan["settings"])  # passthrough first: the structural keys below always win
@@ -441,13 +535,17 @@ def build_jobs(plan: dict, out: Path, soundtrack_seconds: float | None = None) -
                      "settings": settings, "output": str(board_path(out, board["index"])),
                      "extract": [{"shot": item["shot"], "frame": item["frame"], "path": str(keyframe_path(out, item["shot"]))} for item in board["extract"]]})
         board_of.update({index: job_id for index in board["shots"]})
-    clips = timeline(plan)
+    clips, fps = timeline(plan), plan["frames_rule"]["fps"]
     for shot in plan["shots"]:
         index = shot["index"]
         has_end = plan["end_images"] == "next" and index + 1 < len(plan["shots"])
         voices = [voice for voice in plan["audio"]["voices"] if voice["subject"] in shot["subjects"]][:MAX_VOICES] if audio_mode != "kept" else []
-        settings = _base_settings(plan, clip_prompt(plan, shot, has_end, voices), shot["frames"], plan["seed"] + index)
-        settings.update(image_prompt_type="SE" if has_end else "S", image_start=shot_keyframe(plan, out, index))
+        if shot["cutaway"]:
+            settings = _base_settings(plan, cutaway_prompt(plan, shot, voices), shot["frames"], plan["seed"] + index)
+            settings.update(image_prompt_type="S", image_start=plan["cutaway"]["image"])
+        else:
+            settings = _base_settings(plan, clip_prompt(plan, shot, has_end, voices), shot["frames"], plan["seed"] + index)
+            settings.update(image_prompt_type="SE" if has_end else "S", image_start=shot_keyframe(plan, out, index))
         deps = {board_of[index]} if index in board_of else set()
         if has_end:
             settings.update(image_end=shot_keyframe(plan, out, index + 1), input_video_strength=plan["end_image_strength"])
@@ -461,9 +559,15 @@ def build_jobs(plan: dict, out: Path, soundtrack_seconds: float | None = None) -
             settings["audio_prompt_type"] = ("A", "AB", "ABD")[len(voices) - 1]
             for key, voice in zip(("audio_guide", "audio_guide2", "audio_guide3"), voices, strict=False):
                 settings[key] = voice["audio"]
-        jobs.append({"id": f"clip{index}", "kind": "clip", "index": index, "priority": [1, index], "deps": sorted(deps),
-                     "label": f"clip {index + 1}", "seconds": shot["duration"], "settings": settings,
-                     "output": str(clip_path(out, index)), "extract": []})
+        job = {"id": f"clip{index}", "kind": "clip", "index": index, "priority": [1, index], "deps": sorted(deps),
+               "label": f"clip {index + 1}", "seconds": shot["frames"] / fps, "play_seconds": shot["duration"],
+               "settings": settings, "output": str(clip_path(out, index)), "extract": []}
+        if shot["cutaway"]:
+            cut = plan["cutaway"]
+            job["raw_output"] = str(clip_path(out, index).with_name(f"clip_{index:03d}_raw.mp4"))
+            job["trim"] = {"cut_frame": cut["cut_frame"], "trim_frames": cut["trim_frames"], "guard_frames": cut["guard_frames"],
+                           "frames": shot["frames"], "fps": fps}
+        jobs.append(job)
     return jobs, boards
 
 
@@ -561,7 +665,7 @@ def playback(ready_at: list[float], durations: list[float], prebuffer: int = 1) 
 def estimate(jobs: list[dict], gpu_counts, scale: float = 1.0, load_s: float = 0.0, prebuffer: int = 1,
              parallel_start: bool = False, warmup: bool = True, warmup_frames: int = H3_FRAMES["minimum"]) -> list[dict]:
     clips = [job for job in jobs if job["kind"] == "clip"]
-    durations = [job["seconds"] for job in clips]
+    durations = [job.get("play_seconds", job["seconds"]) for job in clips]  # rendering costs `seconds` (with any lead)
     warmup_s = estimate_gen_s(warmup_frames / H3_FRAMES["fps"], scale) if warmup else None
     rows = []
     for count in gpu_counts:
@@ -637,25 +741,186 @@ def prepare_wav(ffmpeg: str | None, source, target) -> float:
 
 
 def write_slices(master, slices: list[tuple]) -> list[str]:
-    """Cut a 16-bit PCM WAV into contiguous slices [(path, start_s, duration_s)], sample-exact. A slice that starts after
-    the end of the audio is skipped; one that runs past it is shorter. Returns the paths written."""
+    """Cut a 16-bit PCM WAV into contiguous slices [(path, start_s, duration_s)] or [(path, start_s, duration_s,
+    lead_s)], sample-exact; `lead_s` of silence goes before the slice (a cut-away clip's trimmed lead). A slice that
+    starts after the end of the audio is skipped; one that runs past it is shorter. Returns the paths written."""
     written = []
     with wave.open(str(master)) as source:
         rate, total = source.getframerate(), source.getnframes()
-        for path, start, duration in slices:
+        for path, start, duration, *rest in slices:
             first, last = int(round(start * rate)), min(total, int(round((start + duration) * rate)))
             if first >= total or last <= first:
                 continue
             source.setpos(first)
             data = source.readframes(last - first)
+            lead = int(round((rest[0] if rest else 0.0) * rate)) * source.getnchannels() * source.getsampwidth()
             Path(path).parent.mkdir(parents=True, exist_ok=True)
             with wave.open(str(path), "wb") as target:
                 target.setnchannels(source.getnchannels())
                 target.setsampwidth(source.getsampwidth())
                 target.setframerate(rate)
-                target.writeframes(data)
+                target.writeframes(b"\x00" * lead + data)
             written.append(str(path))
     return written
+
+
+def clip_encode_args(encoder: str, threads: int | None = None) -> list[str]:
+    """ffmpeg video options for a finished clip: x264 CRF 10 (WanGP's quality) at the veryfast preset, WanGP's own
+    x264 settings (medium preset), or NVENC."""
+    if encoder == "nvenc":
+        return [*NVENC_ARGS, "-pix_fmt", "yuv420p"]
+    args = ["-c:v", "libx264", "-crf", "10", *(["-preset", X264_PRESET] if encoder == "x264" else []), "-pix_fmt", "yuv420p"]
+    return args + (["-threads", str(threads)] if threads else [])
+
+
+def patch_codec_spec(original, state: dict):
+    """Wrap WanGP's shared.utils.video_codecs._get_video_codec_spec in a worker: its x264 encodes get the worker's preset
+    (`state["preset"]`, which can change per job) and thread budget, or its default codec becomes NVENC. Other codecs
+    and the "wangp" encoder are left alone."""
+    def spec(codec_key, container):
+        codec, pixel_format, params = original(codec_key, container)
+        if codec != "libx264" or state.get("encoder") == "wangp":
+            return codec, pixel_format, params
+        if state.get("encoder") == "nvenc" and str(codec_key or "libx264_8").strip().lower() == "libx264_8":
+            return NVENC_ARGS[1], "yuv420p", NVENC_ARGS[2:]
+        threads = ["-threads", str(state["threads"])] if state.get("threads") else []
+        return codec, pixel_format, [*params, "-preset", state.get("preset") or X264_PRESET, *threads]
+
+    spec.__wrapped__ = original
+    return spec
+
+
+def nvenc_available(ffmpeg: str) -> bool:
+    """Whether this ffmpeg can encode with NVENC here (containers often lack the driver's video capability)."""
+    try:
+        result = subprocess.run([ffmpeg, "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", "color=c=black:s=256x256:r=24:d=0.2",
+                                 "-c:v", NVENC_ARGS[1], "-f", "null", "-"], capture_output=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0
+
+
+def read_luma(ffmpeg: str, video, first: int, last: int, size: tuple[int, int] = (160, 96)):
+    """Frames first..last (0-based, inclusive) of a video as small grayscale arrays [N, height, width] for cut detection."""
+    import numpy as np  # noqa: PLC0415
+
+    width, height = size
+    command = [ffmpeg, "-hide_banner", "-loglevel", "error", "-i", str(video), "-vf",
+               f"select=between(n\\,{int(first)}\\,{int(last)}),setpts=N/FRAME_RATE/TB,scale={width}:{height},format=gray",
+               "-f", "rawvideo", "-pix_fmt", "gray", "pipe:1"]
+    result = subprocess.run(command, capture_output=True)
+    if result.returncode != 0:
+        raise RunError(f"cannot read frames {first}-{last} of {video}: {result.stderr.decode(errors='ignore')[-500:]}")
+    data = np.frombuffer(result.stdout, dtype=np.uint8)
+    return data[: data.size // (width * height) * width * height].reshape(-1, height, width)
+
+
+def detect_cut(frames, first: int, min_diff: float = CUT_MIN_DIFF) -> int | None:
+    """The first frame of the new shot after the largest change between consecutive `frames` (frame numbers start at
+    `first`), or None when no change is clearly a cut (below `min_diff`, or not 3x the typical change)."""
+    import numpy as np  # noqa: PLC0415
+
+    frames = np.asarray(frames, dtype=np.float32)
+    if len(frames) < 2:
+        return None
+    diffs = np.abs(frames[1:] - frames[:-1]).reshape(len(frames) - 1, -1).mean(axis=1)
+    peak = int(diffs.argmax())
+    others = np.delete(diffs, peak)
+    typical = float(np.median(others)) if others.size else 0.0
+    if diffs[peak] < max(min_diff, 3.0 * typical):
+        return None
+    return first + peak + 1
+
+
+def trim_clip(ffmpeg: str, raw, output, trim: dict, encode_args: list[str]) -> dict:
+    """Cut a cut-away clip's lead: find the cut near the planned frame, start the clip `trim_frames` in (or
+    `guard_frames` after a later cut) and re-encode it, video frame-exact and audio sample-exact."""
+    planned, guard, fps, frames = trim["trim_frames"], trim["guard_frames"], trim["fps"], trim["frames"]
+    first = max(0, trim["cut_frame"] - VAE_TEMPORAL_RATIO)
+    cut = detect_cut(read_luma(ffmpeg, raw, first, min(frames - 1, planned + 2 * VAE_TEMPORAL_RATIO)), first)
+    if cut is None:
+        start, status = planned, "not found"
+    elif cut + guard > planned:
+        start, status = cut + guard, "late"
+    else:
+        start, status = planned, "on time"
+    duration = (frames - start) / fps
+    args = ["-i", raw, "-vf", f"trim=start_frame={start},setpts=PTS-STARTPTS", *encode_args]
+    if has_audio(ffmpeg, raw):
+        args += ["-af", f"atrim=start={start / fps:.6f},asetpts=PTS-STARTPTS", "-c:a", "aac", "-b:a", "192k"]
+    run_ffmpeg(ffmpeg, [*args, "-t", f"{duration:.6f}", "-movflags", "+faststart", output])
+    return {"trim_start": start, "cut_frame": cut, "cut": status, "duration": duration}
+
+
+# ------------------------------------------------------------------------------------------------------------- host
+def parse_cpu_list(text: str) -> list[int]:
+    """Linux CPU list syntax ("0-3,8,10-11") as a sorted list."""
+    cpus = set()
+    for part in str(text).strip().split(","):
+        if not part.strip():
+            continue
+        low, _, high = part.strip().partition("-")
+        cpus.update(range(int(low), int(high or low) + 1))
+    return sorted(cpus)
+
+
+def numa_cpus() -> dict[int, list[int]]:
+    """CPUs of every NUMA node, or {} where the system does not report them."""
+    nodes = {}
+    for path in Path("/sys/devices/system/node").glob("node[0-9]*"):
+        try:
+            nodes[int(path.name[4:])] = parse_cpu_list((path / "cpulist").read_text())
+        except (OSError, ValueError):
+            continue
+    return nodes
+
+
+def gpu_numa_nodes() -> dict[str, int]:
+    """NUMA node of every NVIDIA GPU, keyed by index and by UUID, or {} when nvidia-smi or sysfs cannot tell."""
+    try:
+        result = subprocess.run(["nvidia-smi", "--query-gpu=index,uuid,pci.bus_id", "--format=csv,noheader"],
+                                capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return {}
+    nodes = {}
+    for line in result.stdout.splitlines() if result.returncode == 0 else []:
+        try:
+            index, uuid, bus = (field.strip() for field in line.split(","))
+            node = int(Path(f"/sys/bus/pci/devices/{bus[-12:].lower()}/numa_node").read_text())
+        except (OSError, ValueError):
+            continue
+        if node >= 0:
+            nodes[index] = nodes[uuid] = node
+    return nodes
+
+
+def plan_cpu_sets(gpus: list[str], allowed, gpu_node: dict | None = None, nodes: dict | None = None) -> list[list[int]]:
+    """One CPU set per worker, disjoint when there are enough CPUs. Workers whose GPU sits on a known NUMA node split
+    that node's CPUs; the others split the CPUs no such worker uses (all of them when none remain)."""
+    allowed = sorted(set(allowed))
+    gpu_node, nodes = gpu_node or {}, nodes or {}
+    pools = {}
+    for node, cpus in nodes.items():
+        usable = [cpu for cpu in cpus if cpu in allowed]
+        if usable:
+            pools[node] = usable
+    keys = [gpu_node.get(str(gpu)) if gpu_node.get(str(gpu)) in pools else None for gpu in gpus]
+    claimed = {cpu for key in set(keys) - {None} for cpu in pools[key]}
+    pools[None] = [cpu for cpu in allowed if cpu not in claimed] or allowed
+    sets = [[] for _ in gpus]
+    for key in set(keys):
+        members, pool = [w for w, k in enumerate(keys) if k == key], pools[key]
+        if len(pool) < len(members):  # fewer CPUs than workers: they share
+            for rank, worker in enumerate(members):
+                sets[worker] = [pool[rank % len(pool)]]
+            continue
+        size, extra = divmod(len(pool), len(members))
+        start = 0
+        for rank, worker in enumerate(members):
+            end = start + size + (1 if rank < extra else 0)
+            sets[worker] = pool[start:end]
+            start = end
+    return sets
 
 
 class Streamer:
@@ -673,8 +938,11 @@ class Streamer:
         if hls:
             self._write_playlist(final=False)
 
-    def add(self, index: int, video, clock) -> list[int]:
-        """Queue a finished clip; emit every clip now next in film order. `clock()` stamps when each one goes live."""
+    def add(self, index: int, video, clock, duration: float | None = None) -> list[int]:
+        """Queue a finished clip; emit every clip now next in film order. `clock()` stamps when each one goes live.
+        `duration` replaces the planned one (a cut-away clip whose cut came late is a few frames shorter)."""
+        if duration is not None:
+            self.durations[index] = float(duration)
         self.waiting[index] = Path(video)
         emitted = []
         while self.next_index in self.waiting:
@@ -734,12 +1002,51 @@ class Streamer:
         return film
 
 
+class StreamThread:
+    """Runs the Streamer's ffmpeg work in a background thread, so the director keeps handing jobs to free GPUs while
+    finished clips are processed. Errors are raised by check() and close()."""
+
+    def __init__(self, streamer: Streamer, clock, log=print):
+        self.streamer, self.clock, self.log, self.error = streamer, clock, log, None
+        self.queue = queue.Queue()
+        self.thread = threading.Thread(target=self._run, name="director-stream", daemon=True)
+        self.thread.start()
+
+    def put(self, index: int, video, duration: float | None = None) -> None:
+        self.queue.put((index, video, duration))
+
+    def _run(self) -> None:
+        while True:
+            item = self.queue.get()
+            if item is None:
+                return
+            if self.error is not None:
+                continue
+            index, video, duration = item
+            try:
+                for live in self.streamer.add(index, video, self.clock, duration):
+                    self.log(f"[{self.clock():7.1f}s] stream: clip {live + 1} is live ({self.streamer.durations[live]:.1f} s)")
+            except BaseException as exc:  # noqa: BLE001 - surfaced to the director loop by check()
+                self.error = exc
+
+    def check(self) -> None:
+        if self.error is not None:
+            raise RunError(f"stream: {self.error}") from self.error
+
+    def close(self, check: bool = True) -> None:
+        self.queue.put(None)
+        self.thread.join()
+        if check:
+            self.check()
+
+
 # ---------------------------------------------------------------------------------------------------------- workers
 class WanGPBackend:
-    """One WanGP session in this process (one GPU: CUDA_VISIBLE_DEVICES is set before torch loads)."""
+    """One WanGP session in this process (one GPU: CUDA_VISIBLE_DEVICES is set before torch loads). `encode` is the
+    worker's shared encoder state: {"encoder", "threads", "preset"}."""
 
-    def __init__(self, spec: dict, worker: int):
-        self.spec, self.worker = spec, worker
+    def __init__(self, spec: dict, worker: int, encode: dict | None = None):
+        self.spec, self.worker, self.encode = spec, worker, encode if encode is not None else {"encoder": "wangp"}
         self.root = Path(spec["wangp_root"]).resolve()
         self.work = Path(spec["out"]) / "workers" / f"worker{worker}"
         self.session = self.log = None
@@ -764,11 +1071,38 @@ class WanGPBackend:
         self.log = open(self.work / "wangp.log", "a", encoding="utf-8", buffering=1)  # noqa: SIM115 - lives with the worker
         self.session = init(root=self.root, config_path=config, output_dir=self.work / "outputs",
                             cli_args=self.spec["cli_args"], console_output=False)
+        import torch  # noqa: PLC0415 - loaded by WanGP above
+
+        if self.encode.get("threads"):
+            torch.set_num_threads(int(self.encode["threads"]))
+        from shared.utils import video_codecs  # noqa: PLC0415
+
+        if self.encode.get("encoder") == "nvenc":
+            try:
+                import imageio_ffmpeg  # noqa: PLC0415 - the ffmpeg WanGP saves with
+
+                usable = nvenc_available(imageio_ffmpeg.get_ffmpeg_exe())
+            except Exception:  # noqa: BLE001
+                usable = False
+            if not usable:
+                self.encode["encoder"] = "x264"
+                self.log.write("director: WanGP's ffmpeg cannot use NVENC here, clips are encoded with x264\n")
+        original = getattr(video_codecs._get_video_codec_spec, "__wrapped__", video_codecs._get_video_codec_spec)
+        video_codecs._get_video_codec_spec = patch_codec_spec(original, self.encode)
 
     def run(self, job: dict, progress) -> dict:
         settings = dict(job["settings"])
         if job["extract"]:
             settings["_api"] = {"return_media": True}  # decoded frames in memory: keyframes skip the mp4 compression
+        preset = self.encode.get("preset")
+        if job.get("trim"):
+            self.encode["preset"] = "ultrafast"  # an intermediate: the trimmed clip is encoded again from it
+        try:
+            return self._run(job, settings, progress)
+        finally:
+            self.encode["preset"] = preset
+
+    def _run(self, job: dict, settings: dict, progress) -> dict:
         handle = self.session.submit_task(settings)
         tail, phase = collections.deque(maxlen=40), None
         for event in handle.events.iter(timeout=0.5):
@@ -789,7 +1123,7 @@ class WanGPBackend:
             (name for name in reversed(result.generated_files) if Path(name).suffix.lower() in VIDEO_SUFFIXES), None)
         if not source:
             raise RunError(f"no video among {result.generated_files}")
-        target = Path(job["output"])
+        target = Path(job.get("raw_output") or job["output"])
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(source, target)
         frames = artifact.video_tensor_uint8 if artifact is not None else None
@@ -803,10 +1137,11 @@ class WanGPBackend:
 
 class FakeBackend:
     """No GPU: renders an ffmpeg test pattern of the requested length (with the kept soundtrack slice when there is one)
-    after checking that every input the job names exists. For rehearsing scheduling, keyframes and streaming."""
+    after checking that every input the job names exists. For rehearsing scheduling, keyframes and streaming. A cut-away
+    clip holds a flat grey lead and cuts to the pattern `fake_cut_offset` frames after its planned cut."""
 
-    def __init__(self, spec: dict, worker: int):
-        self.spec, self.worker, self.ffmpeg = spec, worker, None
+    def __init__(self, spec: dict, worker: int, encode: dict | None = None):
+        self.spec, self.worker, self.ffmpeg, self.encode = spec, worker, None, encode or {}
 
     def start(self) -> None:
         self.ffmpeg = find_ffmpeg()
@@ -825,14 +1160,21 @@ class FakeBackend:
         time.sleep(float(self.spec.get("fake_seconds") or 0.0))
         width, height = (int(value) for value in settings["resolution"].split("x"))
         frames = int(settings["video_length"])
-        video = Path(job["output"])
+        video = Path(job.get("raw_output") or job["output"])
         video.parent.mkdir(parents=True, exist_ok=True)
         inputs = ["-f", "lavfi", "-i", f"testsrc2=size={width}x{height}:rate={FAKE_FPS}"]
         if "S" in audio_flags:
             inputs += ["-i", settings["audio_guide"]]
         else:
             inputs += ["-f", "lavfi", "-i", "sine=frequency=440:sample_rate=32000"]
-        run_ffmpeg(self.ffmpeg, [*inputs, "-frames:v", frames, "-t", f"{frames / FAKE_FPS:.4f}", "-map", "0:v", "-map", "1:a",
+        video_map = ["-map", "0:v"]
+        if job.get("trim"):
+            cut = job["trim"]["cut_frame"] + int(self.spec.get("fake_cut_offset") or 0)
+            inputs += ["-f", "lavfi", "-i", f"color=c=gray:size={width}x{height}:rate={FAKE_FPS}"]
+            graph = (f"[2:v]trim=end_frame={cut},setpts=PTS-STARTPTS[lead];"
+                     f"[0:v]trim=end_frame={frames - cut},setpts=PTS-STARTPTS[shot];[lead][shot]concat=n=2:v=1:a=0[v]")
+            video_map = ["-filter_complex", graph, "-map", "[v]"]
+        run_ffmpeg(self.ffmpeg, [*inputs, "-frames:v", frames, "-t", f"{frames / FAKE_FPS:.4f}", *video_map, "-map", "1:a",
                                  "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-c:a", "aac", video])
         for item in job["extract"]:
             extract_frame_file(self.ffmpeg, video, item["frame"], item["path"])
@@ -840,15 +1182,34 @@ class FakeBackend:
         return {"video": str(video), "lossless_keyframes": False}
 
 
-def worker_main(worker: int, gpu: str, spec: dict, inbox, outbox) -> None:
+def pin_worker(cpus: list[int] | None) -> int | None:
+    """Bind this process (and the ffmpeg encoders it starts) to `cpus` and size every CPU thread pool to them, before
+    torch loads: workers on one machine would otherwise each start a thread per core and slow each other down."""
+    if not cpus:
+        return None
+    try:
+        os.sched_setaffinity(0, cpus)
+    except (AttributeError, OSError, ValueError):
+        pass  # not Linux, or CPUs outside this container's set: thread budgets still apply
+    for name in THREAD_ENV:
+        os.environ[name] = str(len(cpus))
+    return len(cpus)
+
+
+def worker_main(worker: int, gpu: str, spec: dict, inbox, outbox, cpus: list[int] | None = None) -> None:
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu)  # before anything imports torch: WanGP then sees this GPU as cuda:0
     try:
-        backend = (FakeBackend if spec["backend"] == "fake" else WanGPBackend)(spec, worker)
+        threads = pin_worker(cpus)
+        encode = {"encoder": spec.get("encoder", "x264"), "threads": threads, "preset": X264_PRESET}
+        ffmpeg = find_ffmpeg()
+        if encode["encoder"] == "nvenc" and not nvenc_available(ffmpeg):
+            encode["encoder"] = "x264"  # no NVENC in this container: keep CRF 10 on the CPU
+        backend = (FakeBackend if spec["backend"] == "fake" else WanGPBackend)(spec, worker, encode)
         backend.start()
     except BaseException as exc:  # noqa: BLE001 - reported to the director, which drops this worker
         outbox.put({"type": "dead", "worker": worker, "error": f"{type(exc).__name__}: {exc}", "trace": traceback.format_exc()[-3000:]})
         return
-    outbox.put({"type": "ready", "worker": worker})
+    outbox.put({"type": "ready", "worker": worker, "encoder": encode["encoder"], "cpus": threads})
     while True:
         job = inbox.get()
         if job is None:
@@ -860,6 +1221,10 @@ def worker_main(worker: int, gpu: str, spec: dict, inbox, outbox) -> None:
 
         try:
             info = backend.run(job, progress)
+            if job.get("trim"):
+                progress("trimming")
+                info.update(trim_clip(ffmpeg, info["video"], job["output"], job["trim"],
+                                      clip_encode_args(encode["encoder"], encode["threads"])), video=job["output"])
             outbox.put({"type": "done", "worker": worker, "job": job["id"], "seconds": time.monotonic() - started, "info": info})
         except Exception as exc:  # noqa: BLE001 - a failed job is retried elsewhere or ends the run
             outbox.put({"type": "failed", "worker": worker, "job": job["id"], "seconds": time.monotonic() - started,
@@ -869,11 +1234,13 @@ def worker_main(worker: int, gpu: str, spec: dict, inbox, outbox) -> None:
 # ------------------------------------------------------------------------------------------------------------- run
 def prepare_audio(plan: dict, out: Path, ffmpeg: str) -> tuple[float | None, str | None, dict[int, str]]:
     """Kept mode: the master soundtrack as WAV and one slice per clip. Bed mode: one bed slice per clip."""
-    audio, clips = plan["audio"], timeline(plan)
+    audio, clips, fps = plan["audio"], timeline(plan), plan["frames_rule"]["fps"]
     if audio["mode"] == "kept":
         master = out / "audio" / "soundtrack.wav"
         seconds = prepare_wav(ffmpeg, audio["soundtrack"], master)
-        write_slices(master, [(slice_path(out, clip["index"]), clip["start"], clip["duration"]) for clip in clips])
+        # a cut-away clip renders a lead before its shot: its slice starts with that much silence, trimmed off with it
+        write_slices(master, [(slice_path(out, clip["index"]), clip["start"], clip["duration"],
+                               plan["shots"][clip["index"]]["trim_frames"] / fps) for clip in clips])
         return seconds, str(master), {}
     if audio["mode"] == "bed":
         bed = out / "audio" / "bed.wav"
@@ -886,7 +1253,7 @@ def prepare_audio(plan: dict, out: Path, ffmpeg: str) -> tuple[float | None, str
 
 def run(plan: dict, out: Path, gpus: list[str], backend: str = "wangp", wangp_root: Path = WANGP_ROOT, retries: int = 1,
         hls: bool = True, prebuffer: int = 1, fake_seconds: float = 0.0, parallel_start: bool = False, warmup: bool = True,
-        log=print) -> dict:
+        log=print, encoder: str | None = None, pin_cpus: bool = True, fake_cut_offset: int = 0) -> dict:
     out = Path(out).resolve()
     if plan["missing_files"] and backend != "fake":
         raise PlanError("missing files:\n  " + "\n  ".join(plan["missing_files"]))
@@ -899,22 +1266,33 @@ def run(plan: dict, out: Path, gpus: list[str], backend: str = "wangp", wangp_ro
     skipped = [job["index"] + 1 for job in clips if plan["audio"]["mode"] == "kept" and "S" not in job["settings"]["audio_prompt_type"]]
     if skipped:
         log(f"note: the soundtrack ends before clip(s) {skipped}: they generate their own audio")
-    log(f"{plan['title']}: {len(clips)} clips ({sum(job['seconds'] for job in clips):.1f} s), {len(boards)} storyboard(s), "
-        f"{len(gpus)} GPU worker(s) {gpus}, audio {plan['audio']['mode']}")
+    encoder = encoder or plan["encoder"]
+    if encoder not in ENCODERS:
+        raise PlanError(f"encoder must be one of {ENCODERS}")
+    log(f"{plan['title']}: {len(clips)} clips ({sum(job['play_seconds'] for job in clips):.1f} s), {len(boards)} storyboard(s), "
+        f"{len(gpus)} GPU worker(s) {gpus}, audio {plan['audio']['mode']}"
+        + (f", cut-away from {Path(plan['cutaway']['image']).name}" if plan["cutaway"] else ""))
 
+    if pin_cpus and hasattr(os, "sched_getaffinity"):
+        cpu_sets = plan_cpu_sets(gpus, os.sched_getaffinity(0), gpu_numa_nodes() if backend != "fake" else {}, numa_cpus())
+        log("CPU cores per worker: " + ", ".join(f"w{worker} {len(cpus)}" for worker, cpus in enumerate(cpu_sets)))
+    else:
+        cpu_sets = [None] * len(gpus)
     spec = {"backend": backend, "wangp_root": str(wangp_root), "out": str(out), "cli_args": plan["cli_args"],
-            "wgp_config": plan["wgp_config"], "fake_seconds": fake_seconds}
+            "wgp_config": plan["wgp_config"], "fake_seconds": fake_seconds, "encoder": encoder, "fake_cut_offset": fake_cut_offset}
     context = mp.get_context("spawn")
     outbox, workers = context.Queue(), {}
     for worker, gpu in enumerate(gpus):
         inbox = context.Queue()
         # not daemonic: WanGP may start child processes of its own; shutdown below stops every worker
-        process = context.Process(target=worker_main, args=(worker, gpu, spec, inbox, outbox), name=f"director-{worker}")
+        process = context.Process(target=worker_main, args=(worker, gpu, spec, inbox, outbox, cpu_sets[worker]), name=f"director-{worker}")
         process.start()
         workers[worker] = {"process": process, "inbox": inbox, "gpu": gpu, "name": f"w{worker}/gpu{gpu}", "ready": False, "job": None}
 
     scheduler, attempts, records, streamer = Scheduler(jobs), collections.Counter(), {}, Streamer(out, plan, ffmpeg, beds, hls, log)
     started = time.monotonic()
+    stream = StreamThread(streamer, lambda: time.monotonic() - started, log)
+    worker_info = {}
     # The first WanGP job may download the weights: until one job has finished, run one at a time, since concurrent
     # downloads into the shared checkpoint folder would collide. Every clip waits for the first storyboard anyway.
     gated = not parallel_start
@@ -964,7 +1342,9 @@ def run(plan: dict, out: Path, gpus: list[str], backend: str = "wangp", wangp_ro
                     continue
                 if kind == "ready":
                     info["ready"] = True
-                    log(f"{stamp()} {info['name']} worker ready")
+                    worker_info[worker] = {"gpu": info["gpu"], "encoder": message.get("encoder"), "cpus": message.get("cpus")}
+                    log(f"{stamp()} {info['name']} worker ready (encoder {message.get('encoder')}, "
+                        f"{message.get('cpus') or 'all'} CPU threads)")
                 elif kind == "progress":
                     log(f"{stamp()} {info['name']} {known[message['job']]['label']}: {message['phase']}")
                 elif kind in ("done", "failed") and known[message["job"]]["kind"] == "warmup":
@@ -981,10 +1361,11 @@ def run(plan: dict, out: Path, gpus: list[str], backend: str = "wangp", wangp_ro
                     records[job["id"]] = {"label": job["label"], "gpu": info["gpu"], "worker": worker,
                                           "start_s": round(end - message["seconds"], 2), "end_s": round(end, 2),
                                           "seconds": round(message["seconds"], 2), **message.get("info", {})}
-                    log(f"{stamp()} {info['name']} {job['label']} done in {message['seconds']:.1f} s")
+                    done = message.get("info", {})
+                    trimmed = (f", lead trimmed at frame {done['trim_start']} (cut {done['cut']})" if "trim_start" in done else "")
+                    log(f"{stamp()} {info['name']} {job['label']} done in {message['seconds']:.1f} s{trimmed}")
                     if job["kind"] == "clip":
-                        for index in streamer.add(job["index"], job["output"], lambda: time.monotonic() - started):
-                            log(f"{stamp()} stream: clip {index + 1} is live ({streamer.durations[index]:.1f} s)")
+                        stream.put(job["index"], job["output"], done.get("duration"))
                 elif kind == "failed":
                     info["job"] = None
                     requeue(message["job"], info["name"], message["error"])
@@ -999,6 +1380,7 @@ def run(plan: dict, out: Path, gpus: list[str], backend: str = "wangp", wangp_ro
                         raise RunError("no GPU worker left")
             if not scheduler.finished() and not scheduler.running() and scheduler.next_ready() is None:
                 raise RunError("nothing left to run: a job's dependency never finished")
+            stream.check()
     finally:
         for info in workers.values():
             info["inbox"].put(None)
@@ -1006,19 +1388,22 @@ def run(plan: dict, out: Path, gpus: list[str], backend: str = "wangp", wangp_ro
             info["process"].join(timeout=30)
             if info["process"].is_alive():
                 info["process"].terminate()
+        stream.close(check=False)  # an error raised above wins over a stream error
+    stream.check()
 
-    film_s = sum(job["seconds"] for job in clips)
+    durations = [streamer.durations[job["index"]] for job in clips]
+    film_s = sum(durations)
     # the master soundtrack replaces the clip audio only when it covers the whole film; otherwise the clips past its end
     # keep the audio they generated
     film = streamer.finish(master if master is not None and soundtrack_seconds >= film_s - 0.05 else None)
     wall = time.monotonic() - started
     ready = [streamer.ready_at[job["index"]] for job in clips]
-    durations = [job["seconds"] for job in clips]
     report = {"title": plan["title"], "gpus": gpus, "backend": backend, "audio_mode": plan["audio"]["mode"],
+              "cutaway": plan["cutaway"]["image"] if plan["cutaway"] else None, "workers": worker_info,
               "video_s": round(sum(durations), 3), "wall_s": round(wall, 2),
               "playback": {key: (round(value, 2) if isinstance(value, float) else value)
                            for key, value in playback(ready, durations, prebuffer).items() if key != "starts"},
-              "clips": [{"index": job["index"], "duration_s": round(job["seconds"], 3),
+              "clips": [{"index": job["index"], "duration_s": round(streamer.durations[job["index"]], 3),
                          "live_at_s": round(streamer.ready_at[job["index"]], 2)} for job in clips],
               "jobs": records, "film": str(film), "playlist": str(streamer.playlist) if hls else None}
     (out / "report.json").write_text(json.dumps(report, indent=1), encoding="utf-8")
@@ -1036,15 +1421,20 @@ def dry_run(plan: dict, out: Path, gpus: int, scale: float, load_s: float, prebu
     fps = plan["frames_rule"]["fps"]
     log(f"{plan['title']}: {len(plan['shots'])} clips, {sum(shot['duration'] for shot in plan['shots']):.1f} s of film, "
         f"model {plan['model_type']} at {plan['resolution']}, audio {plan['audio']['mode']}, end images {plan['end_images']}")
+    if plan["cutaway"]:
+        cut = plan["cutaway"]
+        log(f"  cut-away from {cut['image']}: cut at frame {cut['cut_frame']} ({cut['cut_frame'] / fps:.3f} s), "
+            f"lead trimmed at frame {cut['trim_frames']} ({cut['trim_frames'] / fps:.3f} s)")
     for board in boards:
         log(f"  storyboard {board['index'] + 1}: {board['frames']} frames ({board['frames'] / fps:.2f} s), shots "
             f"{[index + 1 for index in board['shots']]}, keyframes at frames {[item['frame'] for item in board['extract']]}"
             + (f", starts on clip {board['anchor_shot'] + 1}'s keyframe" if board["anchor_shot"] is not None else ""))
     for shot in plan["shots"]:
-        log(f"  clip {shot['index'] + 1}: {shot['frames']} frames ({shot['duration']:.2f} s)")
+        lead = f", {shot['trim_frames']} trimmed" if shot["cutaway"] else ""
+        log(f"  clip {shot['index'] + 1}: {shot['frames']} frames{lead} ({shot['duration']:.2f} s in the film)")
     if plan["missing_files"]:
         log("missing files (needed before a real run):\n  " + "\n  ".join(plan["missing_files"]))
-    for job in jobs[:1] + [job for job in jobs if job["kind"] == "clip"][:1]:
+    for job in {job["id"]: job for job in jobs[:1] + [job for job in jobs if job["kind"] == "clip"][:1]}.values():
         log(f"\n--- {job['label']} prompt ---\n{job['settings']['prompt']}")
     counts = sorted({1, 2, 3, 4, 5, 6, 8, gpus})
     rows = estimate(jobs, counts, scale, load_s, prebuffer, parallel_start, warmup, plan["frames_rule"]["minimum"])
@@ -1077,6 +1467,11 @@ def main(argv=None) -> int:
     parser.add_argument("--prebuffer", type=int, default=1, help="clips buffered before playback starts (report and estimate)")
     parser.add_argument("--est-scale", type=float, default=1.0, help="dry run: scale the measured RTX 5090 times (1.2 = 20%% slower host)")
     parser.add_argument("--est-load-s", type=float, default=0.0, help="dry run: cold model load added to each GPU's first job")
+    parser.add_argument("--encoder", choices=ENCODERS, default=None,
+                        help="clip encoding: x264 (CRF 10, veryfast; default), nvenc (falls back to x264 without NVENC), "
+                             "wangp (WanGP's own x264 settings). Overrides the plan's \"encoder\"")
+    parser.add_argument("--no-cpu-pinning", action="store_true",
+                        help="let every worker use all CPU cores (default: each worker gets its own cores and thread budget)")
     args = parser.parse_args(argv)
     gpus = [gpu.strip() for gpu in args.gpus.split(",") if gpu.strip()]
     try:
@@ -1088,7 +1483,7 @@ def main(argv=None) -> int:
         if not gpus:
             raise PlanError("--gpus lists no GPU")
         run(plan, Path(args.out), gpus, args.backend, Path(args.wangp_root), args.retries, not args.no_hls, args.prebuffer,
-            args.fake_seconds, args.parallel_start, not args.no_warmup)
+            args.fake_seconds, args.parallel_start, not args.no_warmup, encoder=args.encoder, pin_cpus=not args.no_cpu_pinning)
         return 0
     except PlanError as exc:
         print(f"director: {exc}", file=sys.stderr)
