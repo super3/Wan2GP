@@ -1223,6 +1223,14 @@ def test_save_from_segments_writes_the_streamed_frames_and_refuses_changed_ones(
                             "stream=nb_read_frames,width,height", "-of", "csv=p=0", out], capture_output=True, text=True)
     assert probe.stdout.strip() == "48,32,12"
     assert fastpath.last_save()["segments"] == 2
+    live_again = streaming.LiveSegmenter(tmp_path / "segments2", fps=24)
+    for start in range(0, 12, 6):
+        live_again.submit({"chunk": start // 6, "frame_start": start, "frame_end": start + 6, "t": 0.0},
+                          decoded[0, :, start:start + 6].permute(1, 2, 3, 0).contiguous())
+    # WanGP passes its windows' samples as a list (one window here), uint8 as decoded
+    assert fastpath.save_video_from_segments(live_again, [decoded[0]], str(tmp_path / "listed.mp4"), "mp4", fingerprint)
+    assert fastpath.save_video_from_segments(live_again, [decoded[0], decoded[0]], str(tmp_path / "two.mp4"), "mp4", fingerprint) is None
+    assert "2 windows" in fastpath.last_refusal()
     changed = video.clone()
     changed[:, 0] = 1.0 - changed[:, 0]  # a post-processed first frame: not the streamed one
     assert fastpath.save_video_from_segments(live, changed, str(tmp_path / "other.mp4"), "mp4", fingerprint) is None

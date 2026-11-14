@@ -159,6 +159,10 @@ def save_video_from_segments(live, tensor, save_file: str, container: str, finge
     changed after the decode (film grain, a filter) is encoded by WanGP as usual."""
     from .streaming import matches_fingerprint
 
+    if isinstance(tensor, (list, tuple)):  # WanGP passes its windows' samples as a list; the segments hold one decode: one window
+        if len(tensor) != 1:
+            return _refuse(f"{len(tensor)} windows: the segments hold the last decode only")
+        tensor = tensor[0]
     if live is None or container != "mp4" or save_file is None or not hasattr(tensor, "shape") or tensor.dim() not in (4, 5):
         return _refuse(f"no live segments, or not an mp4 video (container {container}, {type(tensor).__name__})")
     frames, height, width = tensor.shape[-3], tensor.shape[-2], tensor.shape[-1]
