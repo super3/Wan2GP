@@ -1,0 +1,107 @@
+"""Drift guard for plugins/usp_multi_gpu/usp.py — text-only, no torch.
+
+``usp._usp_forward`` is a rank-aware COPY of ``MiniMaxH3Model.forward``
+(transformer.py). If upstream edits that forward, the copy silently diverges;
+this test pins the mirrored region's hash so the divergence fails CI instead.
+On failure: re-diff ``_usp_forward`` against the new upstream forward, port
+the change, and update the hash below.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import re
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parents[2]
+
+#: sha256 of MiniMaxH3Model.forward's source at the revision usp.py mirrors
+#: (upstream c8d47da: several H3 images denoised as one batch, which USP refuses, and an optional
+#: audio stream, H3-Image having none).
+MIRRORED_FORWARD_SHA256 = "32e5a5db125dfbd08fe43857bc3f5b7378568b18801ac493dcf53e66c2aea51a"
+
+
+def _forward_source() -> str:
+    src = (REPO / "models" / "minimax_h3" / "transformer.py").read_text()
+    # Search from the class, not the file start: upstream added
+    # InputPreparation.forward(self, video_x, ...) above it, which a file-wide
+    # search matches first -- the guard would then pin the wrong function.
+    start = src.find("\nclass MiniMaxH3Model(")
+    assert start >= 0, "class MiniMaxH3Model not found — the anchor needs updating"
+    match = re.compile(r"    def forward\(self, video_x.*?(?=\n\n__all__|\nclass |\Z)", re.S).search(src, start)
+    assert match, "MiniMaxH3Model.forward not found — the anchor regex needs updating"
+    return match.group(0)
+
+
+def test_upstream_forward_unchanged_since_usp_mirror():
+    digest = hashlib.sha256(_forward_source().encode()).hexdigest()
+    assert digest == MIRRORED_FORWARD_SHA256, (
+        "MiniMaxH3Model.forward changed upstream since plugins/usp_multi_gpu/usp.py mirrored it. "
+        "Re-diff usp._usp_forward against transformer.py's forward, port the change, and "
+        f"update MIRRORED_FORWARD_SHA256 to {digest}."
+    )
+
+
+#: sha256 of models/minimax_h3/vsa/attention.py at the revision usp.py's VSA support was verified against (upstream
+#: dee6635). usp._usp_vsa_call runs VSAAttention UNCHANGED on heads / world_size heads of the full sequence, which is exact
+#: only while VSA mixes nothing across heads (pooling, scores, top-k, coarse branch, scales are all per head today).
+VSA_ATTENTION_SHA256 = "b764c8049ecb2b8d3a0bbd2936f2ad60c1ae816f8d14a604c4a886c051ba4d3e"
+
+
+def test_vsa_unchanged_since_usp_verified_it_head_separable():
+    digest = hashlib.sha256((REPO / "models" / "minimax_h3" / "vsa" / "attention.py").read_text().encode()).hexdigest()
+    assert digest == VSA_ATTENTION_SHA256, (
+        "models/minimax_h3/vsa/attention.py changed. USP runs VSA per rank on a subset of the heads, so re-check that "
+        "nothing in it couples heads (or plans per call over the sequence), re-run "
+        "runpod_worker/scripts/test_usp_vsa_cpu.py (torch + triton, CPU-only), then update "
+        f"VSA_ATTENTION_SHA256 to {digest}."
+    )
+
+
+def test_usp_module_stays_torch_lazy_for_this_suite():
+    # The CPU suite must stay importable without torch; usp.py needs torch at
+    # module scope, so nothing in runpod_worker may import it at module scope.
+    # The module lives in the Multi-GPU (USP) plugin: plugins/usp_multi_gpu/usp.py.
+    needles = ("usp_multi_gpu" + " import", "usp_multi_gpu" + ".usp", "minimax_h3" + ".usp")  # split: no self-match
+    for py in (REPO / "runpod_worker").rglob("*.py"):
+        if py.parent.name == "scripts" or py.name == "test_usp_drift.py":
+            continue  # GPU / torch scripts (or this guard itself), never imported by the suite
+        text = py.read_text()
+        assert not any(needle in text for needle in needles), (
+            f"{py} references the torch-requiring usp module; keep the worker package torch-free"
+        )
+
+
+#: sha256 of AutoencoderKLMiniMaxH3._decode at the revision last_frame.py reasons about.
+#: Re-verified at upstream dee6635 (runpod_worker/scripts/test_last_frame_cpu.py:
+#: last frame bit-identical for 107-362 frames): the chunk loop is unchanged;
+#: finalized frames now go to a CPU buffer via _prepare_decoded_chunk(uint8_rounding)
+#: and a single latent frame takes a separate still-image path.
+#: Re-verified at upstream a288819: only the copy of each finalized part into the CPU buffer
+#: changed (decoded[...].copy_(part) became transfer.copy_(decoded[...], part)); the chunk loop
+#: and the slice positions are the same.
+#: Re-verified at upstream 9f30419: only a single-frame decoder branch (decoder.patch_size_t == 1,
+#: H3 image models) was added ahead of the still-image path; the video chunk loop and slice
+#: positions are unchanged, and last_frame.py decodes such a VAE in full.
+MIRRORED_DECODE_SHA256 = "d6e684189a60a7c626299e6925027437d51e647be90e37b9641ffd135dcfd7bc"
+
+
+def _decode_source() -> str:
+    src = (REPO / "models" / "minimax_h3" / "components" / "video_autoencoder.py").read_text()
+    match = re.search(r"    def _decode\(self, z.*?(?=\n    def )", src, re.S)
+    assert match, "AutoencoderKLMiniMaxH3._decode not found — the anchor regex needs updating"
+    return match.group(0)
+
+
+def test_decode_chunking_unchanged_since_last_frame_patch():
+    """models/minimax_h3/last_frame.py is only correct because _decode loops over
+    INDEPENDENT chunks and the final frames come from the last chunk's unblended
+    j==1 segment. If that loop changes, the tail slice may silently return frames
+    from the wrong place — which looks like a plausible image, not an error."""
+    digest = hashlib.sha256(_decode_source().encode()).hexdigest()
+    assert digest == MIRRORED_DECODE_SHA256, (
+        "AutoencoderKLMiniMaxH3._decode changed. Re-verify that the last chunk still "
+        "reads exactly the trailing tokens_chunk_size + token_overlap latent frames and "
+        "that nothing earlier contributes to the final frames, then update "
+        f"MIRRORED_DECODE_SHA256 to {digest}."
+    )
