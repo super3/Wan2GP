@@ -90,6 +90,8 @@ class StreamRecorder:
         self.audio_first_effective = False
         #: the last decode's multi-device plan: {"devices", "main", "fallback"}; None for a single-device decode
         self.decode_plan: dict | None = None
+        #: sampled pixels of the last decode's uint8 output (output_fingerprint), to recognize those frames later
+        self.fingerprint: tuple | None = None
 
     # -- hooks ------------------------------------------------------------
     def on_decode_start(self) -> None:
@@ -104,10 +106,18 @@ class StreamRecorder:
             if self.audio_out is not None:
                 self.live.set_audio(self.audio_out)
 
-    def on_chunk(self, vae, decoded: torch.Tensor, frame_start: int, frame_end: int, chunk_index: int) -> None:
+    def wants_frames(self) -> bool:
+        return self.store_frames or self.live is not None
+
+    def on_chunk(self, vae, decoded: torch.Tensor, frame_start: int, frame_end: int, chunk_index: int,
+                 frames_u8: torch.Tensor | None = None) -> None:
+        """frames_u8: these frames already as uint8 (frames, H, W, 3) on the CPU (the decode loop converts uint8 chunks on the GPU),
+        else they are converted from the CPU output buffer."""
         if frame_end <= frame_start:
             return
-        u8 = _to_uint8_frames(vae, decoded[:, :, frame_start:frame_end])  # (frames, H, W, 3)
+        u8 = None
+        if self.wants_frames():
+            u8 = frames_u8 if frames_u8 is not None else _to_uint8_frames(vae, decoded[:, :, frame_start:frame_end])
         # `decoded` is the CPU buffer `_decode` fills with a blocking copy per
         # finalized chunk: the timestamp includes the decode of this chunk AND
         # the host copy a streaming mux would need.
@@ -119,8 +129,9 @@ class StreamRecorder:
         if self.live is not None:
             self.live.submit(meta, u8)
 
-    def on_decode_end(self) -> None:
+    def on_decode_end(self, decoded: torch.Tensor | None = None) -> None:
         self.decode_end_t = time.monotonic()
+        self.fingerprint = output_fingerprint(decoded) if decoded is not None and decoded.dtype == torch.uint8 else None
 
     # -- derived ----------------------------------------------------------
     @property
@@ -131,6 +142,35 @@ class StreamRecorder:
 
     def chunk_ready_rel(self, t0: float) -> list[float]:
         return [c["t"] - t0 for c in self.chunks]
+
+
+def _fingerprint_positions(frames: int, height: int, width: int):
+    ts = sorted({0, frames // 2, frames - 1})
+    ys = torch.linspace(0, height - 1, 8).long()
+    xs = torch.linspace(0, width - 1, 8).long()
+    return ts, ys, xs
+
+
+def output_fingerprint(decoded: torch.Tensor) -> tuple:
+    """(frames, height, width, values) of a uint8 decode output (batch, 3, frames, height, width): an 8x8 grid of pixels of its
+    first, middle and last frames."""
+    frames, height, width = decoded.shape[-3:]
+    ts, ys, xs = _fingerprint_positions(frames, height, width)
+    values = decoded[0][:, ts][:, :, ys][:, :, :, xs].to(torch.int16)
+    return frames, height, width, values
+
+
+def matches_fingerprint(fingerprint: tuple | None, video: torch.Tensor) -> bool:
+    """Whether a [-1, 1] float video (3, frames, height, width) holds the frames of `fingerprint`, within one level of rounding."""
+    if fingerprint is None:
+        return False
+    frames, height, width, values = fingerprint
+    if tuple(video.shape[-3:]) != (frames, height, width):
+        return False
+    ts, ys, xs = _fingerprint_positions(frames, height, width)
+    sample = video.reshape(-1, *video.shape[-4:])[0][:, ts][:, :, ys][:, :, :, xs].float().cpu()
+    levels = ((sample + 1.0) * 127.5).round().to(torch.int16)
+    return bool((levels - values).abs().max() <= 1)
 
 
 def _to_uint8_frames(vae, sl: torch.Tensor) -> torch.Tensor:
@@ -272,11 +312,13 @@ def parse_decode_devices(devices) -> list[str] | None:
 
 
 def set_decode_devices(devices) -> list[str] | None:
-    """Set the multi-device decode list (None/empty: off, the single-device decode of today)."""
+    """Set the multi-device decode list (None/empty: off, the single-device decode of today); starts the decode workers of an
+    H3 VAE already loaded in the background."""
     names = parse_decode_devices(devices)
     if names != _STATE.get("decode_devices"):
         release_decode_replicas()
-    _STATE["decode_devices"] = names
+        _STATE["decode_devices"] = names
+        start_decode_workers()
     return names
 
 
@@ -285,12 +327,15 @@ def decode_devices() -> list[str] | None:
 
 
 def release_decode_replicas() -> None:
-    """Drop every cached replica (their weights free on their devices once no decode is using them)."""
+    """Drop every cached replica (their weights free on their devices once no decode is using them); a worker still starting
+    is closed as soon as it is up."""
     with _REPLICA_LOCK:
         for cache in list(_REPLICAS.values()):
             for replica in cache.values():
                 if isinstance(replica, _ProcessReplica):
                     replica.close()
+                elif isinstance(replica, _PendingReplica):
+                    _close_when_booted(replica.future)
         _REPLICAS.clear()
 
 
@@ -453,6 +498,7 @@ class _Replica:
 
 
 _RECIPE_ATTR = "_decode_worker_recipe"  # set on a VAE by the loader hook: how a decode worker loads the same VAE
+_RECIPE_VAES: "weakref.WeakSet" = weakref.WeakSet()  # VAEs loaded with a recipe, for start_decode_workers
 _WORKER_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "decode_worker.py")
 _WORKER_BOOT_TIMEOUT_S = 900
 _INHERITED_FLAGS = {  # the WanGP flags a decode worker shares with this process (the USP helper's set)
@@ -481,6 +527,8 @@ def install_recipe_hook() -> bool:
         vae = loader(*args, **kwargs)
         vae.__dict__[_RECIPE_ATTR] = {"factory": "models.minimax_h3.minimax_h3_main:_load_video_vae", "args": list(args),
                                       "kwargs": dict(kwargs), "wangp": True}
+        _RECIPE_VAES.add(vae)
+        start_decode_workers(vae)  # with decode devices set, its workers load while the pipeline loads and denoises
         return vae
 
     load_video_vae._records_recipe = True
@@ -544,6 +592,7 @@ class _ProcessReplica:
         self.device, self.main = device, main
         self.attrs, self.lock, self.proc, self.conn = {}, threading.Lock(), None, None
         self.tuning_sent = -1  # entries of the main process's tuning tables already sent (tuning_sync.size)
+        self.pinned, self.copied = None, None  # reusable pinned receive buffer, and the event of its last copy to the GPU
         self.shapes_seen: set = set()  # clip shapes this worker has decoded with tables from the main process
         self.timings: list[dict] = []  # per clip: worker decode and pack, round trip and unpack seconds
         settings = _worker_settings()
@@ -640,10 +689,34 @@ class _ProcessReplica:
             if reply[0] != "clip":
                 raise RuntimeError(f"decode worker on {self.device}: {reply[1]}\n{reply[2] if len(reply) > 2 else ''}")
             received = time.monotonic()
-            clip = worker.unpack(reply[1], self.conn.recv_bytes())
-        clip = clip.to(self.main)
+            clip = self._receive(reply[1])
         self.timings.append({"decode_s": reply[1].get("decode_s", 0.0), "pack_s": reply[1].get("pack_s", 0.0),
                              "roundtrip_s": received - started, "unpack_s": time.monotonic() - received})
+        return clip
+
+    def _receive(self, meta: dict) -> torch.Tensor:
+        """The clip's bytes, straight into a reusable pinned buffer, then copied to the main device without blocking (one copy
+        instead of a bytes object, a bytearray and a pageable host-to-device copy)."""
+        from . import decode_worker as worker
+
+        dtype = getattr(torch, worker._DTYPES[meta["dtype"]])
+        numel = 1
+        for dim in meta["shape"]:
+            numel *= dim
+        nbytes = numel * torch.empty((), dtype=dtype).element_size()
+        if self.main.type != "cuda" or nbytes == 0:
+            return worker.unpack(meta, self.conn.recv_bytes()).to(self.main)
+        if self.copied is not None:
+            self.copied.synchronize()  # the previous clip's copy out of the buffer is done
+        if self.pinned is None or self.pinned.numel() < nbytes:
+            self.pinned = torch.empty(nbytes, dtype=torch.uint8, pin_memory=True)
+        received = self.conn.recv_bytes_into(memoryview(self.pinned.numpy())[:nbytes])
+        if received != nbytes:
+            raise RuntimeError(f"decode worker on {self.device} sent {received} bytes, expected {nbytes}")
+        host = self.pinned[:nbytes].view(dtype).view(meta["shape"])
+        clip = host.to(self.main, non_blocking=True)
+        self.copied = torch.cuda.Event()
+        self.copied.record(torch.cuda.current_stream(self.main))
         return clip
 
     def close(self) -> None:
@@ -669,29 +742,112 @@ class _ProcessReplica:
         self.close()
 
 
-def _replicas_for(vae, slots: list[torch.device], main: torch.device | None = None) -> list:
+class _PendingReplica:
+    """A decode worker process still starting (`_boot_in_background`): its slot is left out of the decodes until it is ready."""
+
+    def __init__(self, future: concurrent.futures.Future, device: torch.device):
+        self.future, self.device = future, device
+
+
+def _boot_in_background(*args) -> concurrent.futures.Future:
+    """A `_ProcessReplica(*args)` started on a thread of its own (gone once the worker is up), as a future."""
+    future: concurrent.futures.Future = concurrent.futures.Future()
+
+    def boot():
+        try:
+            future.set_result(_ProcessReplica(*args))
+        except BaseException as exc:  # noqa: BLE001 - handed to the decode that collects the future
+            future.set_exception(exc)
+
+    threading.Thread(target=boot, daemon=True, name=f"h3-decode-worker-boot-{args[1]}").start()
+    return future
+
+
+def _close_when_booted(future: concurrent.futures.Future) -> None:
+    def close(done):
+        if not done.cancelled() and done.exception() is None:
+            done.result().close()
+
+    future.add_done_callback(close)
+
+
+def _replicas_for(vae, slots: list[torch.device], main: torch.device | None = None, wait: bool = False) -> list:
     """One replica per extra decode slot, built once per VAE and slot and cached while the device list is unchanged: a decode
-    worker process when the VAE carries a loader recipe (WanGP's H3 VAEs, `install_recipe_hook`), else an in-process copy."""
+    worker process when the VAE carries a loader recipe (WanGP's H3 VAEs, `install_recipe_hook`), else an in-process copy.
+
+    A worker process starts in the background (it loads a WanGP session and the VAE: 15-30 s): until it is ready its slot is None
+    in the returned list (the decode leaves it out), unless `wait`. A worker that failed to start raises its error, every time,
+    until the device list changes."""
     with _REPLICA_LOCK:
         cache = _REPLICAS.get(vae)
         if cache is None:
             cache = _REPLICAS[vae] = {}
-        replicas, ordinal = [], {}
+        replicas, ordinal, pending = [], {}, []
         for device in slots:
             key = (str(device), ordinal.setdefault(str(device), 0))
             ordinal[str(device)] += 1
             replica = cache.get(key)
             if replica is None:
-                if device.type == "cuda":
-                    torch.cuda.synchronize()  # no MMGP prefetch of these weights is still in flight while they are read
                 recipe = vae.__dict__.get(_RECIPE_ATTR)
                 if recipe is not None:
-                    replica = cache[key] = _ProcessReplica(recipe, device, main if main is not None else _normalize_device("cuda"))
+                    owner = main if main is not None else _normalize_device("cuda" if torch.cuda.is_available() else "cpu")
+                    replica = cache[key] = _PendingReplica(_boot_in_background(recipe, device, owner), device)
                 else:
+                    if device.type == "cuda":
+                        torch.cuda.synchronize()  # no MMGP prefetch of these weights is still in flight while they are read
                     replica = cache[key] = _Replica(vae, device)
-            replica.sync_from(vae)
             replicas.append(replica)
-        return replicas
+            if isinstance(replica, _PendingReplica):
+                pending.append((key, replica))
+    for index, (key, replica) in enumerate(pending):
+        if wait:
+            concurrent.futures.wait([replica.future])
+        if replica.future.done():
+            booted = replica.future.result()  # raises the worker's start-up error
+            with _REPLICA_LOCK:
+                if cache.get(key) is replica:
+                    cache[key] = booted
+            replicas[replicas.index(replica)] = booted
+    out = []
+    for replica in replicas:
+        if isinstance(replica, _PendingReplica):
+            out.append(None)
+        else:
+            replica.sync_from(vae)
+            out.append(replica)
+    return out
+
+
+def start_decode_workers(vae=None) -> int:
+    """Start the decode workers of the current device list for `vae` (or every VAE with a loader recipe loaded so far) without
+    waiting for them; returns how many are starting or ready. Called when a VAE is loaded and when the device list is set, so the
+    workers are usually up before the first decode."""
+    names = _STATE.get("decode_devices")
+    if not names:
+        return 0
+    vaes = [vae] if vae is not None else list(_RECIPE_VAES)
+    main = _normalize_device("cuda" if torch.cuda.is_available() else "cpu")
+    devices = [_normalize_device(name) for name in names]
+    main_slot = next((k for k, device in enumerate(devices) if device == main), None)
+    extra = [device for k, device in enumerate(devices) if k != main_slot]  # as _make_dispatcher splits them
+    count = 0
+    for item in vaes:
+        if item is None or _RECIPE_ATTR not in item.__dict__:
+            continue
+        try:
+            _replicas_for(item, extra, main)
+            count += len(extra)
+        except Exception:  # noqa: BLE001 - reported by the next decode, which falls back to one device
+            pass
+    return count
+
+
+def wait_for_decode_workers(timeout: float | None = None) -> bool:
+    """Wait until every decode worker started so far is ready (or failed); True when none is still starting."""
+    with _REPLICA_LOCK:
+        futures = [replica.future for cache in _REPLICAS.values() for replica in cache.values() if isinstance(replica, _PendingReplica)]
+    done, not_done = concurrent.futures.wait(futures, timeout=timeout)
+    return not not_done
 
 
 class _ChunkDispatcher:
@@ -861,15 +1017,27 @@ def _make_dispatcher(vae, z: torch.Tensor, num_chunks: int, tokens_chunk_size: i
     main_slot = next((k for k, device in enumerate(devices) if device == main), None)
     extra = [device for k, device in enumerate(devices) if k != main_slot]
     try:
-        replicas = iter(_replicas_for(vae, extra, main))
+        ready = _replicas_for(vae, extra, main)
     except Exception as exc:  # noqa: BLE001 - fall back to the single-device decode, which is always correct
         where = " <- ".join(f"{frame.name}@{frame.filename.rsplit('/', 1)[-1]}:{frame.lineno}"
                             for frame in reversed(traceback.extract_tb(exc.__traceback__)[-4:]))
         rec.decode_plan = {"devices": [str(main)], "fallback": f"{type(exc).__name__}: {exc}"[:300], "where": where[:400]}
         print(f"[Chunk Streaming] multi-device decode unavailable, decoding on {main} only: {exc}")
         return None
+    starting = sum(replica is None for replica in ready)
+    if starting:  # a worker still starting: decode without it rather than wait for it
+        keep = iter(ready)
+        devices = [device for k, device in enumerate(devices) if k == main_slot or next(keep) is not None]
+        ready = [replica for replica in ready if replica is not None]
+        main_slot = next((k for k, device in enumerate(devices) if device == main), None)
+        if len(devices) == 1 and devices[0] == main:
+            rec.decode_plan = {"devices": [str(main)], "fallback": None, "workers_starting": starting}
+            return None
+    replicas = iter(ready)
     slots = [None if k == main_slot else next(replicas) for k in range(len(devices))]
     rec.decode_plan = {"devices": [str(device) for device in devices], "main": str(main), "fallback": None}
+    if starting:
+        rec.decode_plan["workers_starting"] = starting
     workers = [slot for slot in slots if isinstance(slot, _ProcessReplica)]
     signature = (tuple(z.shape[:2]), clip_tokens, tuple(z.shape[-2:]), str(z.dtype), tuple(sorted(_plain_settings(vae).items())))
     hold = False
@@ -963,6 +1131,8 @@ def _instrumented_decode_loop(self, z, uint8_rounding, rec, dispatcher, num_chun
         overlap = None
         reported = 0  # end of the frame range already handed to the recorder
 
+        hwc_parts = []  # uint8 (frames, H, W, 3) CPU frames written since the last report to the recorder
+
         def write_chunk(chunk):
             # finalized pixels converted and copied to the CPU output by groups of frames (no full-clip conversion copies)
             nonlocal decoded, write_position
@@ -972,14 +1142,23 @@ def _instrumented_decode_loop(self, z, uint8_rounding, rec, dispatcher, num_chun
                 if decoded is None:
                     decoded = torch.empty(*part.shape[:2], output_frames, *part.shape[3:], dtype=part.dtype, device="cpu")
                 _va.transfer.copy_(decoded[:, :, write_position : write_position + part.shape[2]], part)  # mmgp.transfer, as upstream
+                if part.dtype == torch.uint8 and rec.wants_frames():
+                    # the recorder's frames, laid out (frames, H, W, 3) on the device: the same values as the CPU buffer, without the
+                    # strided CPU copy a channels-last view of that buffer costs (half a second per 720p chunk)
+                    hwc_parts.append(part[0].permute(1, 2, 3, 0).contiguous().cpu())
                 write_position += part.shape[2]
                 del part
+
+        def report(start, end, index):
+            frames = torch.cat(hwc_parts) if hwc_parts and sum(p.shape[0] for p in hwc_parts) == end - start else None
+            hwc_parts.clear()
+            rec.on_chunk(self, decoded, start, end, index, frames_u8=frames)
 
         if num_chunks == 0:
             # Short videos still need one decode, without an overlapping temporal chunk.
             write_chunk(self._decode_clip(z)[:, :, frame_pre_padding : frame_pre_padding + output_frames])
-            rec.on_chunk(self, decoded, 0, write_position, 0)
-            rec.on_decode_end()
+            report(0, write_position, 0)
+            rec.on_decode_end(decoded)
             return decoded
 
         for i in range(num_chunks):
@@ -999,7 +1178,7 @@ def _instrumented_decode_loop(self, z, uint8_rounding, rec, dispatcher, num_chun
                         chunk = self._blend(overlap, chunk, self.frame_overlap, dim=-3)
                     write_chunk(chunk)
                     if i < num_chunks - 1 and write_position > reported:
-                        rec.on_chunk(self, decoded, reported, write_position, i)
+                        report(reported, write_position, i)
                         reported = write_position
                 else:
                     overlap = chunk.contiguous()
@@ -1009,8 +1188,8 @@ def _instrumented_decode_loop(self, z, uint8_rounding, rec, dispatcher, num_chun
         if write_position != output_frames:
             raise RuntimeError(f"MiniMax H3 VAE decoded {write_position} frames, expected {output_frames}")
         # The last chunk's frames plus the trailing overlap finalize together.
-        rec.on_chunk(self, decoded, reported, write_position, num_chunks - 1)
-        rec.on_decode_end()
+        report(reported, write_position, num_chunks - 1)
+        rec.on_decode_end(decoded)
         return decoded
 
 
@@ -1079,6 +1258,9 @@ def activate(store_frames: bool = True, live_dir: str | None = None,
     _STATE["orig_video_decode"] = orig_video_decode
     _video_mod.MiniMaxH3VideoVAE.decode = audio_first_video_decode
     _STATE["active"] = True
+    from . import fastpath
+
+    fastpath.apply_environment()  # opt-in overhead cuts (CHUNK_STREAMING_KEEP_RESIDENT, CHUNK_STREAMING_SAVE_FROM_SEGMENTS)
     return rec
 
 
@@ -1119,6 +1301,7 @@ class LiveSegmenter:
         self.sample_rate = sample_rate
         self.audio: torch.Tensor | None = None
         self.results: list[dict] = []
+        self.frame_size: tuple | None = None
         self._queue: queue.Queue = queue.Queue()
         self._closed = False
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -1131,6 +1314,7 @@ class LiveSegmenter:
 
     def submit(self, meta: dict, frames_u8: torch.Tensor) -> None:
         if not self._closed:
+            self.frame_size = tuple(frames_u8.shape[1:3])  # (H, W) of the frames, for fastpath.save_from_segments
             self._queue.put((dict(meta), frames_u8))
 
     def _run(self) -> None:

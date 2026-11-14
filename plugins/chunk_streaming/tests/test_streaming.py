@@ -18,6 +18,8 @@ from __future__ import annotations
 import functools
 import json
 import math
+import os
+import shutil
 import subprocess
 import sys
 import threading
@@ -1019,6 +1021,14 @@ def test_worker_process_decode_is_bit_identical():
     vae.__dict__[streaming._RECIPE_ATTR] = dict(_WORKER_RECIPE)
     rec = streaming.activate(store_frames=False, decode_devices=["cpu", "cpu"])
     try:
+        # the worker starts in the background: a decode before it is up runs on the main device alone, without waiting
+        assert streaming.start_decode_workers(vae) == 1
+        with torch.inference_mode():
+            early = AutoencoderKLMiniMaxH3.decode(vae, z, False, "round")[0]
+        assert torch.equal(expected, early)
+        if rec.decode_plan.get("workers_starting"):
+            assert rec.decode_plan["devices"] == ["cpu"]
+        assert streaming.wait_for_decode_workers(120)
         with torch.inference_mode():
             got = AutoencoderKLMiniMaxH3.decode(vae, z, False, "round")[0]
         timing = rec.decode_plan.pop("timing")
@@ -1047,6 +1057,8 @@ def test_worker_process_that_cannot_load_falls_back_to_one_device():
     vae.__dict__[streaming._RECIPE_ATTR] = dict(_WORKER_RECIPE, kwargs={"fail": True})
     rec = streaming.activate(store_frames=False, decode_devices=["cpu", "cpu"])
     try:
+        streaming.start_decode_workers(vae)
+        assert streaming.wait_for_decode_workers(120)
         with torch.inference_mode():
             got = AutoencoderKLMiniMaxH3.decode(vae, z, False, "round")[0]
         assert rec.decode_plan["devices"] == ["cpu"] and "this recipe fails on purpose" in rec.decode_plan["fallback"]
@@ -1065,6 +1077,8 @@ def test_worker_processes_bypass_the_wgpkernels_guard(monkeypatch):
     z = torch.randn(1, 4, _MULTI_LENGTHS[-1], 8, 8, generator=torch.Generator().manual_seed(8))
     rec = streaming.activate(store_frames=False, decode_devices=["cpu", "cpu"])
     try:
+        streaming.start_decode_workers(vae)
+        assert streaming.wait_for_decode_workers(120)
         with torch.inference_mode():
             AutoencoderKLMiniMaxH3.decode(vae, z, False, "round")
         assert rec.decode_plan["devices"] == ["cpu", "cpu"] and rec.decode_plan["fallback"] is None
@@ -1080,6 +1094,8 @@ def test_worker_adopts_the_main_process_tuning_tables():
     z = torch.randn(1, 4, _MULTI_LENGTHS[-1], 8, 8, generator=torch.Generator().manual_seed(9))
     rec = streaming.activate(store_frames=False, decode_devices=["cpu", "cpu"])
     try:
+        streaming.start_decode_workers(vae)
+        assert streaming.wait_for_decode_workers(120)
         with torch.inference_mode():
             AutoencoderKLMiniMaxH3.decode(vae, z, False, "round")
         replica = next(iter(streaming._REPLICAS[vae].values()))
@@ -1101,6 +1117,8 @@ def test_tuning_off_switch_splits_from_the_first_clip(monkeypatch):
         expected = AutoencoderKLMiniMaxH3.decode(vae, z, False, "round")[0]
     rec = streaming.activate(store_frames=False, decode_devices=["cpu", "cpu"])
     try:
+        streaming.start_decode_workers(vae)
+        assert streaming.wait_for_decode_workers(120)
         with torch.inference_mode():
             got = AutoencoderKLMiniMaxH3.decode(vae, z, False, "round")[0]
         assert not rec.decode_plan["timing"]["held_first_clip"] and torch.equal(expected, got)
@@ -1130,3 +1148,56 @@ def test_tuning_snapshot_and_receive(monkeypatch):
     late._tuned = {}
     monkeypatch.setitem(sys.modules, "not_loaded_lib", late)
     assert tuning_sync.flush() == 1 and late._tuned == {"k": [1, 1]} and tuning_sync.pending() == 0
+
+
+def test_keep_models_resident_skips_and_restores_the_stage_unloads(monkeypatch):
+    from chunk_streaming import fastpath
+
+    unloads = []
+
+    class FakePipeline:
+        def _use_transformer(self):
+            unloads.append("shared")
+
+        def _use_shared_components(self):
+            unloads.append("dit")
+
+    module = types.ModuleType("models.minimax_h3.pipeline")
+    module.MiniMaxH3Pipeline = FakePipeline
+    monkeypatch.setitem(sys.modules, "models.minimax_h3.pipeline", module)
+    original = (FakePipeline._use_transformer, FakePipeline._use_shared_components)
+    assert fastpath.keep_models_resident(True)
+    FakePipeline()._use_transformer()
+    FakePipeline()._use_shared_components()
+    assert unloads == []
+    assert not fastpath.keep_models_resident(False)
+    assert (FakePipeline._use_transformer, FakePipeline._use_shared_components) == original
+    FakePipeline()._use_transformer()
+    assert unloads == ["shared"]
+    monkeypatch.setenv("CHUNK_STREAMING_KEEP_RESIDENT", "1")
+    assert fastpath.apply_environment()["keep_models_resident"] is True
+    fastpath.keep_models_resident(False)
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="needs ffmpeg")
+def test_save_from_segments_writes_the_streamed_frames_and_refuses_changed_ones(tmp_path, monkeypatch):
+    from chunk_streaming import fastpath
+
+    torch.manual_seed(3)
+    decoded = torch.randint(0, 256, (1, 3, 12, 32, 48), dtype=torch.uint8)
+    live = streaming.LiveSegmenter(tmp_path / "segments", fps=24)
+    for start in range(0, 12, 6):
+        frames = decoded[0, :, start:start + 6].permute(1, 2, 3, 0).contiguous()
+        live.submit({"chunk": start // 6, "frame_start": start, "frame_end": start + 6, "t": 0.0}, frames)
+    fingerprint = streaming.output_fingerprint(decoded)
+    video = decoded[0].float() / 127.5 - 1.0  # what WanGP saves: the same frames in [-1, 1]
+    out = fastpath.save_video_from_segments(live, video, str(tmp_path / "saved.mp4"), "mp4", fingerprint)
+    assert out == str(tmp_path / "saved.mp4") and os.path.getsize(out) > 0
+    probe = subprocess.run(["ffprobe", "-v", "error", "-count_frames", "-select_streams", "v:0", "-show_entries",
+                            "stream=nb_read_frames,width,height", "-of", "csv=p=0", out], capture_output=True, text=True)
+    assert probe.stdout.strip() == "48,32,12"
+    assert fastpath.last_save()["segments"] == 2
+    changed = video.clone()
+    changed[:, 0] = 1.0 - changed[:, 0]  # a post-processed first frame: not the streamed one
+    assert fastpath.save_video_from_segments(live, changed, str(tmp_path / "other.mp4"), "mp4", fingerprint) is None
+    assert fastpath.save_video_from_segments(live, video[:, :10], str(tmp_path / "short.mp4"), "mp4", fingerprint) is None
