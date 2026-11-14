@@ -1277,3 +1277,23 @@ def test_keep_models_resident_reuses_an_unchanged_lora_set(monkeypatch):
     finally:
         fastpath.keep_models_resident(False)
     assert offload.load_loras_into_model is load_loras_into_model and offload.unload_loras_from_model is unload_loras_from_model
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="needs ffmpeg")
+def test_save_from_segments_keeps_the_timeline(tmp_path):
+    """124 frames in 7 segments (as an H3 5 s clip streams): the saved video lasts 124 / 24 s, with no gap at the joins."""
+    from chunk_streaming import fastpath
+
+    torch.manual_seed(4)
+    decoded = torch.randint(0, 256, (1, 3, 124, 32, 48), dtype=torch.uint8)
+    live = streaming.LiveSegmenter(tmp_path / "segments", fps=24, sample_rate=32000)
+    live.set_audio(torch.randn(2, int(124 / 24 * 32000)) * 0.1)
+    bounds = [0, 17, 35, 53, 71, 89, 107, 124]
+    for i, (a, b) in enumerate(zip(bounds, bounds[1:])):
+        live.submit({"chunk": i, "frame_start": a, "frame_end": b, "t": 0.0}, decoded[0, :, a:b].permute(1, 2, 3, 0).contiguous())
+    out = fastpath.save_video_from_segments(live, [decoded[0]], str(tmp_path / "saved.mp4"), "mp4", streaming.output_fingerprint(decoded))
+    assert out is not None, fastpath.last_refusal()
+    probe = subprocess.run(["ffprobe", "-v", "error", "-count_frames", "-select_streams", "v:0", "-show_entries",
+                            "stream=nb_read_frames,duration", "-of", "csv=p=0", out], capture_output=True, text=True).stdout.strip()
+    frames, duration = probe.split(",")[-1], float(probe.split(",")[0])
+    assert frames == "124" and abs(duration - 124 / 24) < 0.05, probe

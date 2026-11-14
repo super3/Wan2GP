@@ -17,7 +17,10 @@ save_from_segments: with chunk streaming, every chunk of the video is already en
 preset veryfast), and WanGP then encodes all the frames again for its saved file (3.5-8 s on a 2x RTX PRO 4500 run). This writes
 the saved file's video track by concatenating the segments instead (`-c copy`, about 0.1-0.25 s); WanGP adds its own audio track
 afterwards as usual. It only steps in when the segments cover exactly the frames being saved (same count and size, mp4 container,
-every segment written); otherwise WanGP encodes as before. The video is the segments' encode, not WanGP's chosen codec.
+every segment written); otherwise WanGP encodes as before. The video is the segments' encode, not WanGP's chosen codec: with
+WanGP's default (libx264 CRF 10) the saved file was about 3x smaller (lower quality) on a 2x RTX PRO 4500 check, where the save
+went from 2.5 to 1.3 s (480p 5 s) and 4.9 to 2.4 s (720p 5 s). Encoding the segments with WanGP's codec settings would make the two
+equivalent (not done: it lengthens each segment's encode).
 
 Turn it on with CHUNK_STREAMING_SAVE_FROM_SEGMENTS=1, or `save_from_segments(True)`.
 """
@@ -173,9 +176,13 @@ def save_video_from_segments(live, tensor, save_file: str, container: str, finge
         return _refuse(f"segments do not cover the frames (size {getattr(live, 'frame_size', None)}, {len(records)} segments)")
     out = save_file if save_file.endswith(".mp4") else os.path.splitext(save_file)[0] + ".mp4"
     started = time.monotonic()
+    fps = getattr(live, "fps", 24)
     with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as listing:
         for record in sorted(records, key=lambda r: r["frame_start"]):
             listing.write(f"file '{os.path.abspath(record['path'])}'\n")
+            # each segment's exact length: without it the joins add the segments' start offsets (2 frames each, x264's B-frame
+            # delay), and a 124-frame clip in 7 segments came out 0.5 s long
+            listing.write(f"duration {(record['frame_end'] - record['frame_start']) / fps:.6f}\n")
     try:
         proc = subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "concat", "-safe", "0", "-i", listing.name, "-map", "0:v:0",
                                "-c", "copy", "-movflags", "+faststart", out], capture_output=True, text=True)
