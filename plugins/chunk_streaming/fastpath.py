@@ -7,6 +7,9 @@ audio VAE, the video VAE in turn) calls `unload_all` first, and WanGP unloads ev
 `torch.cuda.empty_cache`). This marks every model of WanGP's offload object as a cotenant of all the others (`cotenants_map`, "*"),
 so they stay loaded together, and skips the explicit `unload_all` calls; MMGP still evicts when an allocation needs the memory.
 For GPUs with room for the DiT, the VAEs and the activations together (the text encoder is not needed again for a cached prompt).
+It also keeps a job's LoRAs loaded for the next job: WanGP loads them at the start of every job (`offload.load_loras_into_model`,
+1.5 s of the queue time, mostly pinning their weights again) and unloads them at the end. A load of the same LoRAs with the same
+multipliers and options as the last one is skipped while they are still loaded; any other set unloads the kept one first.
 
 Turn it on with CHUNK_STREAMING_KEEP_RESIDENT=1, or `keep_models_resident(True, wgp)`.
 
@@ -51,6 +54,42 @@ def _resident(offloadobj) -> None:
     offloadobj.release = release_all
 
 
+def _lora_key(lora_path, lora_multi, args, kwargs) -> str:
+    options = {key: value for key, value in kwargs.items() if key not in ("preprocess_sd", "split_linear_modules_map")}
+    return repr((tuple(str(path) for path in (lora_path or ())), lora_multi, args, sorted(options.items())))
+
+
+def _wrap_loras() -> tuple:
+    """(load, unload): mmgp's LoRA calls, keeping an unchanged set loaded from one job to the next."""
+    from mmgp import offload
+
+    load, unload = offload.load_loras_into_model, offload.unload_loras_from_model
+
+    def load_loras_into_model(model, lora_path, lora_multi=None, *args, **kwargs):
+        if kwargs.get("check_only") or model is None:
+            return load(model, lora_path, lora_multi, *args, **kwargs)
+        key = _lora_key(lora_path, lora_multi, args, kwargs)
+        state = vars(model).get("_fastpath_loras")
+        if state is not None and state["kept"]:
+            if state["key"] == key:
+                state["kept"] = False  # the same LoRAs and multipliers, still loaded
+                return state["result"]
+            unload(model)  # the unload skipped at the end of the last job, now that another set comes
+        result = load(model, lora_path, lora_multi, *args, **kwargs)
+        vars(model)["_fastpath_loras"] = {"key": key, "result": result, "kept": False}
+        return result
+
+    def unload_loras_from_model(model):
+        state = vars(model).get("_fastpath_loras") if model is not None else None
+        if state is not None and not state["kept"]:
+            state["kept"] = True  # kept loaded for the next job
+            return None
+        return unload(model)
+
+    offload.load_loras_into_model, offload.unload_loras_from_model = load_loras_into_model, unload_loras_from_model
+    return load, unload
+
+
 def _restore(offloadobj) -> None:
     if offloadobj is None or "_fastpath_unload_all" not in vars(offloadobj):
         return
@@ -78,10 +117,18 @@ def keep_models_resident(enable: bool = True, wgp=None) -> bool:
         generate.__wrapped__ = original  # inspect.signature (the USP plugin reads generate's parameters) sees the original
         _STATE["originals"], _STATE["wgp_resident"] = original, wgp
         MiniMaxH3Pipeline.generate = generate
+        try:
+            _STATE["loras"] = _wrap_loras()
+        except Exception:  # noqa: BLE001 - no mmgp here: the models still stay resident
+            _STATE["loras"] = None
     elif not enable and _STATE["originals"] is not None:
         MiniMaxH3Pipeline.generate = _STATE["originals"]
         _restore(getattr(_STATE.get("wgp_resident"), "offloadobj", None))
-        _STATE["originals"] = _STATE["wgp_resident"] = None
+        if _STATE.get("loras"):
+            from mmgp import offload
+
+            offload.load_loras_into_model, offload.unload_loras_from_model = _STATE["loras"]
+        _STATE["originals"] = _STATE["wgp_resident"] = _STATE["loras"] = None
     return _STATE["originals"] is not None
 
 

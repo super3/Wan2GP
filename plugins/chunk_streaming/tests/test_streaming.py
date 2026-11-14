@@ -1227,3 +1227,38 @@ def test_save_from_segments_writes_the_streamed_frames_and_refuses_changed_ones(
     changed[:, 0] = 1.0 - changed[:, 0]  # a post-processed first frame: not the streamed one
     assert fastpath.save_video_from_segments(live, changed, str(tmp_path / "other.mp4"), "mp4", fingerprint) is None
     assert fastpath.save_video_from_segments(live, video[:, :10], str(tmp_path / "short.mp4"), "mp4", fingerprint) is None
+
+
+def test_keep_models_resident_reuses_an_unchanged_lora_set(monkeypatch):
+    from chunk_streaming import fastpath
+
+    events = []
+    mmgp = types.ModuleType("mmgp")
+    offload = types.ModuleType("mmgp.offload")
+
+    def load_loras_into_model(model, lora_path, lora_multi=None, activate_all_loras=True, check_only=False, preprocess_sd=None, **kwargs):
+        events.append(("load", tuple(lora_path)))
+        return list(lora_path)
+
+    def unload_loras_from_model(model):
+        events.append(("unload",))
+
+    offload.load_loras_into_model, offload.unload_loras_from_model = load_loras_into_model, unload_loras_from_model
+    mmgp.offload = offload
+    monkeypatch.setitem(sys.modules, "mmgp", mmgp)
+    monkeypatch.setitem(sys.modules, "mmgp.offload", offload)
+    pipeline = types.ModuleType("models.minimax_h3.pipeline")
+    pipeline.MiniMaxH3Pipeline = type("FakePipeline", (), {"generate": lambda self, input_prompt, seed=0, **kwargs: None})
+    monkeypatch.setitem(sys.modules, "models.minimax_h3.pipeline", pipeline)
+    model = types.SimpleNamespace()
+    assert fastpath.keep_models_resident(True, types.SimpleNamespace(offloadobj=None))
+    try:
+        job = lambda paths, mult: (offload.load_loras_into_model(model, paths, mult, preprocess_sd=object()), offload.unload_loras_from_model(model))
+        job(["a.safetensors"], [1.0])
+        job(["a.safetensors"], [1.0])  # same set: neither loaded again nor unloaded
+        job(["a.safetensors"], [0.5])  # other multipliers: the kept set is unloaded first
+        assert offload.load_loras_into_model(model, ["a.safetensors"], [0.5], check_only=True) == ["a.safetensors"]
+        assert events == [("load", ("a.safetensors",)), ("unload",), ("load", ("a.safetensors",)), ("load", ("a.safetensors",))]
+    finally:
+        fastpath.keep_models_resident(False)
+    assert offload.load_loras_into_model is load_loras_into_model and offload.unload_loras_from_model is unload_loras_from_model
