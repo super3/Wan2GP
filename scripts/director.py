@@ -1197,6 +1197,8 @@ def pin_worker(cpus: list[int] | None) -> int | None:
 
 
 def worker_main(worker: int, gpu: str, spec: dict, inbox, outbox, cpus: list[int] | None = None) -> None:
+    # GPU ids follow nvidia-smi's numbering (PCI order), which the CPU sets were planned with; CUDA's default order may differ
+    os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu)  # before anything imports torch: WanGP then sees this GPU as cuda:0
     try:
         threads = pin_worker(cpus)
