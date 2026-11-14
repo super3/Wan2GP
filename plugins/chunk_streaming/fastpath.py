@@ -77,6 +77,11 @@ def _wrap_loras() -> tuple:
             unload(model)  # the unload skipped at the end of the last job, now that another set comes
         result = load(model, lora_path, lora_multi, *args, **kwargs)
         vars(model)["_fastpath_loras"] = {"key": key, "result": result, "kept": False}
+        # MMGP copies a model's LoRA weights to the GPU when it loads the model: a model kept resident would run without the LoRAs just
+        # loaded (a 2x RTX PRO 4500 run lost its 4-step LoRA this way). Unload it once, so its next forward loads it with them.
+        offloadobj = getattr(_STATE.get("wgp_resident"), "offloadobj", None)
+        if offloadobj is not None and "_fastpath_unload_all" in vars(offloadobj):
+            vars(offloadobj)["_fastpath_unload_all"]()
         return result
 
     def unload_loras_from_model(model):
@@ -143,6 +148,11 @@ def _segments_cover(records: list[dict], frames: int) -> bool:
     return position == frames
 
 
+def _refuse(reason: str) -> None:
+    _STATE["last_refusal"] = reason
+    return None
+
+
 def save_video_from_segments(live, tensor, save_file: str, container: str, fingerprint=None) -> str | None:
     """The video track of `tensor` (C, T, H, W) written to `save_file` from the live segments that hold the same frames, or None.
     `fingerprint` (streaming.output_fingerprint of the decode the segments came from) must match the frames being saved: a video
@@ -150,13 +160,13 @@ def save_video_from_segments(live, tensor, save_file: str, container: str, finge
     from .streaming import matches_fingerprint
 
     if live is None or container != "mp4" or save_file is None or not hasattr(tensor, "shape") or tensor.dim() not in (4, 5):
-        return None
+        return _refuse(f"no live segments, or not an mp4 video (container {container}, {type(tensor).__name__})")
     frames, height, width = tensor.shape[-3], tensor.shape[-2], tensor.shape[-1]
     if not matches_fingerprint(fingerprint, tensor):
-        return None
+        return _refuse(f"frames differ from the decode's ({tuple(tensor.shape)} {tensor.dtype}, decode {fingerprint[:3] if fingerprint else None})")
     records = live.close()  # every chunk of this generation was finalized before WanGP saves: drain the muxing thread
     if getattr(live, "frame_size", None) != (height, width) or not _segments_cover(records, frames):
-        return None
+        return _refuse(f"segments do not cover the frames (size {getattr(live, 'frame_size', None)}, {len(records)} segments)")
     out = save_file if save_file.endswith(".mp4") else os.path.splitext(save_file)[0] + ".mp4"
     started = time.monotonic()
     with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as listing:
@@ -168,7 +178,7 @@ def save_video_from_segments(live, tensor, save_file: str, container: str, finge
     finally:
         os.unlink(listing.name)
     if proc.returncode != 0:
-        return None
+        return _refuse(f"ffmpeg concat failed: {proc.stderr.strip()[:200]}")
     _STATE["last_save"] = {"path": out, "seconds": round(time.monotonic() - started, 3), "segments": len(records)}
     return out
 
@@ -187,9 +197,10 @@ def save_from_segments(enable: bool = True, wgp=None) -> bool:
 
             rec = streaming.recorder()
             try:
-                path = None if rec is None else save_video_from_segments(rec.live, tensor, save_file, container, rec.fingerprint)
-            except Exception:  # noqa: BLE001 - the prototype must never cost a saved video
-                path = None
+                path = _refuse("chunk streaming is off") if rec is None else save_video_from_segments(rec.live, tensor, save_file,
+                                                                                                         container, rec.fingerprint)
+            except Exception as exc:  # noqa: BLE001 - the prototype must never cost a saved video
+                path = _refuse(f"{type(exc).__name__}: {exc}"[:300])
             if path is not None:
                 return path
             return original(tensor, save_file, fps, codec_type, container, *args, **kwargs)
@@ -205,6 +216,11 @@ def save_from_segments(enable: bool = True, wgp=None) -> bool:
 def last_save() -> dict | None:
     """Path, seconds and segment count of the last video saved from segments."""
     return _STATE["last_save"]
+
+
+def last_refusal() -> str | None:
+    """Why the last save did not use the segments (WanGP encoded it)."""
+    return _STATE.get("last_refusal")
 
 
 def apply_environment() -> dict:

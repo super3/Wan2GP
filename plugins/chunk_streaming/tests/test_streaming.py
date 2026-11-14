@@ -1251,7 +1251,12 @@ def test_keep_models_resident_reuses_an_unchanged_lora_set(monkeypatch):
     pipeline.MiniMaxH3Pipeline = type("FakePipeline", (), {"generate": lambda self, input_prompt, seed=0, **kwargs: None})
     monkeypatch.setitem(sys.modules, "models.minimax_h3.pipeline", pipeline)
     model = types.SimpleNamespace()
-    assert fastpath.keep_models_resident(True, types.SimpleNamespace(offloadobj=None))
+    unloads = []
+    offloadobj = types.SimpleNamespace(models={"transformer": model}, cotenants_map={}, unload_all=lambda *a, **k: unloads.append("all"),
+                                       release=lambda: None)
+    wgp = types.SimpleNamespace(offloadobj=offloadobj)
+    assert fastpath.keep_models_resident(True, wgp)
+    fastpath._resident(offloadobj)  # as at a generation's start
     try:
         job = lambda paths, mult: (offload.load_loras_into_model(model, paths, mult, preprocess_sd=object()), offload.unload_loras_from_model(model))
         job(["a.safetensors"], [1.0])
@@ -1259,6 +1264,8 @@ def test_keep_models_resident_reuses_an_unchanged_lora_set(monkeypatch):
         job(["a.safetensors"], [0.5])  # other multipliers: the kept set is unloaded first
         assert offload.load_loras_into_model(model, ["a.safetensors"], [0.5], check_only=True) == ["a.safetensors"]
         assert events == [("load", ("a.safetensors",)), ("unload",), ("load", ("a.safetensors",)), ("load", ("a.safetensors",))]
+        # each real LoRA load while resident unloads the models once (their next forward loads the new LoRAs to the GPU)
+        assert unloads == ["all", "all"]
     finally:
         fastpath.keep_models_resident(False)
     assert offload.load_loras_into_model is load_loras_into_model and offload.unload_loras_from_model is unload_loras_from_model
