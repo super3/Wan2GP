@@ -1093,7 +1093,7 @@ def test_worker_adopts_the_main_process_tuning_tables():
     vae = _tiny_vae()
     vae.__dict__[streaming._RECIPE_ATTR] = dict(_WORKER_RECIPE)
     z = torch.randn(1, 4, _MULTI_LENGTHS[-1], 8, 8, generator=torch.Generator().manual_seed(9))
-    rec = streaming.activate(store_frames=False, decode_devices=["cpu", "cpu"])
+    streaming.activate(store_frames=False, decode_devices=["cpu", "cpu"])
     try:
         streaming.start_decode_workers(vae)
         assert streaming.wait_for_decode_workers(120)
