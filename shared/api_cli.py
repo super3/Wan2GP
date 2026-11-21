@@ -7,6 +7,7 @@ import time
 from typing import Any
 
 from shared.api import GenerationError, GenerationResult, ProgressUpdate, SessionJob, _GENERATION_LOCK, _OutputCapture, _pushd
+from shared.utils.background_save import background_saves
 from shared.utils.thread_utils import AsyncStream
 
 
@@ -120,6 +121,20 @@ def run_cli_job(session, job: SessionJob, tasks: list[dict[str, Any]]) -> None:
 
 
 def _run_tasks_worker(session, wgp, tasks: list[dict[str, Any]], stream: AsyncStream, job: SessionJob, task_summary: dict[str, Any]) -> None:
+    """The job's tasks in order. With server_config "background_save", a task's file may still be written while the next task runs:
+    the job ends once every file is, and a file that could not be written fails its task."""
+    def report_save_failure(label: str, error: BaseException) -> None:  # its task was counted as done
+        failure = GenerationError(message=f"Saving {label} failed: {error}", stage="save")
+        task_summary["errors"].append(failure)
+        task_summary["successful_tasks"] = max(0, task_summary["successful_tasks"] - 1)
+        task_summary["failed_tasks"] += 1
+        stream.output_queue.push("error", failure)
+
+    with background_saves.scope(report=report_save_failure):
+        _run_task_loop(session, wgp, tasks, stream, job, task_summary)
+
+
+def _run_task_loop(session, wgp, tasks: list[dict[str, Any]], stream: AsyncStream, job: SessionJob, task_summary: dict[str, Any]) -> None:
     expected_args = set(inspect.signature(wgp.generate_media).parameters.keys())
     gen = session._state["gen"]
     for task_index, task in enumerate(tasks, start=1):

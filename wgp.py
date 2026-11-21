@@ -88,6 +88,7 @@ from shared.utils.utils import convert_tensor_to_image, convert_video_tensor_to_
 from shared.utils.utils import calculate_new_dimensions, get_outpainting_dims, get_outpainting_frame_location, get_outpainting_full_area_dimensions, resolve_outpainting_dims
 from shared.utils.utils import has_video_file_extension, has_image_file_extension, has_audio_file_extension, has_mesh_file_extension, has_world_file_extension, has_app_file_extension, MESH_IMPORT_EXTENSIONS, guide_to_float, guide_mask_to_float
 from shared.utils.kept_loras import kept_lora_signature, reuse_kept_loras
+from shared.utils.background_save import background_saves
 from shared.utils.audio_video import extract_audio_tracks, subtitle_stream_count, combine_video_with_audio_tracks, combine_and_concatenate_video_with_audio_tracks, cleanup_temp_audio_files, normalize_audio_volumes_to_temp_files, save_video, save_hdr_video, save_image, get_image_format, get_media_duration_and_audio_layouts
 from shared.utils.audio_video import append_sliding_window_audio, audio_overlap_repair_seconds, source_audio_repair_ms, read_image_metadata, extract_audio_track_to_wav, write_wav_file, save_audio_file, get_audio_codec_extension, create_silent_wav_file
 from shared.utils.audio_video import truncate_audio, shift_audio_trim_ranges, trim_audio_ranges, trim_audio_file_ranges, slice_audio_window, resolve_mux_audio_sampling_rate
@@ -7523,6 +7524,32 @@ def record_file_metadata(video_path, configs, is_image, audio_only, gen, embedde
     if record_notification:
         notifications.record_generation(server_config, gen, video_path, configs, replace_last=replaced_file is not None, notify=notify_generation)
 
+def publish_saved_media(gen, send_cmd, video_path, configs, is_image, audio_only_file, embedded_images=None, replaced_file=None, notify_generation=True, output_role="final", side_files=None, api_return_side_files=False, store_artifact=False, artifact=None):
+    """What follows the writing of a generated file: its metadata and gallery entry, its side files, the API artifact (`artifact`:
+    store_api_output_artifact's other arguments, stored when `store_artifact` or when side files are returned), the notification
+    sound and the "output" event. Run by generate_media once the file is written, or by the background saver (background_save)."""
+    record_file_metadata(video_path, configs, is_image, audio_only_file, gen, embedded_images=embedded_images, replaced_file=replaced_file, notify_generation=notify_generation, output_role=output_role)
+    main_path = video_path[0] if isinstance(video_path, list) else video_path
+    output_side_files = process_side_files(main_path, side_files, return_files=api_return_side_files)
+    for side_name in output_side_files:  # a saved world file joins the Worlds gallery
+        side_path = os.path.join(os.path.dirname(main_path), side_name)
+        if has_world_file_extension(side_name) and os.path.isfile(side_path):
+            record_file_metadata(side_path, configs, False, False, gen, notify_generation=False, record_notification=False)
+    if store_artifact or (api_return_side_files and output_side_files):
+        store_api_output_artifact(gen, artifact["client_id"], video_path, artifact["media_type"], artifact["video"], artifact["audio"], artifact["audio_sampling_rate"], artifact["fps"], hdr=artifact["hdr"], flashvsr_continue_cache=artifact["flashvsr_continue_cache"], side_files=output_side_files if api_return_side_files else None)
+    # Play notification sound for single video
+    try:
+        if server_config.get("notification_sound_enabled", 0):
+            volume = server_config.get("notification_sound_volume", 50)
+            notification_sound.notify_video_completion(
+                video_path=video_path,
+                volume=volume
+            )
+    except Exception as e:
+        print(f"Error playing notification sound for individual video: {e}")
+
+    send_cmd("output")
+
 
 @workspace_storage.workspace_generation(headless=lambda state: workspace_storage.HeadlessWorkspaceHost(state, args.workspaces_dir or server_config.get('workspaces_dir') or os.path.join(wgp_root, 'workspaces'), lambda path: get_settings_from_file(state, path, False, False, False)[0], output_override=bool(args.output_dir)))
 @generation_downloads(get_gen_info, lambda: offloadobj)
@@ -9368,6 +9395,18 @@ def generate_media(
                     file_name = f"{time_flag}_seed{seed}{'_' + prompt_name if prompt_name else ''}.{extension}"
                 video_path = os.path.join(output_dir, file_name)
                 saving_status = f"Saving File {file_name if len(file_name) <= 50 else file_name[:12] + '...' + file_name[-35:]}"
+                # server_config "background_save": a plain generated video (no source or control audio, continuation, HDR, soundtrack or
+                # voice processing, one window) is encoded, muxed and published by the background saver, so the next queued task starts
+                # at once; only inside a caller's background_saves.scope(), which waits for it (shared/utils/background_save.py)
+                deferred_save_steps = [] if (server_config.get("background_save", 0) and background_saves.accepting() and video_file is None
+                                             and not (audio_only or mesh_outputs or world_only or is_image) and continued_video is None and not sample_is_hdr
+                                             and (not sliding_window or total_windows == 1) and len(control_audio_tracks) == 0 and len(source_audio_tracks) == 0
+                                             and not any_soundtrack_processor and audio_source is None and not (replace_voice_method and replace_voice_sample is not None)
+                                             and not return_flashvsr_continue_cache) else None
+                def save_step(fn, *args, **kwargs):  # runs now, or later on the background saver with the arguments given now
+                    if deferred_save_steps is None:
+                        return fn(*args, **kwargs)
+                    deferred_save_steps.append(partial(fn, *args, **kwargs))
 
                 if not is_image:
                     set_progress_status(saving_status)
@@ -9417,7 +9456,7 @@ def generate_media(
                     elif sample_is_hdr:
                         save_hdr_video(tensor=output_video_frames, save_file=save_path_tmp, fps=output_fps, codec_type=server_config.get("hdr_video_crf", 8), container=container)
                     else:
-                        save_video( tensor=output_video_frames, save_file=save_path_tmp, fps=output_fps, nrow=1, normalize=True, value_range=(-1, 1), codec_type = server_config.get("video_output_codec", None), container=container)
+                        save_step(save_video, tensor=output_video_frames, save_file=save_path_tmp, fps=output_fps, nrow=1, normalize=True, value_range=(-1, 1), codec_type = server_config.get("video_output_codec", None), container=container)
                     output_new_audio_temp_filepath = None
                     new_audio_tracks_are_pretrimmed = False
                     saved_audio_tail_seconds = 0.0
@@ -9484,7 +9523,7 @@ def generate_media(
                     mux_audio_sampling_rate = resolve_mux_audio_sampling_rate(output_audio_sampling_rate, source_audio_metadata, new_audio_tracks)
 
                     set_progress_status(saving_status)
-                    combine_and_concatenate_video_with_audio_tracks(
+                    save_step(combine_and_concatenate_video_with_audio_tracks,
                         video_path,
                         save_path_tmp,
                         source_audio_tracks,
@@ -9498,10 +9537,10 @@ def generate_media(
                         verbose=verbose_level >= 2,
                         audio_tail_seconds=saved_audio_tail_seconds,
                     )
-                    if continued_video is None: os.remove(save_path_tmp)
-                    if output_new_audio_temp_filepath is not None: os.remove(output_new_audio_temp_filepath)
-                    cleanup_temp_audio_files(trimmed_mux_audio_tracks)
-                    cleanup_temp_audio_files(replace_voice_temp_audio_tracks)
+                    if continued_video is None: save_step(os.remove, save_path_tmp)
+                    if output_new_audio_temp_filepath is not None: save_step(os.remove, output_new_audio_temp_filepath)
+                    save_step(cleanup_temp_audio_files, trimmed_mux_audio_tracks)
+                    save_step(cleanup_temp_audio_files, replace_voice_temp_audio_tracks)
 
                 else:
                     if continued_video is not None:
@@ -9513,7 +9552,7 @@ def generate_media(
                     elif sample_is_hdr:
                         video_path = save_hdr_video(tensor=output_video_frames, save_file=video_path, fps=output_fps, codec_type=server_config.get("hdr_video_crf", 8), container=container)
                     else:
-                        save_video( tensor=output_video_frames, save_file=video_path, fps=output_fps, nrow=1, normalize=True, value_range=(-1, 1),  codec_type= server_config.get("video_output_codec", None), container= container)
+                        save_step(save_video, tensor=output_video_frames, save_file=video_path, fps=output_fps, nrow=1, normalize=True, value_range=(-1, 1),  codec_type= server_config.get("video_output_codec", None), container= container)
 
                 end_time = time.time()
 
@@ -9553,34 +9592,23 @@ def generate_media(
                 configs["creation_timestamp"] = int(end_time)
                 # if sample_is_image: configs["is_image"] = True
                 keep_intermediate_windows = server_config.get("keep_intermediate_sliding_windows", 1)
-                record_file_metadata(video_path, configs, is_image, audio_only and video_file is None, gen, embedded_images=embedded_images, replaced_file=None if keep_intermediate_windows else previous_window_path, notify_generation=not sliding_window or keep_intermediate_windows or window_no == total_windows, output_role="intermediate" if sliding_window and window_no < total_windows else "final")
+                artifact_audio = output_new_audio_data if api_return_audio else None
+                if artifact_audio is None and api_return_audio and audio_only and sample is not None:
+                    artifact_audio = sample.squeeze(0).detach().cpu().float().numpy()
+                artifact = {"client_id": client_id, "media_type": "audio" if audio_only and video_file is None else "3d" if mesh_outputs else "world" if world_only else ("image" if is_image else "video"),
+                            "video": output_video_frames if api_return_video_uint8 else None, "audio": artifact_audio, "audio_sampling_rate": output_audio_sampling_rate,
+                            "fps": output_fps if not audio_only else None, "hdr": bool(sample_is_hdr), "flashvsr_continue_cache": flashvsr_continue_cache if return_flashvsr_continue_cache else None}
+                publish = partial(publish_saved_media, gen, send_cmd, video_path, configs, is_image, audio_only and video_file is None, embedded_images=embedded_images,
+                                  replaced_file=None if keep_intermediate_windows else previous_window_path, notify_generation=not sliding_window or keep_intermediate_windows or window_no == total_windows,
+                                  output_role="intermediate" if sliding_window and window_no < total_windows else "final", side_files=side_files, api_return_side_files=api_return_side_files,
+                                  store_artifact=bool(api_return_video_uint8 or api_return_audio or return_flashvsr_continue_cache), artifact=artifact)
                 if sliding_window: previous_window_path = video_path  # removed once the next window's file is written, unless every window is kept
-                output_side_files = process_side_files(video_path[0] if isinstance(video_path, list) else video_path, side_files, return_files=api_return_side_files)
-                for side_name in output_side_files:  # a saved world file joins the Worlds gallery
-                    side_path = os.path.join(os.path.dirname(video_path[0] if isinstance(video_path, list) else video_path), side_name)
-                    if has_world_file_extension(side_name) and os.path.isfile(side_path):
-                        record_file_metadata(side_path, configs, False, False, gen, notify_generation=False, record_notification=False)
-                if api_return_video_uint8 or api_return_audio or return_flashvsr_continue_cache or (api_return_side_files and output_side_files):
-                    media_type = "audio" if audio_only and video_file is None else "3d" if mesh_outputs else "world" if world_only else ("image" if is_image else "video")
-                    artifact_audio = output_new_audio_data if api_return_audio else None
-                    if artifact_audio is None and api_return_audio and audio_only and sample is not None:
-                        artifact_audio = sample.squeeze(0).detach().cpu().float().numpy()
-                    artifact_video = output_video_frames if api_return_video_uint8 else None
-                    store_api_output_artifact(gen, client_id, video_path, media_type, artifact_video, artifact_audio, output_audio_sampling_rate, output_fps if not audio_only else None, hdr=bool(sample_is_hdr), flashvsr_continue_cache=flashvsr_continue_cache if return_flashvsr_continue_cache else None, side_files=output_side_files if api_return_side_files else None)
-                side_files = output_side_files = None
-                embedded_images = None
-                # Play notification sound for single video
-                try:
-                    if server_config.get("notification_sound_enabled", 0):
-                        volume = server_config.get("notification_sound_volume", 50)
-                        notification_sound.notify_video_completion(
-                            video_path=video_path, 
-                            volume=volume
-                        )
-                except Exception as e:
-                    print(f"Error playing notification sound for individual video: {e}")
-
-                send_cmd("output")
+                if deferred_save_steps is None:
+                    publish()
+                else:  # blocks while an earlier save waits: generation never runs more than one clip ahead of the files
+                    open(video_path, "ab").close()  # reserves the name until it is written: get_available_filename skips existing files
+                    background_saves.submit(os.path.basename(video_path), deferred_save_steps + [publish], on_failure=partial(background_saves.remove_placeholder, video_path))
+                side_files = embedded_images = artifact = artifact_audio = publish = deferred_save_steps = None
 
         seed = set_seed(-1)
     gen_state = plugin_data = None
@@ -9722,6 +9750,9 @@ def _process_tasks(state):
     def queue_worker_func():
         nonlocal gpu_acquired
         gen["prompt_no"] = 0
+        # background_save: a task's file may still be written while the next task runs; the queue ends once every file is
+        save_scope = background_saves.scope(report=lambda label, error: send_cmd("error", f"Saving {label} failed: {error}"))
+        save_scope.__enter__()
         try:
             while len(queue) > 0 and not quitting_app:
                 paused_for_edit = False
@@ -9810,6 +9841,7 @@ def _process_tasks(state):
             notification_run.fail(str(e))
             send_cmd("error", f"Queue worker crashed: {e}")
         finally:
+            save_scope.__exit__(None, None, None)  # waits for the files still being written
             with lock:
                 gen.pop("api_active_queue_task", None)
             send_cmd("worker_exit", None)
