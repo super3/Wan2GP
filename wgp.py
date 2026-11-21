@@ -88,7 +88,7 @@ from shared.utils.utils import convert_tensor_to_image, convert_video_tensor_to_
 from shared.utils.utils import calculate_new_dimensions, get_outpainting_dims, get_outpainting_frame_location, get_outpainting_full_area_dimensions, resolve_outpainting_dims
 from shared.utils.utils import has_video_file_extension, has_image_file_extension, has_audio_file_extension, has_mesh_file_extension, has_world_file_extension, has_app_file_extension, MESH_IMPORT_EXTENSIONS, guide_to_float, guide_mask_to_float
 from shared.utils.kept_loras import kept_lora_signature, reuse_kept_loras
-from shared.utils.background_save import background_saves
+from shared.utils.background_save import background_save_blockers, background_saves
 from shared.utils.audio_video import extract_audio_tracks, subtitle_stream_count, combine_video_with_audio_tracks, combine_and_concatenate_video_with_audio_tracks, cleanup_temp_audio_files, normalize_audio_volumes_to_temp_files, save_video, save_hdr_video, save_image, get_image_format, get_media_duration_and_audio_layouts
 from shared.utils.audio_video import append_sliding_window_audio, audio_overlap_repair_seconds, source_audio_repair_ms, read_image_metadata, extract_audio_track_to_wav, write_wav_file, save_audio_file, get_audio_codec_extension, create_silent_wav_file
 from shared.utils.audio_video import truncate_audio, shift_audio_trim_ranges, trim_audio_ranges, trim_audio_file_ranges, slice_audio_window, resolve_mux_audio_sampling_rate
@@ -9514,11 +9514,17 @@ def generate_media(
                 # server_config "background_save": a plain generated video (no source or control audio, continuation, HDR, soundtrack or
                 # voice processing, one window) is encoded, muxed and published by the background saver, so the next queued task starts
                 # at once; only inside a caller's background_saves.scope(), which waits for it (shared/utils/background_save.py)
-                deferred_save_steps = [] if (server_config.get("background_save", 0) and background_saves.accepting() and video_file is None
-                                             and not (audio_only or mesh_outputs or world_only or is_image) and continued_video is None and not sample_is_hdr
-                                             and (not sliding_window or total_windows == 1) and len(control_audio_tracks) == 0 and len(source_audio_tracks) == 0
-                                             and not any_soundtrack_processor and audio_source is None and not (replace_voice_method and replace_voice_sample is not None)
-                                             and not return_flashvsr_continue_cache) else None
+                # A continued video with nothing before this window (no Source Video, first window) would only encode it to a work file:
+                # the background saver encodes it to the same place instead, so the continued video stays untouched
+                background_save = bool(server_config.get("background_save", 0)) and background_saves.accepting()
+                background_blockers = background_save_blockers(video_file=video_file, not_video=audio_only or mesh_outputs or world_only or is_image, hdr=sample_is_hdr,
+                                                               continued_video=continued_video, windows=total_windows if sliding_window else 1,
+                                                               audio_tracks=len(control_audio_tracks) + len(source_audio_tracks),
+                                                               audio_processing=any_soundtrack_processor or audio_source is not None or bool(replace_voice_method and replace_voice_sample is not None),
+                                                               flashvsr_continue=return_flashvsr_continue_cache) if background_save else []
+                if background_blockers:
+                    print(f"[Background save] {file_name} is saved before the next task starts: {', '.join(background_blockers)}")
+                deferred_save_steps = [] if background_save and not background_blockers else None
                 def save_step(fn, *args, _deferred=deferred_save_steps, **kwargs):  # runs now, or later on the background saver with the arguments given now
                     if _deferred is None:
                         return fn(*args, **kwargs)
