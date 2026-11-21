@@ -66,9 +66,15 @@ if "shared.attention" not in sys.modules:
     def _sage_attention_mask(*_args, **_kw):
         raise NotImplementedError("Sage attention masks are not stubbed in plugins/chunk_streaming/tests/test_streaming.py")
 
+    # Imported by attention_kit since upstream v20: the attention kernel's launch waves on this GPU. None, as the real
+    # helper reports when it cannot probe, makes attention_kit keep its default grouping.
+    def _no_launch_waves(*_args, **_kw):
+        return None
+
     attn_mod.pay_attention = _sdpa_pay_attention
     attn_mod.sage_staged = _no_sage_staged
     attn_mod.sage_attention_mask = _sage_attention_mask
+    attn_mod.launch_waves = _no_launch_waves
     sys.modules["shared.attention"] = attn_mod
     shared_pkg.attention = attn_mod
 
