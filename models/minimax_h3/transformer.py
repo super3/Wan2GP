@@ -601,6 +601,12 @@ class MiniMaxH3Model(nn.Module):
                     prefix = wrapper + head
                     for key in [key for key in converted if key.startswith(prefix) and not key.startswith(prefix + "linear.")]:
                         converted[prefix + "linear." + key[len(prefix):]] = converted.pop(key)
+        if diffusers_format:  # pi-H3 adapters (diffusers names): replaced AdaLN and final-layer tensors become exact differences from the loaded weights
+            from .pi_h3 import convert_full_tensors as convert_pi_h3_tensors
+
+            count = convert_pi_h3_tensors(self, converted)
+            if count:
+                tqdm.write(f"MiniMax H3 LoRA: pi-H3 adapter, {count} replaced tensors applied as exact differences from the loaded weights")
         from .lora_affine import convert_adaln_loras
 
         if self.use_adaln_curves or self.endpoint_gate is not None:

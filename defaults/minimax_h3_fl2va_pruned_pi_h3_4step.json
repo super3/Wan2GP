@@ -1,0 +1,21 @@
+{
+    "model": {
+        "name": "MiniMax H3 FL2VA Pruned pi-H3 4-Step 20B",
+        "architecture": "minimax_h3_fl2va_pruned",
+        "description": "Generates synchronized video and stereo audio from text alone, a first frame, a last frame, or both, in 4 steps without guidance, with better structure and motion than the 2-step version. Lakonik's pi-H3 adapter (pi-Flow v2 distillation) of the Pruned model, downloaded from Lakonik/pi-H3 (MiniMax H3 Community License); the video is decoded by the selected VAE.",
+        "URLs": "minimax_h3_fl2va_pruned",
+        "loras": [
+            "https://huggingface.co/Lakonik/pi-H3/resolve/main/pi_h3_4step_adapter/diffusion_pytorch_model.safetensors|pi_h3_4step_adapter"
+        ],
+        "loras_multipliers": [
+            1
+        ],
+        "pi_h3": true
+    },
+    "num_inference_steps": 4,
+    "guidance_phases": 1,
+    "guidance_scale": 1,
+    "sample_solver": "euler",
+    "flow_shift": 12.0,
+    "prompt": "integrated_multimodal_description: [Shot 1] A five-second cinematic single take inside a rain-lashed glass observatory at midnight. A radio astronomer sits before an antique brass receiver while electric-blue constellations drift across a translucent star map behind her. The camera makes a slow push from medium shot to close-up as the receiver emits three precise tones. She leans toward its microphone, looks up with sudden hope, and says clearly (S1) <d>[English] If you can hear me, follow this signal.</d> While finishing the line, she presses the transmit key; one brilliant blue pulse races across the star map and lights her restrained smile. Her speech completes naturally within the shot with precise lip synchronization.\noverall_soundscape: Rain rattling across the observatory dome, a low electrical hum, three clean receiver tones, a brass switch clicking, the astronomer's synchronized voice, and a short stereo transmission pulse.\nnon_diegetic_music: One quiet bowed-glass chord rising beneath the transmission and fading at the end."
+}

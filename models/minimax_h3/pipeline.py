@@ -31,6 +31,7 @@ from .h3_image import (H3_IMAGE_MAX_IMAGES, H3_IMAGE_MODEL, H3_IMAGE_PICTURE_LAB
                        bound_short_edge, canvas_size, h3_image_head_plans, h3_image_sigmas)
 from .p_h3_image import p_h3_image_sigmas, reference_size, size_at_area
 from .hyperflow import HYPERFLOW_STEPS, HYPERFLOW_VIDEO_SHIFT, checkpoint_lora_offsets, grid_tail_sigmas, video_sigmas as hyperflow_video_sigmas
+from .pi_h3 import check_settings as pi_h3_check_settings, selected_adapter as pi_h3_selected_adapter, video_sigmas as pi_h3_video_sigmas
 from .pdd import pdd_sampling_plans, pdd_sampling_plans_for_sigmas
 from .pika import PIKA_SOLVER, PIKA_STEPS, PIKA_VIDEO_SHIFT, noise as pika_noise, renoise_ as pika_renoise_, sigma_schedule as pika_sigma_schedule
 from .dmad import DMAD_AUDIO_SHIFT, DMAD_SOLVER, renoise_ as dmad_renoise_
@@ -889,12 +890,19 @@ class MiniMaxH3Pipeline:
         hyperflow_steps = HYPERFLOW_STEPS if hyperflow else (8,)
         if hyperflow_phase_1 and (int(sampling_steps) not in hyperflow_steps or custom_sigmas and custom_sigmas[0] is not None):
             raise ValueError(f"HyperFlow runs {' or '.join(map(str, hyperflow_steps))} steps on its own schedule, without phase-1 custom sigmas")
+        pi_h3 = pi_h3_selected_adapter(loras_selected, loras_slists, int(sampling_steps))  # pi-H3: its adapter sets the schedule
+        if getattr(self, "pi_h3", False) and not pi_h3:
+            raise ValueError("pi-H3 needs its adapter (pi_h3_2step_adapter or pi_h3_4step_adapter) selected at multiplier 1")
+        if pi_h3:
+            if hyperflow_phase_1 or hyperflow_phase_2 or regenerate_ic or self.reference_mode or self.image_model or self.remake_mode:
+                raise ValueError("pi-H3 adapters apply to MiniMax H3 FL2VA Pruned, without HyperFlow or Regenerate LoRAs")
+            pi_h3_check_settings(sampling_steps, sample_solver, shift, guide_phases, starting_sigma, self.transformer.cache, custom_sigmas)
         if self.h3_image and (int(guide_phases) > 1 or any(sigmas is not None for sigmas in custom_sigmas or ()) or starting_sigma is not None
                               or sample_solver != "euler" or self.transformer.cache is not None):
             raise ValueError("H3-Image samples one phase of 6 Euler steps on its own schedule, without custom sigmas or step skipping")
         phase_1_sigmas = (h3_image_sigmas(int(sampling_steps)) if self.h3_image else  # 6 steps: the grid of the output heads; others: the pDMD grid
                           custom_sigmas[0] if custom_sigmas and custom_sigmas[0] is not None else p_h3_image_sigmas(int(sampling_steps)) if self.image_model else VIGGLE_REMAKE_SIGMAS[self.remake_mode] if self.remake_mode
-                          else hyperflow_video_sigmas(sampling_steps) if hyperflow_phase_1 else None)
+                          else hyperflow_video_sigmas(sampling_steps) if hyperflow_phase_1 else pi_h3_video_sigmas(sampling_steps) if pi_h3 else None)
         phase_2_sigmas = (custom_sigmas[1] if custom_sigmas and len(custom_sigmas) > 1 and custom_sigmas[1] is not None
                           else grid_tail_sigmas(sampling_steps2) if hyperflow_phase_2 else None)  # HyperFlow phase 2: the last steps of its 8-step grid
         if phase_1_sigmas is not None:
