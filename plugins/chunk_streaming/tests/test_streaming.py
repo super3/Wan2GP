@@ -14,8 +14,11 @@ from __future__ import annotations
 
 import json
 import math
+import queue
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -257,6 +260,82 @@ def test_instrumented_decode_single_frame_decoder():
     assert expected.shape[2] == 1
     assert torch.equal(expected, got), "instrumented decode diverged from original"
     assert [(c["frame_start"], c["frame_end"]) for c in rec.chunks] == [(0, 1)]
+
+
+class _DeferredRamWriter:
+    """mmgp's `transfer.RamWriter` as it behaves with CUDA sources, on CPU: `write` returns at once, each piece lands later, in
+    order, on a helper thread, which then calls its done(); close() waits for what is pending."""
+
+    def __init__(self, *_args, **_kwargs):
+        self.pieces: queue.Queue = queue.Queue()
+        self.error = None
+        self.thread = threading.Thread(target=self._land, name="DeferredRamWriter", daemon=True)
+        self.thread.start()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        self.close()
+
+    def write(self, destination, source, done=None):
+        self.pieces.put((destination, source.clone(), done))
+
+    def _land(self):
+        while (piece := self.pieces.get()) is not None:
+            destination, source, done = piece
+            time.sleep(0.002)  # the GPU has not passed the piece yet: the decode loop runs ahead
+            try:
+                destination.copy_(source)
+                if done is not None:
+                    done()
+            except BaseException as error:  # noqa: BLE001 - reported by close(), as RamWriter does
+                self.error = error
+
+    def close(self):
+        self.pieces.put(None)
+        self.thread.join()
+        if self.error is not None:
+            raise self.error
+
+
+@pytest.mark.parametrize("deferred", [False, True])
+def test_instrumented_decode_reports_clips_once_their_rows_have_landed(monkeypatch, deferred):
+    """Spatial tiling decodes each clip by rows of tiles (`_decode_clip_rows`, here 3 rows) whose pixels RamWriter lands in the
+    CPU output later, from its own thread, on a GPU (`deferred`): a clip goes to the recorder only once all its rows are there."""
+    vae = _tiny_adapter_vae()
+    vae.tile_sample_min_height = vae.tile_sample_min_width = 64
+    vae.tile_sample_min_overlap_height = vae.tile_sample_min_overlap_width = 32
+    z = torch.randn(1, 4, 21, 8, 8)  # 4 clips
+    with torch.no_grad():
+        assert len(list(vae._decode_clip_rows(z[:, :, :7]))) == 3
+        expected = AutoencoderKLMiniMaxH3.decode(vae, z, False, "round")[0]
+    if deferred:
+        monkeypatch.setattr(streaming._va.transfer, "RamWriter", _DeferredRamWriter)
+    rec = streaming.activate(store_frames=True)
+    seen = []
+    on_chunk = rec.on_chunk
+
+    def checked_on_chunk(vae_, decoded, frame_start, frame_end, chunk_index):
+        landed = torch.equal(decoded[:, :, frame_start:frame_end], expected[:, :, frame_start:frame_end])
+        seen.append((threading.current_thread().name, landed))
+        on_chunk(vae_, decoded, frame_start, frame_end, chunk_index)
+
+    monkeypatch.setattr(rec, "on_chunk", checked_on_chunk)
+    try:
+        rec.reset()
+        with torch.no_grad():
+            got = AutoencoderKLMiniMaxH3.decode(vae, z, False, "round")[0]
+    finally:
+        streaming.deactivate()
+    assert torch.equal(expected, got), "instrumented decode diverged from original"
+    assert [c["chunk"] for c in rec.chunks] == [0, 1, 2, 3]
+    assert rec.chunks[0]["frame_start"] == 0 and rec.chunks[-1]["frame_end"] == expected.shape[2]
+    assert all(rec.chunks[k]["frame_start"] == rec.chunks[k - 1]["frame_end"] for k in range(1, len(rec.chunks)))
+    assert all(landed for _, landed in seen), "a clip was reported before all its rows landed"
+    assert torch.equal(torch.cat(rec.frames), expected[0].permute(1, 2, 3, 0))
+    if deferred:
+        assert any(name == "DeferredRamWriter" for name, _ in seen)
 
 
 def test_audio_first_video_decode_forwards_arguments(monkeypatch):
