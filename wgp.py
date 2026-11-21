@@ -9519,10 +9519,10 @@ def generate_media(
                                              and (not sliding_window or total_windows == 1) and len(control_audio_tracks) == 0 and len(source_audio_tracks) == 0
                                              and not any_soundtrack_processor and audio_source is None and not (replace_voice_method and replace_voice_sample is not None)
                                              and not return_flashvsr_continue_cache) else None
-                def save_step(fn, *args, **kwargs):  # runs now, or later on the background saver with the arguments given now
-                    if deferred_save_steps is None:
+                def save_step(fn, *args, _deferred=deferred_save_steps, **kwargs):  # runs now, or later on the background saver with the arguments given now
+                    if _deferred is None:
                         return fn(*args, **kwargs)
-                    deferred_save_steps.append(partial(fn, *args, **kwargs))
+                    _deferred.append(partial(fn, *args, **kwargs))
 
                 if not is_image and not background_save:
                     set_progress_status(saving_status)
