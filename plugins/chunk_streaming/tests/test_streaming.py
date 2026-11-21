@@ -604,3 +604,130 @@ def test_instrumented_decode_feeds_live_segmenter(tmp_path):
     for r in results:
         assert "error" not in r, r
         assert not r["has_audio"]  # no audio was set in this run
+
+
+# -- Sol-H3-VAE (VAE config sol_int8): MiniMaxH3VideoVAE's own whole-frame _decode ----------------------------------------
+
+_video_vae = importlib.import_module("models.minimax_h3.video_vae")
+_sol_mod = importlib.import_module("models.minimax_h3.components.sol_decoder")
+
+
+class _TinySolVAE(_video_vae.MiniMaxH3VideoVAE):
+    """The WanGP adapter class (its Sol `_decode`, `_prepare_decoded_chunk`) around a tiny H3 VAE whose decoder is a tiny
+    `MiniMaxH3SolDecoder3d` (sol=False keeps the tiny H3 decoder: the non-Sol route through the same class)."""
+
+    def __init__(self, sol: bool = True):
+        AutoencoderKLMiniMaxH3.__init__(self, latent_channels=4, block_out_channels=(8, 8, 8, 8, 8, 8), layers_per_block=1,
+                                        norm_num_groups=4, decoder_num_layers=1, decoder_num_attention_heads=1,
+                                        decoder_attention_head_dim=8, decoder_num_register_tokens=1, decoder_ffn_mult=1)
+        if sol:
+            self.decoder = _sol_mod.MiniMaxH3SolDecoder3d(in_channels=4, out_channels=3, patch_size=2, patch_size_t=4, num_layers=2,
+                                                          num_attention_heads=2, attention_head_dim=8, num_register_tokens=1, ffn_mult=1)
+        self.upsampling = False
+        self.register_buffer("pixel_mean", torch.tensor(_video_vae.IMAGENET_MEAN).view(1, 3, 1, 1, 1), persistent=False)
+        self.register_buffer("pixel_std", torch.tensor(_video_vae.IMAGENET_STD).view(1, 3, 1, 1, 1), persistent=False)
+        self._interrupt = False
+
+
+@pytest.fixture
+def sol_cpu(monkeypatch):
+    """CPU stand-ins for the Sol decoder's GPU-only sizing, the same for the upstream and the instrumented decode: one FFN chunk
+    (kernels.mlp asks CUDA for the L2 size), and bands of 2 latent rows so each latent frame is emitted in several bands."""
+    ops = importlib.import_module("shared.kernels.ops")
+    monkeypatch.setattr(ops, "mlp_chunk_rows", lambda tokens, *_a, **_k: tokens)
+    monkeypatch.setattr(_sol_mod, "EMIT_BYTES", 2 * 10 * _sol_mod.EMIT_TOKEN_BYTES)  # W = 10 latent columns below
+    torch.manual_seed(0)
+    return _TinySolVAE().eval()
+
+
+def _sol_decode(vae, z, uint8_rounding=None):
+    with torch.no_grad():
+        return _video_vae.MiniMaxH3VideoVAE._decode(vae, z, uint8_rounding)
+
+
+@pytest.mark.parametrize("latents,uint8_rounding", [(7, "round"), (12, None), (22, "truncate"), (37, "round")])
+def test_sol_decode_bit_identical_and_reports_each_block(sol_cpu, latents, uint8_rounding):
+    """37 latents are a 124-frame clip, as WanGP's 5 s generations: 7 blocks of 17 frames, then 5."""
+    z = torch.randn(1, 4, latents, 6, 10)
+    expected = _sol_decode(sol_cpu, z, uint8_rounding)
+    rec = streaming.activate(store_frames=True)
+    try:
+        rec.reset()
+        got = _sol_decode(sol_cpu, z, uint8_rounding)
+    finally:
+        streaming.deactivate()
+    assert torch.equal(expected, got), "instrumented Sol decode diverged from upstream's"
+    frames = sol_cpu.decoder.output_frames(latents)
+    assert expected.shape[2] == frames
+    blocks = -(-latents // _sol_mod.BLOCK)
+    assert [(c["frame_start"], c["frame_end"]) for c in rec.chunks] == [(17 * b, min(17 * (b + 1), frames)) for b in range(blocks)]
+    assert [c["chunk"] for c in rec.chunks] == list(range(blocks))
+    reference = expected if uint8_rounding else expected.clamp(-1.0, 1.0).add(1.0).mul(127.5).round().to(torch.uint8)
+    assert torch.equal(torch.cat(rec.frames), reference[0].permute(1, 2, 3, 0))
+
+
+@pytest.mark.parametrize("deferred", [False, True])
+def test_sol_decode_reports_blocks_once_they_have_landed(sol_cpu, monkeypatch, deferred):
+    """On a GPU RamWriter lands each band later, from its own thread (`deferred`): a block goes to the recorder only once every
+    band written before its report is in the CPU output."""
+    z = torch.randn(1, 4, 22, 6, 10)
+    expected = _sol_decode(sol_cpu, z, "round")
+    if deferred:
+        monkeypatch.setattr(streaming._va.transfer, "RamWriter", _DeferredRamWriter)
+    rec = streaming.activate(store_frames=True)
+    seen = []
+    on_chunk = rec.on_chunk
+
+    def checked_on_chunk(vae_, decoded, frame_start, frame_end, chunk_index):
+        seen.append((threading.current_thread().name, torch.equal(decoded[:, :, :frame_end], expected[:, :, :frame_end])))
+        on_chunk(vae_, decoded, frame_start, frame_end, chunk_index)
+
+    monkeypatch.setattr(rec, "on_chunk", checked_on_chunk)
+    try:
+        rec.reset()
+        got = _sol_decode(sol_cpu, z, "round")
+    finally:
+        streaming.deactivate()
+    assert torch.equal(expected, got)
+    assert len(seen) == 5 and all(landed for _, landed in seen), "a block was reported before its bands landed"
+    if deferred:
+        assert any(name == "DeferredRamWriter" for name, _ in seen)
+
+
+def test_sol_decode_picture(sol_cpu):
+    """One latent: five copies, its first frame kept, one blocking copy; one report."""
+    z = torch.randn(1, 4, 1, 6, 10)
+    expected = _sol_decode(sol_cpu, z, "round")
+    rec = streaming.activate(store_frames=True)
+    try:
+        rec.reset()
+        got = _sol_decode(sol_cpu, z, "round")
+    finally:
+        streaming.deactivate()
+    assert torch.equal(expected, got) and expected.shape[2] == 1
+    assert [(c["frame_start"], c["frame_end"]) for c in rec.chunks] == [(0, 1)]
+
+
+def test_adapter_class_without_sol_decoder_streams_through_the_h3_path():
+    """MiniMaxH3VideoVAE._decode hands any other decoder to AutoencoderKLMiniMaxH3._decode: the instrumented H3 path, once."""
+    torch.manual_seed(0)
+    vae = _TinySolVAE(sol=False).eval()
+    z = torch.randn(1, 4, 12, 8, 8)
+    expected = _sol_decode(vae, z, "round")
+    rec = streaming.activate(store_frames=True)
+    try:
+        rec.reset()
+        got = _sol_decode(vae, z, "round")
+    finally:
+        streaming.deactivate()
+    assert torch.equal(expected, got)
+    assert len(rec.chunks) > 1 and rec.chunks[-1]["frame_end"] == expected.shape[2]
+    assert rec.decode_start_t is not None
+
+
+def test_deactivate_restores_the_sol_decode():
+    original = _video_vae.MiniMaxH3VideoVAE.__dict__["_decode"]
+    streaming.activate()
+    assert _video_vae.MiniMaxH3VideoVAE.__dict__["_decode"] is not original
+    streaming.deactivate()
+    assert _video_vae.MiniMaxH3VideoVAE.__dict__["_decode"] is original
