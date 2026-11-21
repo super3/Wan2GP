@@ -53,9 +53,12 @@ class StreamRecorder:
     """Collects chunk/audio events from one instrumented generation."""
 
     def __init__(self, store_frames: bool = True, live_dir: str | None = None,
-                 audio_first: bool = False, fps: int = 24, sample_rate: int = 32000):
+                 audio_first: bool = False, fps: int = 24, sample_rate: int = 32000,
+                 segment_video_args: list[str] | None = None):
         self.store_frames = store_frames
         self.live_dir = live_dir
+        #: ffmpeg video encoder arguments of the live segments (None: x264 veryfast CRF 18, a preview)
+        self.segment_video_args = segment_video_args
         self.audio_first = audio_first
         self.fps = fps
         self.sample_rate = sample_rate
@@ -88,7 +91,7 @@ class StreamRecorder:
             self.generation_index += 1
             self.live = LiveSegmenter(
                 Path(self.live_dir) / f"gen_{self.generation_index:03d}",
-                fps=self.fps, sample_rate=self.sample_rate)
+                fps=self.fps, sample_rate=self.sample_rate, video_args=self.segment_video_args)
             if self.audio_out is not None:
                 self.live.set_audio(self.audio_out)
 
@@ -354,25 +357,29 @@ def _instrumented_decode(self, z: torch.Tensor, uint8_rounding: str | None = Non
 
 
 def activate(store_frames: bool = True, live_dir: str | None = None,
-             audio_first: bool = False) -> StreamRecorder:
+             audio_first: bool = False, segment_video_args: list[str] | None = None) -> StreamRecorder:
     """Install the instrumented decode paths; returns the shared recorder.
 
     `live_dir` turns on the live segmenter: every finalized chunk is muxed to
     a standalone fMP4 segment in a background thread as it lands, under
     `live_dir/gen_NNN/`. `audio_first` additionally decodes the audio before
     the video decode starts (see `_maybe_prefetch_audio`), so live segments
-    carry their audio slice from the first chunk onward.
+    carry their audio slice from the first chunk onward. `segment_video_args`
+    sets the segments' video encoder (see `mux_segment`); `stitch.install`
+    uses the output codec's, so the saved video can be joined from them.
     """
     if _STATE["active"]:
         rec = _STATE["recorder"]
         rec.store_frames = store_frames
         rec.live_dir = live_dir
         rec.audio_first = audio_first
+        rec.segment_video_args = segment_video_args
         return rec
     from models.minimax_h3 import audio_vae as _audio_mod
     from models.minimax_h3 import video_vae as _video_mod
 
-    rec = StreamRecorder(store_frames=store_frames, live_dir=live_dir, audio_first=audio_first)
+    rec = StreamRecorder(store_frames=store_frames, live_dir=live_dir, audio_first=audio_first,
+                         segment_video_args=segment_video_args)
     _STATE["recorder"] = rec
     _STATE["orig_decode"] = _va.AutoencoderKLMiniMaxH3._decode
     _va.AutoencoderKLMiniMaxH3._decode = _instrumented_decode
@@ -442,10 +449,12 @@ class LiveSegmenter:
     and returns the per-segment records.
     """
 
-    def __init__(self, out_dir: str | Path, fps: int = 24, sample_rate: int = 32000):
+    def __init__(self, out_dir: str | Path, fps: int = 24, sample_rate: int = 32000,
+                 video_args: list[str] | None = None):
         self.out_dir = Path(out_dir)
         self.out_dir.mkdir(parents=True, exist_ok=True)
         self.fps = fps
+        self.video_args = video_args
         self.sample_rate = sample_rate
         self.audio: torch.Tensor | None = None
         self.results: list[dict] = []
@@ -485,7 +494,7 @@ class LiveSegmenter:
                         wav = str(seg_path.with_suffix(".wav"))
                         write_wav(wav, self.audio[:, s0:s1], self.sample_rate)
                         record["has_audio"] = True
-                record["mux_s"] = round(mux_segment(frames, wav, seg_path, fps=self.fps), 4)
+                record["mux_s"] = round(mux_segment(frames, wav, seg_path, fps=self.fps, video_args=self.video_args), 4)
                 if wav:
                     Path(wav).unlink(missing_ok=True)
                 record["path"] = str(seg_path)
@@ -525,11 +534,17 @@ def write_wav(path: str | Path, samples, sample_rate: int) -> None:
         w.writeframes(pcm.tobytes())
 
 
-def mux_segment(frames_u8: torch.Tensor, audio_wav: str | None, out_path: str | Path, fps: int = 24) -> float:
+PREVIEW_SEGMENT_VIDEO_ARGS = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p"]
+
+
+def mux_segment(frames_u8: torch.Tensor, audio_wav: str | None, out_path: str | Path, fps: int = 24,
+                video_args: list[str] | None = None) -> float:
     """Encode one finished chunk as a standalone fragmented MP4 segment.
 
-    `frames_u8` is (frames, H, W, 3) uint8. Returns the encode wall seconds,
-    which is the per-segment cost a streaming worker pays off the GPU path.
+    `frames_u8` is (frames, H, W, 3) uint8. `video_args` are the ffmpeg video
+    encoder arguments (default: x264 veryfast CRF 18, a preview). Returns the
+    encode wall seconds, which is the per-segment cost a streaming worker pays
+    off the GPU path.
     """
     frames_u8 = frames_u8.contiguous()
     n, height, width, _ = frames_u8.shape
@@ -539,7 +554,7 @@ def mux_segment(frames_u8: torch.Tensor, audio_wav: str | None, out_path: str | 
         # No -shortest: AAC frames quantize to 1024 samples, so the audio can
         # land a few ms short of the video and -shortest would drop a frame.
         cmd += ["-i", audio_wav, "-c:a", "aac", "-b:a", "128k"]
-    cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p",
+    cmd += [*(video_args or PREVIEW_SEGMENT_VIDEO_ARGS),
             "-movflags", "+frag_keyframe+empty_moov+default_base_moof", str(out_path)]
     started = time.monotonic()
     proc = subprocess.run(cmd, input=frames_u8.numpy().tobytes(), capture_output=True)
