@@ -105,4 +105,16 @@ class BackgroundSaver:
                     print(f"[Background save] {label}: {error!r}")
 
 
+def background_save_blockers(*, video_file, not_video, hdr, continued_video, windows, audio_tracks, audio_processing, flashvsr_continue) -> list[str]:
+    """Why a generated output must be saved before the next task starts (empty: it may be saved in the background). The background
+    path saves a plain generated video: frames encoded with WanGP's codec, then muxed with the generated sound. `continued_video` is
+    the generation's video_continuation.ContinuedVideo or None: a fresh one (no Source Video, nothing written yet) would only encode
+    this window to a work file, which the background saver does itself."""
+    reasons = [(video_file is not None, "the model wrote the video itself"), (not_video, "not a video"), (hdr, "HDR"),
+               (continued_video is not None and (continued_video.video_source is not None or continued_video.file is not None), "it continues a video"),
+               (windows != 1, "several windows"), (audio_tracks > 0, "source or control audio"), (audio_processing, "soundtrack or voice processing"),
+               (flashvsr_continue, "FlashVSR continuation")]
+    return [reason for blocked, reason in reasons if blocked]
+
+
 background_saves = BackgroundSaver()

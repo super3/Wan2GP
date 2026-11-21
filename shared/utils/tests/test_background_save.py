@@ -10,7 +10,7 @@ import types
 
 import pytest
 
-from shared.utils.background_save import BackgroundSaver, background_saves
+from shared.utils.background_save import BackgroundSaver, background_save_blockers, background_saves
 
 
 def test_saves_run_in_order_after_submit_returns():
@@ -76,6 +76,47 @@ def test_placeholder_removal_keeps_written_files(tmp_path):
     BackgroundSaver.remove_placeholder(str(written))
     BackgroundSaver.remove_placeholder(str(tmp_path / "missing.mp4"))
     assert not empty.exists() and written.exists()
+
+
+PLAIN = dict(video_file=None, not_video=False, hdr=False, continued_video=None, windows=1, audio_tracks=0, audio_processing=False, flashvsr_continue=False)
+
+
+def continued_video_class(monkeypatch):
+    """shared.utils.video_continuation's ContinuedVideo, its media helpers stubbed (they pull in torchvision, imageio...): only its
+    constructor and attributes are used here."""
+    import importlib.util
+    import sys
+    from pathlib import Path
+
+    stub = types.ModuleType("shared.utils.audio_video")
+    stub.__getattr__ = lambda name: (lambda *args, **kwargs: None)
+    monkeypatch.setitem(sys.modules, "shared.utils.audio_video", stub)
+    path = Path(__file__).resolve().parents[1] / "video_continuation.py"
+    spec = importlib.util.spec_from_file_location("shared.utils.video_continuation_under_test", path)  # not registered: the real module stays
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.ContinuedVideo
+
+
+def test_a_plain_generated_video_may_be_saved_in_the_background(tmp_path, monkeypatch):
+    ContinuedVideo = continued_video_class(monkeypatch)
+
+    assert background_save_blockers(**PLAIN) == []
+    # WanGP v20 gathers every plain video in a ContinuedVideo, even with one window: a fresh one does not block (on the first GPU run
+    # this case was refused, so no file was ever saved in the background)
+    fresh = ContinuedVideo(None, 0, 24, None, lambda frames, path: path, str(tmp_path), "mp4", [])
+    assert background_save_blockers(**dict(PLAIN, continued_video=fresh)) == []
+    fresh.file = str(tmp_path / "window1.mp4")  # a later window follows the video made so far: saved now
+    assert background_save_blockers(**dict(PLAIN, continued_video=fresh)) == ["it continues a video"]
+    source = ContinuedVideo(str(tmp_path / "source.mp4"), 48, 24, None, lambda frames, path: path, str(tmp_path), "mp4", [])
+    assert background_save_blockers(**dict(PLAIN, continued_video=source)) == ["it continues a video"]
+
+
+@pytest.mark.parametrize("change, reason", [({"video_file": "made.mp4"}, "the model wrote the video itself"), ({"not_video": True}, "not a video"),
+                                            ({"hdr": True}, "HDR"), ({"windows": 2}, "several windows"), ({"audio_tracks": 1}, "source or control audio"),
+                                            ({"audio_processing": True}, "soundtrack or voice processing"), ({"flashvsr_continue": True}, "FlashVSR continuation")])
+def test_anything_else_is_saved_before_the_next_task(change, reason):
+    assert background_save_blockers(**dict(PLAIN, **change)) == [reason]
 
 
 class FakeWgp:
