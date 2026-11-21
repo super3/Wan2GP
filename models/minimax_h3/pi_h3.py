@@ -116,7 +116,7 @@ def convert_full_tensors(model, state_dict):
     official = _load_affine_package("fl2va", len(ADALN_SIGNS))[0]
     if not torch.allclose(model.adaln_t_table.detach().float().cpu(), official, rtol=0, atol=1e-6):
         raise ValueError("pi-H3 adapters need the official MiniMax H3 FL2VA Pruned checkpoint: this one has another AdaLN table")
-    signs = torch.tensor(ADALN_SIGNS, dtype=torch.float32)
+    signs = torch.tensor(ADALN_SIGNS, dtype=torch.float32, device="cpu")  # explicit: mmgp leaves CUDA as the default device after a load
     modules = dict(model.named_modules())
 
     def current(module_name, name):

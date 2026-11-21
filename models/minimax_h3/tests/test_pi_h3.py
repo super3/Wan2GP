@@ -184,6 +184,18 @@ def test_conversion_is_exact():
     torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-4)
 
 
+def test_conversion_ignores_the_default_device():
+    """mmgp leaves torch's default device on CUDA after loading a model, and the first LoRA load runs then: every tensor the
+    conversion creates must name its device. A meta default makes any tensor without one fail here, on CPU."""
+    model, adapter = FakeH3(), _adapter()
+    reference = dict(adapter)
+    with torch.device("meta"):
+        count = pi_h3.convert_full_tensors(model, adapter)
+    assert count == 8 and all(value.device.type == "cpu" for value in adapter.values())
+    torch.testing.assert_close(_apply(model, adapter)["blocks.0.adaln_proj.linear.weight"],
+                               reference["blocks.0.adaln_proj.linear.weight"].float() * torch.tensor(pi_h3.ADALN_SIGNS))
+
+
 def test_signs_turn_the_diffusers_coordinates_into_wangp_ones():
     """A block reading the diffusers port's coordinates c (c = WanGP's coordinates times the signs, as their tables are) with the
     adapter's weights computes what WanGP computes with the converted weights."""
