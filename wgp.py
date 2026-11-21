@@ -4648,6 +4648,10 @@ def load_models(model_type, override_profile = -1, output_type="video", config_i
             kwargs = pipe
             pipe = kwargs.pop("pipe")
         if "coTenantsMap" not in kwargs: kwargs["coTenantsMap"] = {}
+        if server_config.get("keep_model_loaded", 0):  # the transformers stay in VRAM while the model's other parts (VAEs, encoders) run, as
+            for name in ("transformer", "transformer2"):  # mmgp otherwise unloads them for each of those and loads them back for the next clip
+                if name in pipe:
+                    kwargs["coTenantsMap"].setdefault(name, "*")
         if preview_decoder is not None:
             pipe["tiny_vae"] = preview_decoder
             kwargs["coTenantsMap"]["tiny_vae"] = "*"
