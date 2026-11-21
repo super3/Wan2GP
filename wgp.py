@@ -88,6 +88,7 @@ from shared.utils.utils import convert_tensor_to_image, convert_video_tensor_to_
 from shared.utils.utils import calculate_new_dimensions, get_outpainting_dims, get_outpainting_frame_location, get_outpainting_full_area_dimensions, resolve_outpainting_dims
 from shared.utils.utils import has_video_file_extension, has_image_file_extension, has_audio_file_extension, has_mesh_file_extension, has_world_file_extension, has_app_file_extension, MESH_IMPORT_EXTENSIONS, guide_to_float, guide_mask_to_float
 from shared.utils.kept_loras import kept_lora_signature, reuse_kept_loras
+from shared.utils.background_save import background_saves
 from shared.utils.audio_video import extract_audio_tracks, subtitle_stream_count, combine_video_with_audio_tracks, combine_and_concatenate_video_with_audio_tracks, cleanup_temp_audio_files, normalize_audio_volumes_to_temp_files, save_video, save_hdr_video, save_image, get_image_format, get_media_duration_and_audio_layouts
 from shared.utils.audio_video import append_sliding_window_audio, audio_overlap_repair_seconds, source_audio_repair_ms, read_image_metadata, extract_audio_track_to_wav, write_wav_file, save_audio_file, get_audio_codec_extension, create_silent_wav_file
 from shared.utils.audio_video import truncate_audio, shift_audio_trim_ranges, trim_audio_ranges, trim_audio_file_ranges, slice_audio_window, resolve_mux_audio_sampling_rate
@@ -7604,6 +7605,32 @@ def record_file_metadata(video_path, configs, is_image, audio_only, gen, embedde
     if record_notification:
         notifications.record_generation(server_config, gen, video_path, configs, replace_last=replaced_file is not None, notify=notify_generation)
 
+def publish_saved_media(gen, send_cmd, video_path, configs, is_image, audio_only_file, embedded_images=None, replaced_file=None, notify_generation=True, output_role="final", side_files=None, api_return_side_files=False, store_artifact=False, artifact=None):
+    """What follows the writing of a generated file: its metadata and gallery entry, its side files, the API artifact (`artifact`:
+    store_api_output_artifact's other arguments, stored when `store_artifact` or when side files are returned), the notification
+    sound and the "output" event. Run by generate_media once the file is written, or by the background saver (background_save)."""
+    record_file_metadata(video_path, configs, is_image, audio_only_file, gen, embedded_images=embedded_images, replaced_file=replaced_file, notify_generation=notify_generation, output_role=output_role)
+    main_path = video_path[0] if isinstance(video_path, list) else video_path
+    output_side_files = process_side_files(main_path, side_files, return_files=api_return_side_files)
+    for side_name in output_side_files:  # a saved world file joins the Worlds gallery
+        side_path = os.path.join(os.path.dirname(main_path), side_name)
+        if has_world_file_extension(side_name) and os.path.isfile(side_path):
+            record_file_metadata(side_path, configs, False, False, gen, notify_generation=False, record_notification=False)
+    if store_artifact or (api_return_side_files and output_side_files):
+        store_api_output_artifact(gen, artifact["client_id"], video_path, artifact["media_type"], artifact["video"], artifact["audio"], artifact["audio_sampling_rate"], artifact["fps"], hdr=artifact["hdr"], flashvsr_continue_cache=artifact["flashvsr_continue_cache"], side_files=output_side_files if api_return_side_files else None)
+    # Play notification sound for single video
+    try:
+        if server_config.get("notification_sound_enabled", 0):
+            volume = server_config.get("notification_sound_volume", 50)
+            notification_sound.notify_video_completion(
+                video_path=video_path,
+                volume=volume
+            )
+    except Exception as e:
+        print(f"Error playing notification sound for individual video: {e}")
+
+    send_cmd("output")
+
 
 @workspace_storage.workspace_generation(headless=lambda state: workspace_storage.HeadlessWorkspaceHost(state, args.workspaces_dir or server_config.get('workspaces_dir') or os.path.join(wgp_root, 'workspaces'), lambda path: get_settings_from_file(state, path, False, False, False)[0], output_override=bool(args.output_dir)))
 @generation_downloads(get_gen_info, lambda: offloadobj)
@@ -9484,6 +9511,18 @@ def generate_media(
                     saver.wait()
                 write_output = None  # what the save thread writes before recording the output
                 saving_status = f"Saving File {file_name if len(file_name) <= 50 else file_name[:12] + '...' + file_name[-35:]}"
+                # server_config "background_save": a plain generated video (no source or control audio, continuation, HDR, soundtrack or
+                # voice processing, one window) is encoded, muxed and published by the background saver, so the next queued task starts
+                # at once; only inside a caller's background_saves.scope(), which waits for it (shared/utils/background_save.py)
+                deferred_save_steps = [] if (server_config.get("background_save", 0) and background_saves.accepting() and video_file is None
+                                             and not (audio_only or mesh_outputs or world_only or is_image) and continued_video is None and not sample_is_hdr
+                                             and (not sliding_window or total_windows == 1) and len(control_audio_tracks) == 0 and len(source_audio_tracks) == 0
+                                             and not any_soundtrack_processor and audio_source is None and not (replace_voice_method and replace_voice_sample is not None)
+                                             and not return_flashvsr_continue_cache) else None
+                def save_step(fn, *args, **kwargs):  # runs now, or later on the background saver with the arguments given now
+                    if deferred_save_steps is None:
+                        return fn(*args, **kwargs)
+                    deferred_save_steps.append(partial(fn, *args, **kwargs))
 
                 if not is_image and not background_save:
                     set_progress_status(saving_status)
@@ -9827,6 +9866,9 @@ def _process_tasks(state):
     def queue_worker_func():
         nonlocal gpu_acquired
         gen["prompt_no"] = 0
+        # background_save: a task's file may still be written while the next task runs; the queue ends once every file is
+        save_scope = background_saves.scope(report=lambda label, error: send_cmd("error", f"Saving {label} failed: {error}"))
+        save_scope.__enter__()
         try:
             while len(queue) > 0 and not quitting_app:
                 paused_for_edit = False
@@ -9915,6 +9957,7 @@ def _process_tasks(state):
             notification_run.fail(str(e))
             send_cmd("error", f"Queue worker crashed: {e}")
         finally:
+            save_scope.__exit__(None, None, None)  # waits for the files still being written
             with lock:
                 gen.pop("api_active_queue_task", None)
             send_cmd("worker_exit", None)
