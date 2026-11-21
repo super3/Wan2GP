@@ -36,12 +36,31 @@ def segment_video_args(codec_key: str | None, container: str | None = "mp4") -> 
     return get_video_encode_args(codec_key, container)
 
 
+def _chunk_frames(chunk) -> torch.Tensor | None:
+    """A chunk of a list given to save_video as uint8 (frames, H, W, 3), read the way save_video reads it, or None."""
+    if not torch.is_tensor(chunk) or chunk.dtype != torch.uint8 or chunk.ndim != 4:
+        return None
+    frames = chunk if chunk.shape[-1] in (1, 3, 4) else chunk.permute(1, 2, 3, 0)  # (F, H, W, C) as is, (C, F, H, W) permuted
+    return frames if frames.shape[-1] == 3 else None
+
+
 def _frame(video, index: int) -> torch.Tensor | None:
-    """Frame `index` of a video given to save_video as uint8 (H, W, 3), or None when it is not uint8 frames."""
+    """Frame `index` of a video given to save_video as uint8 (H, W, 3), or None when it is not uint8 RGB frames. save_video takes a
+    (1, 3, F, H, W) tensor, a list of chunks ((C, F, H, W) or (F, H, W, C) tensors: the windows of a generation), or FrameChunks."""
     if torch.is_tensor(video):
         if video.dtype != torch.uint8 or video.ndim != 5 or video.shape[0] != 1 or video.shape[1] != 3:
             return None
         return video[0, :, index].permute(1, 2, 0)
+    if isinstance(video, (list, tuple)):
+        position = 0
+        for chunk in video:
+            frames = _chunk_frames(chunk)
+            if frames is None:
+                return None
+            if index < position + frames.shape[0]:
+                return frames[index - position]
+            position += frames.shape[0]
+        return None
     read = getattr(video, "read", None)
     if read is not None and hasattr(video, "frames_count"):
         frames = read(index, 1)
@@ -53,6 +72,9 @@ def _frame(video, index: int) -> torch.Tensor | None:
 def _frame_count(video) -> int | None:
     if torch.is_tensor(video) and video.ndim == 5:
         return int(video.shape[2])
+    if isinstance(video, (list, tuple)):
+        chunks = [_chunk_frames(chunk) for chunk in video]
+        return None if not chunks or any(frames is None for frames in chunks) else sum(int(frames.shape[0]) for frames in chunks)
     return int(video.frames_count) if hasattr(video, "frames_count") else None
 
 
@@ -62,8 +84,10 @@ def covering_segments(rec, video, fps) -> tuple[list[str] | None, str]:
         return None, "no live segments"
     results = sorted(rec.live.close(), key=lambda record: record["segment"])  # waits for the last segments
     frames = _frame_count(video)
-    if frames is None or not results:
-        return None, "nothing to compare"
+    if frames is None:
+        return None, "the video is not uint8 RGB frames"
+    if not results:
+        return None, "no segments"
     if round(float(fps), 6) != round(float(rec.fps), 6):
         return None, f"saved at {fps} fps, segments at {rec.fps}"
     position = 0
