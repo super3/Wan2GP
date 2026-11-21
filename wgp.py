@@ -87,7 +87,7 @@ from shared.utils.loras_mutipliers import preparse_loras_multipliers, parse_lora
 from shared.utils.utils import convert_tensor_to_image, convert_video_tensor_to_uint8_chunked, save_image, get_video_info, get_video_real_fps, get_file_creation_date, convert_image_to_video, calculate_new_dimensions, convert_image_to_tensor, calculate_dimensions_and_resize_image, rescale_and_crop, get_video_frame, resize_and_remove_background, rgb_bw_to_rgba_mask, image_editor_layer_to_rgb_mask, to_rgb_tensor, get_resampled_video_transparent, get_video_summary_extras
 from shared.utils.utils import calculate_new_dimensions, get_outpainting_dims, get_outpainting_frame_location, get_outpainting_full_area_dimensions, resolve_outpainting_dims
 from shared.utils.utils import has_video_file_extension, has_image_file_extension, has_audio_file_extension, has_mesh_file_extension, has_world_file_extension, has_app_file_extension, MESH_IMPORT_EXTENSIONS, guide_to_float, guide_mask_to_float
-from shared.utils.kept_loras import kept_lora_signature, reuse_kept_loras
+from shared.utils.kept_loras import kept_lora_signature, models_stay_loaded, reuse_kept_loras
 from shared.utils.background_save import background_save_blockers, background_saves
 from shared.utils.audio_video import extract_audio_tracks, subtitle_stream_count, combine_video_with_audio_tracks, combine_and_concatenate_video_with_audio_tracks, cleanup_temp_audio_files, normalize_audio_volumes_to_temp_files, save_video, save_hdr_video, save_image, get_image_format, get_media_duration_and_audio_layouts
 from shared.utils.audio_video import append_sliding_window_audio, audio_overlap_repair_seconds, source_audio_repair_ms, read_image_metadata, extract_audio_track_to_wav, write_wav_file, save_audio_file, get_audio_codec_extension, create_silent_wav_file
@@ -7605,6 +7605,8 @@ def record_file_metadata(video_path, configs, is_image, audio_only, gen, embedde
     if record_notification:
         notifications.record_generation(server_config, gen, video_path, configs, replace_last=replaced_file is not None, notify=notify_generation)
 
+kept_models = {"model_type": None}  # server_config "keep_model_loaded": the model type whose models the last task left in VRAM for the next
+
 def publish_saved_media(gen, send_cmd, video_path, configs, is_image, audio_only_file, embedded_images=None, replaced_file=None, notify_generation=True, output_role="final", side_files=None, api_return_side_files=False, store_artifact=False, artifact=None):
     """What follows the writing of a generated file: its metadata and gallery entry, its side files, the API artifact (`artifact`:
     store_api_output_artifact's other arguments, stored when `store_artifact` or when side files are returned), the notification
@@ -8026,6 +8028,8 @@ def generate_media(
         trans_lora, trans2_lora = trans, trans2
 
     keep_loras = bool(server_config.get("keep_loras_loaded", 0))
+    models_were_kept = kept_models["model_type"] == model_type  # left in VRAM by the last task (keep_model_loaded)
+    kept_models["model_type"] = None
     if len(loras_selected) == 0 and keep_loras and getattr(trans_lora, "_loras_adapters", None):  # kept from the last task: none now
         offload.unload_loras_from_model(trans_lora)
         if trans2_lora is not None:
@@ -8078,7 +8082,7 @@ def generate_media(
             raise gr.Error("Error while loading Loras: " + ", ".join(error_files))
         if trans2_lora is not None: 
             offload.sync_models_loras(trans_lora, trans2_lora)
-        if model_def.get("no_model_swap", False):  # blocks kept in VRAM by the previous task (only the LoRAs changed): their GPU copies
+        if model_def.get("no_model_swap", False) or models_were_kept:  # blocks kept in VRAM by the previous task (only the LoRAs changed): their GPU copies
             for lora_model in (trans_lora, trans2_lora):
                 if lora_model is not None:
                     offloadobj.refresh_loras(lora_model)
@@ -8387,8 +8391,9 @@ def generate_media(
     os.makedirs(save_path, exist_ok=True)
     os.makedirs(image_save_path, exist_ok=True)
     os.makedirs(audio_save_path, exist_ok=True)
-    gc.collect()
-    torch.cuda.empty_cache()
+    if not models_were_kept:  # models left in VRAM for this task (keep_model_loaded): nothing to free
+        gc.collect()
+        torch.cuda.empty_cache()
     wan_model._interrupt = False
     abort = False
     if gen.get("abort", False):
@@ -9252,12 +9257,18 @@ def generate_media(
                     samples = samples.to("cpu") # a video stays where it was decoded until it is converted to uint8 below, the RAM only gets the uint8 frames
   
             clear_gen_cache()
+            # server_config "keep_model_loaded": the models stay in VRAM when this model runs again right after (another window or sample of
+            # this task, or the next queued task of the same model): no unload, no reload of their blocks, no full garbage collection
+            keep_models = models_stay_loaded(server_config.get("keep_model_loaded", 0), gen.get("abort", False), window_no < total_windows,
+                                             repeat_no < total_generation, queued_model_type_after(gen, task), model_type)
+            kept_models["model_type"] = model_type if keep_models else None
             # a model whose generation never swaps models stays loaded (parked: other models and programs reclaim its VRAM as they need it)
             # for the next sample of this task, or for the next queued task of the same model (decided at the end of the task)
-            if not (model_def.get("no_model_swap", False) and offloadobj.park()):
+            if not keep_models and not (model_def.get("no_model_swap", False) and offloadobj.park()):
                 offloadobj.unload_all()
-            gc.collect()
-            torch.cuda.empty_cache()
+            if not keep_models:
+                gc.collect()
+                torch.cuda.empty_cache()
             ram_debug_mark("output processing")
 
             if samples == None:

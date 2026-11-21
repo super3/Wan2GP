@@ -104,3 +104,16 @@ def test_unloaded_or_failed_loras_are_not_reused(kept, files):
 
 def test_missing_file_gives_no_signature(kept, files, tmp_path):
     assert kept.kept_lora_signature(Model(), None, [str(tmp_path / "gone.safetensors")], [1.0], "t", True) is None
+
+
+@pytest.mark.parametrize("enabled, aborted, more_windows, more_samples, next_model, expected", [
+    (1, False, False, False, "t", True),    # the next queued task runs the same model: nothing unloaded in between
+    (0, False, False, False, "t", False),   # the setting off: unloaded after every generation, as before
+    (1, True, False, False, "t", False),    # an abort unloads
+    (1, False, False, False, None, False),  # the end of the queue unloads
+    (1, False, False, False, "u", False),   # another model next: unloaded for it
+    (1, False, True, False, None, True),    # another window of this task
+    (1, False, False, True, "u", True),     # another sample of this task
+])
+def test_models_stay_loaded(kept, enabled, aborted, more_windows, more_samples, next_model, expected):
+    assert kept.models_stay_loaded(enabled, aborted, more_windows, more_samples, next_model, "t") is expected

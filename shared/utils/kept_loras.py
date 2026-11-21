@@ -32,3 +32,10 @@ def reuse_kept_loras(trans_lora, trans2_lora, signature, lora_multipliers):
     if trans2_lora is not None:
         offload.sync_models_loras(trans_lora, trans2_lora)
     return True
+
+
+def models_stay_loaded(enabled, aborted, more_windows, more_samples, next_model_type, model_type):
+    """server_config "keep_model_loaded": whether a generation's models stay in VRAM for what runs next (no unload, no reload of their
+    blocks, no full garbage collection in between). Only when this model runs again right after: another window or sample of this task,
+    or the next queued task of the same model type; never after an abort, and the end of a queue unloads as before."""
+    return bool(enabled) and not aborted and (bool(more_windows) or bool(more_samples) or next_model_type == model_type)
