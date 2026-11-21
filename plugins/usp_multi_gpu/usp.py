@@ -387,20 +387,17 @@ def _usp_forward(self, video_x, audio_x, sigma_video, sigma_audio, context, payl
             video_rows = torch.cat((cond_video.to(device), video_rows))
         if cond_audio is not None:
             audio_rows = torch.cat((cond_audio.to(device), audio_rows))
-        video_embeds = self.video_patch_proj(video_rows).to(dtype)
-        del video_rows
-        audio_embeds = None if self.audio_patch_proj is None else self.audio_patch_proj(audio_rows).to(dtype)
-        del audio_rows
-
         text_embeds = context[0]
         if text_embeds.shape[-1] != self.hidden_size:
             text_embeds = self.preprocess_text_embeds(context)[0]
         hidden = torch.empty(layout.sequence_length, self.hidden_size, dtype=dtype, device=device)
         hidden.index_copy_(0, layout.text_indices.to(device), text_embeds)
-        hidden.index_copy_(0, layout.video_indices.to(device), video_embeds)
-        if audio_embeds is not None:
-            hidden.index_copy_(0, layout.audio_indices.to(device), audio_embeds)
-        del text_embeds, video_embeds, audio_embeds
+        del text_embeds
+        T._project_into(hidden, layout.video_indices.to(device), self.video_patch_proj, video_rows, dtype)
+        del video_rows
+        if self.audio_patch_proj is not None:
+            T._project_into(hidden, layout.audio_indices.to(device), self.audio_patch_proj, audio_rows, dtype)
+        del audio_rows
     else:
         video_x = audio_x = None
 

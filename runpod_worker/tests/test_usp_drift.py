@@ -17,8 +17,9 @@ REPO = Path(__file__).resolve().parents[2]
 
 #: sha256 of MiniMaxH3Model.forward's source at the revision usp.py mirrors
 #: (upstream c8d47da: several H3 images denoised as one batch, which USP refuses, and an optional
-#: audio stream, H3-Image having none).
-MIRRORED_FORWARD_SHA256 = "32e5a5db125dfbd08fe43857bc3f5b7378568b18801ac493dcf53e66c2aea51a"
+#: audio stream, H3-Image having none; upstream v20 f4cfc12: the video and audio patch projections
+#: write into the sequence by chunks of rows (_project_into), ported to usp._usp_forward).
+MIRRORED_FORWARD_SHA256 = "55f0a470021bb0c80c0ba2bd4642fef41a4f37d9ea9ecc1d356a637a6ff47768"
 
 
 def _forward_source() -> str:
@@ -83,7 +84,12 @@ def test_usp_module_stays_torch_lazy_for_this_suite():
 #: Re-verified at upstream 9f30419: only a single-frame decoder branch (decoder.patch_size_t == 1,
 #: H3 image models) was added ahead of the still-image path; the video chunk loop and slice
 #: positions are unchanged, and last_frame.py decodes such a VAE in full.
-MIRRORED_DECODE_SHA256 = "d6e684189a60a7c626299e6925027437d51e647be90e37b9641ffd135dcfd7bc"
+#: Re-verified at upstream v20 f4cfc12: _decode_clip became the row generator _decode_clip_rows and the
+#: output is written row by row through a RamWriter, but each chunk still decodes
+#: z[i * chunk : i * chunk + chunk + overlap] alone, the frames kept for the next cross-fade are still
+#: that chunk's second segment, and the last ones are still written after the loop unblended.
+#: runpod_worker/scripts/test_last_frame_cpu.py (ported to _decode_clip_rows) passes at 107-362 frames.
+MIRRORED_DECODE_SHA256 = "1a52ab8ec63c79744ef07323945affb5eec3816f3122d98fe395a49aa847b5a3"
 
 
 def _decode_source() -> str:

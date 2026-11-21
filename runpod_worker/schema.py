@@ -546,11 +546,11 @@ _REF2VA_MODEL_DEF: dict[str, Any] = {
     # the cap message can still cite the model's own number, but WANGP_MAX_FRAMES
     # is now the ONLY real bound for Ref2VA as well as FL2VA.
     "frames_selection_maximum": 737,
-    # minimax_h3_handler.py:832-889 -- "GPDEV+*-U1" for the guide (up to three reference
-    # videos, excerpts "1", Denoise "GV", In-Context "VU"), "KFI" for refs (frame
-    # injection "FI"), "ABDKS1" for audio (three references, kept soundtracks "AS"/"KS",
-    # soundtrack excerpts "K1").
-    "guide_custom_choices": {"letters_filter": "GPDEV+*-U1", "default": ""},
+    # minimax_h3_handler.py:1052-1066 -- "GPDEV+*-U12" for the guide (up to three reference
+    # videos, excerpts "1", Denoise "GV", In-Context "VU", upstream v20's Aligned Guide "VU2"),
+    # "KFI" for refs (frame injection "FI"), "ABDKS1" for audio (three references, kept
+    # soundtracks "AS"/"KS", soundtrack excerpts "K1").
+    "guide_custom_choices": {"letters_filter": "GPDEV+*-U12", "default": ""},
     "image_ref_choices": {"letters_filter": "KFI", "default": ""},
     "audio_prompt_type_sources": {"letters_filter": "ABDKS1", "default": ""},
     "custom_frames_injection": True,
@@ -724,7 +724,7 @@ _FALLBACK_LETTERS: dict[str, dict[str, str]] = {
     },
     "ref2va": {
         "image_prompt_type": "TSEVL",
-        "video_prompt_type": "GPDEV+*-U1KFI",
+        "video_prompt_type": "GPDEV+*-U12KFI",
         "audio_prompt_type": "ABDKS1",
     },
 }
