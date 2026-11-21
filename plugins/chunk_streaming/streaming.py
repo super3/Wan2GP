@@ -11,6 +11,9 @@ the clip is still decoding.
 
 `activate()` monkeypatches `_decode` with a copy whose only additions are
 recorder callbacks; the returned tensor is bit-identical to the original.
+Sol-H3-VAE's whole-frame decoder (VAE config `sol_int8`, upstream v20) has
+its own `_decode` in `MiniMaxH3VideoVAE`, instrumented the same way: it
+reports a chunk per native block of 5 latents (17 frames).
 `_decode` converts every finalized chunk with `_prepare_decoded_chunk` (in
 `MiniMaxH3VideoVAE`: ImageNet de-normalization, clamp, and uint8 rounding when
 the pipeline asks for it) row of tiles by row of tiles and sends it to a CPU
@@ -152,7 +155,7 @@ def _to_uint8_frames(vae, sl: torch.Tensor) -> torch.Tensor:
 
 
 _STATE: dict = {"active": False, "recorder": None, "orig_decode": None,
-                "orig_audio_decode": None, "orig_video_decode": None}
+                "orig_audio_decode": None, "orig_video_decode": None, "orig_sol_decode": None}
 
 
 def recorder() -> StreamRecorder | None:
@@ -356,6 +359,78 @@ def _instrumented_decode(self, z: torch.Tensor, uint8_rounding: str | None = Non
     return decoded
 
 
+def _instrumented_sol_decode(self, z: torch.Tensor, uint8_rounding: str | None = None) -> torch.Tensor:
+    """`MiniMaxH3VideoVAE._decode` with recorder callbacks.
+
+    v20's `MiniMaxH3VideoVAE` overrides `_decode` for Sol-H3-VAE's decoder (VAE config `sol_int8`), which decodes whole frames
+    instead of 256-pixel tiles of clips; any other decoder goes on to `AutoencoderKLMiniMaxH3._decode`, which `activate()` replaces
+    with `_instrumented_decode`. The Sol body is copied verbatim from models/minimax_h3/video_vae.py (upstream v20): the decoder
+    emits the frames of one latent frame after another, each by bands of pixel rows, and `emit` converts every band and sends it
+    to the CPU output through an mmgp `RamWriter`. The callbacks only read finalized regions of that output, so the returned tensor
+    is bit-identical to upstream's. A chunk is reported at each native block of 5 latents (17 frames: its first latent keeps one
+    frame), once the block's last band is written and every piece before it has landed in the buffer (`_LandedReports`); the
+    last block, which may be shorter, after the decode. A picture (one latent: five copies, one frame kept, a blocking copy) and
+    a batch of several videos report once, at the end.
+    """
+    from models.minimax_h3 import video_vae as _video_mod
+    from models.minimax_h3.components.sol_decoder import BLOCK as SOL_BLOCK, MiniMaxH3SolDecoder3d
+
+    if not isinstance(self.decoder, MiniMaxH3SolDecoder3d):
+        return _STATE["orig_sol_decode"](self, z, uint8_rounding)  # upstream's super()._decode: the instrumented H3 path
+    rec: StreamRecorder = _STATE["recorder"]
+    rec.on_decode_start()
+    transfer = _video_mod.transfer
+    decoder, batch = self.decoder, z.shape[0]
+    if z.shape[2] == 1:  # a lone latent decodes poorly alone (23 to 28 dB to the source, the full VAE 30 to 37): five copies, its first frame kept, as H3's VAE does
+        z = z.repeat(1, 1, SOL_BLOCK, 1, 1)
+        frames = 1
+    else:
+        frames = decoder.output_frames(z.shape[2])
+    decoded, height = None, z.shape[-2] * decoder.patch_size
+    reports = _LandedReports()
+    reported, chunk_index = 0, 0  # end of the frame range already handed to the recorder, the next chunk's number
+    per_block = batch == 1 and frames > 1
+    with PhaseProgress(batch * decoder.steps(z.shape[2])) as progress, transfer.RamWriter("decoded video", depth=64, max_bytes=256 << 20) as writer:
+        decoder.progress = progress
+        try:
+            for item in range(batch):
+                position = 0
+                latents = 0  # latent frames whose last band is written
+
+                def emit(pixels, row, last, item=item):  # (item bound here: upstream reads the loop variable, called within its iteration)
+                    """A band of pixel rows (from row on) of the frames of a latent frame, converted on the GPU and written to the RAM
+                    output; last: the frame's last band."""
+                    nonlocal decoded, position, latents, reported, chunk_index
+                    if position >= frames:
+                        return
+                    part = self._prepare_decoded_chunk(pixels[:, :, :frames - position], uint8_rounding)
+                    if decoded is None:
+                        decoded = torch.empty(batch, part.shape[1], frames, height, part.shape[-1], dtype=part.dtype, device="cpu")
+                    target = decoded[item:item + 1, :, position:position + part.shape[2], row:row + part.shape[-2]]
+                    if frames > 1:
+                        reports.written += 1
+                        writer.write(target, part, reports.landed_one)
+                    else:
+                        transfer.copy_(target, part)  # one picture: one transfer
+                    if last:
+                        position += part.shape[2]
+                        latents += 1
+                        if per_block and latents % SOL_BLOCK == 0 and reported < position < frames:
+                            # a native block is written: its frames go to the recorder once they have landed
+                            reports.add(functools.partial(rec.on_chunk, self, decoded, reported, position, chunk_index))
+                            reported, chunk_index = position, chunk_index + 1
+
+                decoder(self.post_quant_conv(z[item:item + 1]), emit)
+                if position != frames:
+                    raise RuntimeError(f"MiniMax H3 Sol VAE decoded {position} frames, expected {frames}")
+            if reported < frames:  # the last block, or the whole decode of a picture or a batch
+                reports.add(functools.partial(rec.on_chunk, self, decoded, reported, frames, chunk_index))
+        finally:
+            decoder.progress = None
+    rec.on_decode_end()  # the writer is closed: every report has run
+    return decoded
+
+
 def activate(store_frames: bool = True, live_dir: str | None = None,
              audio_first: bool = False, segment_video_args: list[str] | None = None) -> StreamRecorder:
     """Install the instrumented decode paths; returns the shared recorder.
@@ -383,6 +458,10 @@ def activate(store_frames: bool = True, live_dir: str | None = None,
     _STATE["recorder"] = rec
     _STATE["orig_decode"] = _va.AutoencoderKLMiniMaxH3._decode
     _va.AutoencoderKLMiniMaxH3._decode = _instrumented_decode
+    # Sol-H3-VAE's whole-frame decoder has its own _decode in the WanGP adapter class (v20): instrumented too; other decoders go
+    # on from there to the instrumented H3 path above
+    _STATE["orig_sol_decode"] = _video_mod.MiniMaxH3VideoVAE.__dict__["_decode"]
+    _video_mod.MiniMaxH3VideoVAE._decode = _instrumented_sol_decode
 
     orig_audio_decode = _audio_mod.MiniMaxH3AudioVAE.decode
 
@@ -430,10 +509,11 @@ def deactivate() -> None:
     if rec is not None and rec.live is not None:
         rec.live.close()
     _va.AutoencoderKLMiniMaxH3._decode = _STATE["orig_decode"]
+    _video_mod.MiniMaxH3VideoVAE._decode = _STATE["orig_sol_decode"]
     _audio_mod.MiniMaxH3AudioVAE.decode = _STATE["orig_audio_decode"]
     _video_mod.MiniMaxH3VideoVAE.decode = _STATE["orig_video_decode"]
     _STATE.update({"active": False, "recorder": None, "orig_decode": None,
-                   "orig_audio_decode": None, "orig_video_decode": None})
+                   "orig_audio_decode": None, "orig_video_decode": None, "orig_sol_decode": None})
 
 
 # -- segment muxing -------------------------------------------------------
