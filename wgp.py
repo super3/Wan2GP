@@ -87,6 +87,7 @@ from shared.utils.loras_mutipliers import preparse_loras_multipliers, parse_lora
 from shared.utils.utils import convert_tensor_to_image, convert_video_tensor_to_uint8_chunked, save_image, get_video_info, get_video_real_fps, get_file_creation_date, convert_image_to_video, calculate_new_dimensions, convert_image_to_tensor, calculate_dimensions_and_resize_image, rescale_and_crop, get_video_frame, resize_and_remove_background, rgb_bw_to_rgba_mask, image_editor_layer_to_rgb_mask, to_rgb_tensor, get_resampled_video_transparent, get_video_summary_extras
 from shared.utils.utils import calculate_new_dimensions, get_outpainting_dims, get_outpainting_frame_location, get_outpainting_full_area_dimensions, resolve_outpainting_dims
 from shared.utils.utils import has_video_file_extension, has_image_file_extension, has_audio_file_extension, has_mesh_file_extension, has_world_file_extension, has_app_file_extension, MESH_IMPORT_EXTENSIONS, guide_to_float, guide_mask_to_float
+from shared.utils.kept_loras import kept_lora_signature, reuse_kept_loras
 from shared.utils.audio_video import extract_audio_tracks, subtitle_stream_count, combine_video_with_audio_tracks, combine_and_concatenate_video_with_audio_tracks, cleanup_temp_audio_files, normalize_audio_volumes_to_temp_files, save_video, save_hdr_video, save_image, get_image_format, get_media_duration_and_audio_layouts
 from shared.utils.audio_video import append_sliding_window_audio, audio_overlap_repair_seconds, source_audio_repair_ms, read_image_metadata, extract_audio_track_to_wav, write_wav_file, save_audio_file, get_audio_codec_extension, create_silent_wav_file
 from shared.utils.audio_video import truncate_audio, shift_audio_trim_ranges, trim_audio_ranges, trim_audio_file_ranges, slice_audio_window, resolve_mux_audio_sampling_rate
@@ -7908,6 +7909,11 @@ def generate_media(
     else:
         trans_lora, trans2_lora = trans, trans2
 
+    keep_loras = bool(server_config.get("keep_loras_loaded", 0))
+    if len(loras_selected) == 0 and keep_loras and getattr(trans_lora, "_loras_adapters", None):  # kept from the last task: none now
+        offload.unload_loras_from_model(trans_lora)
+        if trans2_lora is not None:
+            offload.unload_loras_from_model(trans2_lora)
     if len(loras_selected) > 0:
         loras_selected = update_loras_url_cache(lora_dir, loras_selected)
         errors = check_loras_exist(model_type, loras_selected, True, send_cmd, gen=gen)
@@ -7916,6 +7922,10 @@ def generate_media(
         pinnedLora = not is_mps and loaded_profile !=5  # and transformer_loras_filenames == None False # # #
         preprocess_target = trans_lora if trans_lora is not None else trans
         split_linear_modules_map = getattr(preprocess_target, "split_linear_modules_map", None)
+        lora_signature = kept_lora_signature(trans_lora, trans2_lora, loras_selected, loras_list_mult_choices_nums, base_model_type, pinnedLora) if keep_loras else None
+    if len(loras_selected) > 0 and lora_signature is not None and reuse_kept_loras(trans_lora, trans2_lora, lora_signature, loras_list_mult_choices_nums):
+        pass  # the same LoRAs as the last task are still loaded: multipliers and step counters reset, no reload
+    elif len(loras_selected) > 0:
         offload.load_loras_into_model(
             trans_lora,
             loras_selected,
@@ -7936,7 +7946,9 @@ def generate_media(
             for lora_model in (trans_lora, trans2_lora):
                 if lora_model is not None:
                     offloadobj.refresh_loras(lora_model)
-        
+        if lora_signature is not None:
+            trans_lora._kept_lora_signature = lora_signature
+
     seed = None if seed == -1 else seed
     # negative_prompt = "" # not applicable in the inference
     model_filename = get_model_filename(base_model_type)  
@@ -9575,9 +9587,10 @@ def generate_media(
     gen["loaded_source_plan"] = None
     clear_status(state)
     trans.cache = None
-    offload.unload_loras_from_model(trans_lora)
-    if not trans2_lora is None:
-        offload.unload_loras_from_model(trans2_lora)
+    if not server_config.get("keep_loras_loaded", 0):  # kept: the next task reuses them when it selects the same LoRAs
+        offload.unload_loras_from_model(trans_lora)
+        if not trans2_lora is None:
+            offload.unload_loras_from_model(trans2_lora)
 
     if not trans2 is None:
        trans2.cache = None
