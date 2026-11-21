@@ -21,9 +21,9 @@ import time
 
 import torch
 
-try:
+if __package__:
     from . import streaming
-except ImportError:  # loaded as a top-level module (tests, scripts with plugins/chunk_streaming on sys.path)
+else:  # loaded as a top-level module (scripts with plugins/chunk_streaming on sys.path)
     import streaming
 
 _STATE: dict = {"wgp": None, "original": None, "last": None}
