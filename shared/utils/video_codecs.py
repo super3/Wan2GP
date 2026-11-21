@@ -1,3 +1,8 @@
+import os
+import shutil
+import subprocess
+import threading
+
 SDR_VIDEO_CODEC_CHOICES = [
     ("x265 CRF 28 (Smaller Files)", "libx265_28"),
     ("x265 CRF 18 (Balanced)", "libx265_18"),
@@ -5,9 +10,67 @@ SDR_VIDEO_CODEC_CHOICES = [
     ("x265 CRF 8 (High Quality)", "libx265_8"),
     ("x264 Level 10 (High Quality)", "libx264_10"),
     ("x264 Lossless", "libx264_lossless"),
+    ("H.264 NVENC (NVIDIA GPU encoder, fast)", "h264_nvenc"),
+    ("HEVC NVENC (NVIDIA GPU encoder, fast)", "hevc_nvenc"),
     ("ProRes 422 (editing)", "prores_422"),
     ("DNxHR HQ (editing)", "dnxhr_hq"),
 ]
+
+# NVENC: the GPU's dedicated video encoder block, separate from the cores that run the models, so it encodes a clip in a fraction
+# of the time x264 takes on the CPU without slowing generation. Constant quality 14 (H.264) / 16 (HEVC) at the slow, high-quality
+# preset is close to x264 CRF 10, WanGP's default. Used only where it works: the ffmpeg on PATH must encode with it here (a GPU
+# without NVENC, such as the A100 or H100, or a container without the driver's video library cannot); otherwise videos are
+# saved with x264 CRF 10, and a warning says why.
+NVENC_VIDEO_CODECS = {
+    "h264_nvenc": ("h264_nvenc", "yuv420p", ["-preset", "p5", "-tune", "hq", "-rc", "vbr", "-cq", "14", "-b:v", "0"]),
+    "hevc_nvenc": ("hevc_nvenc", "yuv420p", ["-preset", "p5", "-tune", "hq", "-rc", "vbr", "-cq", "16", "-b:v", "0"]),
+}
+_NVENC_FALLBACK = ("libx264", "yuv420p", ["-crf", "10"])
+_nvenc_ready = {}
+_nvenc_lock = threading.Lock()
+
+
+def _ffmpeg_on_path() -> str | None:
+    return os.environ.get("FFMPEG_BINARY") or shutil.which("ffmpeg")
+
+
+def _nvenc_probe(ffmpeg: str, encoder: str) -> str | None:
+    """None when this ffmpeg encodes a short test clip with the encoder here, else why not."""
+    try:
+        result = subprocess.run([ffmpeg, "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", "color=c=black:s=256x256:r=24:d=0.2",
+                                 "-c:v", encoder, "-pix_fmt", "yuv420p", "-f", "null", "-"], capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return f"{os.path.basename(ffmpeg)} could not run ({error})"
+    if result.returncode != 0:
+        lines = [line.strip() for line in (result.stderr or "").splitlines() if line.strip()]
+        own = [line for line in lines if line.startswith(f"[{encoder} @")]  # the encoder's own message says why, e.g. "Cannot load libcuda.so.1"
+        return (own or lines or [f"{os.path.basename(ffmpeg)} exited with code {result.returncode}"])[0][:200]
+    return None
+
+
+def nvenc_ready(codec_key: str) -> bool:
+    """Whether NVENC codec `codec_key` can encode here, probed once per process. When it can, ImageIO (which writes WanGP's videos
+    and otherwise runs its own ffmpeg build, made without NVENC) is pointed at the ffmpeg on PATH, unless IMAGEIO_FFMPEG_EXE
+    already names one, which must then pass the probe too."""
+    encoder = NVENC_VIDEO_CODECS[codec_key][0]
+    with _nvenc_lock:
+        if encoder in _nvenc_ready:
+            return _nvenc_ready[encoder]
+        path_ffmpeg = _ffmpeg_on_path()
+        imageio_ffmpeg = os.environ.get("IMAGEIO_FFMPEG_EXE")
+        if path_ffmpeg is None:
+            reason = "no ffmpeg on PATH"
+        else:
+            reason = _nvenc_probe(path_ffmpeg, encoder)
+            if reason is None and imageio_ffmpeg and os.path.realpath(imageio_ffmpeg) != os.path.realpath(path_ffmpeg):
+                reason = _nvenc_probe(imageio_ffmpeg, encoder)
+        ready = reason is None
+        if ready and not imageio_ffmpeg:
+            os.environ["IMAGEIO_FFMPEG_EXE"] = path_ffmpeg
+        if not ready:
+            print(f"[Video] {encoder} is not available here ({reason}): saving videos with x264 CRF 10 instead.")
+        _nvenc_ready[encoder] = ready
+        return ready
 
 VIDEO_CONTAINER_CHOICES = [
     ("MP4", "mp4"),
