@@ -27,8 +27,9 @@ Above 480p one GPU decodes slower than playback. `set_decode_devices` (or
 `activate(decode_devices=...)`) splits the chunks of each video decode
 round-robin across several devices: the clips are independent, so they decode
 concurrently, one thread per extra device holding its own copy of the decoder,
-while the cross-fade, the conversion and the recorder callbacks stay in chunk
-order on the calling thread. Only latents and overlap frames cross devices,
+while the cross-fade, the conversion and the CPU writes stay in chunk order on
+the calling thread, row of tiles by row of tiles, and the recorder callbacks in
+chunk order. Only latents and overlap frames cross devices,
 through the CPU, and the output is bit-identical to the single-device decode.
 
 The pure-math helpers at the bottom model the player: `no_buffer_start` is the
@@ -41,6 +42,7 @@ from __future__ import annotations
 
 import collections
 import concurrent.futures
+import contextlib
 import functools
 import os
 import queue
@@ -264,20 +266,22 @@ def _maybe_prefetch_audio(frame, rec: StreamRecorder) -> bool:
 
 # -- multi-device decode ----------------------------------------------------
 #
-# `_decode` runs one `_decode_clip` per temporal chunk on the latents
+# `_decode` runs one `_decode_clip_rows` per temporal chunk on the latents
 # z[:, :, i * tokens_chunk_size : i * tokens_chunk_size + tokens_chunk_size + token_overlap]
 # and nothing else: no state flows from one clip to the next. What couples
-# consecutive chunks is only the finalization that follows each clip: the
-# first `frame_overlap` frames of chunk i are cross-faded (`_blend`) with the
-# trailing `frame_overlap` frames of clip i-1 (its j == 1 part, the `overlap`),
-# and the finalized frames are converted and written to the CPU output in
-# order. So the clips can be decoded anywhere, concurrently, as long as the
-# blend, the conversion, the CPU writes and the recorder callbacks run in chunk
-# order on the calling thread. That is what `_ChunkDispatcher` does: chunk i
-# decodes on decode device i % N, the calling thread decodes the chunks that
-# fall on the VAE's own device itself (through the original, MMGP-managed
-# module: offloading, progress and abort hooks unchanged) and finalizes every
-# chunk in order exactly as the single-device loop does.
+# consecutive chunks is only the finalization that follows each row of tiles
+# of a clip: the first `frame_overlap` frames of chunk i are cross-faded
+# (`_blend`) with the trailing `frame_overlap` frames of clip i-1 (kept per
+# row, the `overlap`), and the finalized frames are converted and written to
+# the CPU output in order. So the clips can be decoded anywhere, concurrently,
+# as long as the blend, the conversion, the CPU writes and the recorder
+# callbacks run in chunk order on the calling thread. That is what
+# `_ChunkDispatcher` does: chunk i decodes on decode device i % N, the calling
+# thread decodes the chunks that fall on the VAE's own device itself (through
+# the original, MMGP-managed module: offloading, progress and abort hooks
+# unchanged, each row finalized as it comes, as upstream's loop does) and
+# finalizes every chunk in order exactly as the single-device loop does; the
+# other devices hand over all the rows of their clip at once.
 #
 # Each other device gets a `_Replica`: a copy of the decode path only
 # (`post_quant_conv` and `decoder`, plus the root's plain attributes) whose
@@ -492,17 +496,17 @@ class _Replica:
         decoder = self.module._modules["decoder"]
         decoder.__dict__["_interrupt"] = bool(value)
 
-    def decode(self, z_part: torch.Tensor, grad_enabled: bool, inference: bool) -> torch.Tensor:
-        """`_decode_clip` of one chunk on this device, on a worker thread; returns once the clip is computed."""
+    def decode(self, z_part: torch.Tensor, grad_enabled: bool, inference: bool) -> list:
+        """`_decode_clip_rows` of one chunk on this device, on a worker thread: its `(row, pixels)` rows, once all are computed."""
         mode = torch.inference_mode() if inference else torch.set_grad_enabled(grad_enabled)
         if self.stream is None:
             with mode:
-                return self.module._decode_clip(z_part.to(self.device))
+                return list(self.module._decode_clip_rows(z_part.to(self.device)))
         torch.cuda.set_device(self.device)
         with mode, torch.cuda.stream(self.stream):
-            clip = self.module._decode_clip(z_part.to(self.device))
+            rows = list(self.module._decode_clip_rows(z_part.to(self.device)))
             self.stream.synchronize()
-        return clip
+        return rows
 
 
 _RECIPE_ATTR = "_decode_worker_recipe"  # set on a VAE by the loader hook: how a decode worker loads the same VAE
@@ -685,7 +689,8 @@ class _ProcessReplica:
         # a clip in flight finishes in the worker (one chunk); the dispatcher drops it
         pass
 
-    def decode(self, z_part: torch.Tensor, grad_enabled: bool, inference: bool) -> torch.Tensor:
+    def decode(self, z_part: torch.Tensor, grad_enabled: bool, inference: bool) -> list:
+        """The `(row, pixels)` rows of one chunk, decoded by the worker process (`_decode_clip_rows`) and sent as one clip."""
         from . import decode_worker as worker
 
         started = time.monotonic()
@@ -700,7 +705,8 @@ class _ProcessReplica:
             clip = self._receive(reply[1])
         self.timings.append({"decode_s": reply[1].get("decode_s", 0.0), "pack_s": reply[1].get("pack_s", 0.0),
                              "roundtrip_s": received - started, "unpack_s": time.monotonic() - received})
-        return clip
+        starts = reply[1]["rows"]
+        return [(row, clip[..., row:end, :]) for row, end in zip(starts, starts[1:] + [clip.shape[-2]], strict=True)]
 
     def _receive(self, meta: dict) -> torch.Tensor:
         """The clip's bytes, straight into a reusable pinned buffer, then copied to the main device without blocking (one copy
@@ -859,7 +865,7 @@ def wait_for_decode_workers(timeout: float | None = None) -> bool:
 
 
 class _ChunkDispatcher:
-    """Decodes the clips of `_decode`'s chunk loop across devices; `clip(i)` is called in chunk order by the calling thread.
+    """Decodes the clips of `_decode`'s chunk loop across devices; `clip_rows(i)` is called in chunk order by the calling thread.
 
     Slot k of the device list takes chunks k, k + N, k + 2N... The first slot on the VAE's own device is decoded by the calling
     thread with the original module; every other slot has a replica and a worker thread. At most `_DECODE_LOOKAHEAD` chunks per
@@ -917,27 +923,34 @@ class _ChunkDispatcher:
                 slot.shapes_seen.add(self.signature)
         self.hold = False
 
-    def _main_clip(self, i: int) -> torch.Tensor:
-        started = time.monotonic()
+    def _main_rows(self, i: int, release: bool = False):
+        """The `(row, pixels)` rows of clip i, decoded here by the original module as the finalization takes them; release: then
+        let the workers start (`_release`)."""
         start = i * self.tokens_chunk_size
-        clip = self.vae._decode_clip(self.z[:, :, start : start + self.clip_tokens])
-        self.main_clip_s += time.monotonic() - started
-        return clip
-
-    def clip(self, i: int) -> torch.Tensor:
-        if self.hold:  # nothing was submitted yet: this clip decodes here, whatever its slot, and tunes the kernels first
-            clip = self._main_clip(i)
+        rows = self.vae._decode_clip_rows(self.z[:, :, start : start + self.clip_tokens])
+        while True:
+            started = time.monotonic()
+            item = next(rows, None)
+            self.main_clip_s += time.monotonic() - started
+            if item is None:
+                break
+            yield item
+        if release:
             self._release()
-            return clip
+
+    def clip_rows(self, i: int):
+        """The `(row, pixels)` rows of clip i, in order (what `_decode_clip_rows` yields), wherever it is decoded."""
+        if self.hold:  # nothing was submitted yet: this clip decodes here, whatever its slot, and tunes the kernels first
+            return self._main_rows(i, release=True)
         self._submit_until(i + 1 + _DECODE_LOOKAHEAD * len(self.slots))
         slot = self.slots[i % len(self.slots)]
         if slot is None:
-            return self._main_clip(i)
+            return self._main_rows(i)
         future = self.futures.pop(i)
         waited = time.monotonic()
         while True:
             try:
-                clip = future.result(timeout=0.05)
+                rows = future.result(timeout=0.05)
                 break
             except concurrent.futures.TimeoutError:
                 if self._interrupt_requested():
@@ -945,12 +958,13 @@ class _ChunkDispatcher:
                         if other is not None:
                             other.set_interrupt(True)
         self.wait_s += time.monotonic() - waited
-        if clip.device.type == "cuda":
-            # allocated on the replica's stream, finalized on this thread's: its memory must outlive this stream's reads
-            clip.record_stream(torch.cuda.current_stream(clip.device))
+        for _, pixels in rows:
+            if pixels.device.type == "cuda":
+                # allocated on the replica's stream, finalized on this thread's: its memory must outlive this stream's reads
+                pixels.record_stream(torch.cuda.current_stream(pixels.device))
         if self.progress is not None:
             self.progress.advance(self.spatial_tiles)  # the replica's decoder carries no progress hook
-        return clip
+        return rows
 
     def close(self, failed: bool) -> None:
         """Stop and join the workers. On failure, abort in-flight replica decodes at their next block first."""
@@ -1093,6 +1107,11 @@ class _LandedReports:
             self.waiting.popleft()[1]()
 
 
+def _device_of(tensor: torch.Tensor):
+    """The CUDA device of `tensor` made current (a context manager), or nothing for a CPU tensor."""
+    return torch.cuda.device(tensor.device) if tensor.is_cuda else contextlib.nullcontext()
+
+
 def _instrumented_decode(self, z: torch.Tensor, uint8_rounding: str | None = None) -> torch.Tensor:
     """`AutoencoderKLMiniMaxH3._decode` with recorder callbacks.
 
@@ -1164,7 +1183,7 @@ def _instrumented_decode(self, z: torch.Tensor, uint8_rounding: str | None = Non
 
 def _instrumented_decode_loop(self, z, uint8_rounding, rec, dispatcher, num_chunks, output_frames, frame_pre_padding,
                               spatial_tiles):
-    """The chunk loop of `_instrumented_decode`; with a dispatcher, each clip comes from `dispatcher.clip(i)`."""
+    """The chunk loop of `_instrumented_decode`; with a dispatcher, the rows of each clip come from `dispatcher.clip_rows(i)`."""
     tokens_chunk_size = self.tokens_chunk_size
     token_drop = self.config.token_drop
     chunk_num_frames = tokens_chunk_size * self.temporal_compression_ratio
@@ -1201,11 +1220,12 @@ def _instrumented_decode_loop(self, z, uint8_rounding, rec, dispatcher, num_chun
                 if num_chunks:
                     # neither the GPU nor this thread waits for the RAM: a wait in the middle of a clip would leave the GPU idle
                     # while the next decoder call is issued
-                    reports.written += 1
-                    writer.write(target, part, reports.landed_one)
-                    if hwc is not None:
+                    with _device_of(part):  # (a replica's rows, on its device: RamWriter tracks a copy on the current device)
                         reports.written += 1
-                        writer.write(*hwc, reports.landed_one)
+                        writer.write(target, part, reports.landed_one)
+                        if hwc is not None:
+                            reports.written += 1
+                            writer.write(*hwc, reports.landed_one)
                 else:
                     _va.transfer.copy_(target, part)
                     if hwc is not None:
@@ -1241,7 +1261,7 @@ def _instrumented_decode_loop(self, z, uint8_rounding, rec, dispatcher, num_chun
                 start = i * tokens_chunk_size
                 clip_rows = self._decode_clip_rows(z[:, :, start : start + tokens_chunk_size + self.token_overlap])
             else:
-                clip_rows = [(0, dispatcher.clip(i))]  # decoded on decode device i % N (a whole clip: one row); finalized here, in chunk order
+                clip_rows = dispatcher.clip_rows(i)  # decoded on decode device i % N; finalized here, in chunk order
             for row, pixels in clip_rows:
                 if overlap is not None and overlap.device != pixels.device:  # the previous clip was decoded on another device
                     overlap = _move_tensor(overlap, pixels.device)

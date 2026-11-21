@@ -30,6 +30,7 @@ if "shared.attention" not in sys.modules:
     attention.pay_attention = _sdpa
     attention.sage_staged = lambda *_args, **_kw: None
     attention.sage_attention_mask = lambda *_args, **_kw: (_ for _ in ()).throw(NotImplementedError("no Sage masks on CPU"))
+    attention.launch_waves = lambda *_args, **_kw: None  # imported by attention_kit since upstream v20 (None: cannot probe)
     sys.modules["shared.attention"] = attention
     sys.modules["shared"].attention = attention
 

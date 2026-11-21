@@ -17,8 +17,9 @@ Protocol (multiprocessing.connection, authenticated; tensors travel as raw bytes
   main -> worker  ("exit",)
 
 "tuning" carries the main process's kernel tuning tables (tuning_sync.py): the worker adopts them before it decodes, so both
-processes run the same launch configurations and the split decode is bit-identical. A clip's meta also carries the worker's
-decode and pack times ("decode_s", "pack_s").
+processes run the same launch configurations and the split decode is bit-identical. A clip is the rows of tiles its decode
+yields (`_decode_clip_rows`) put together, its meta listing their first pixel rows ("rows"); it also carries the worker's decode
+and pack times ("decode_s", "pack_s").
 """
 
 from __future__ import annotations
@@ -150,13 +151,12 @@ def serve(conn, device_name: str) -> int:
             _flush_tuning()  # tables whose library loaded since the last "tuning" message
             started = time.monotonic()
             mode = torch.inference_mode() if inference else torch.set_grad_enabled(grad_enabled)
-            with mode:
-                clip = vae._decode_clip(z)
-            if clip.device.type == "cuda":
-                torch.cuda.synchronize(clip.device)
+            with mode:  # the clip by rows of tiles, each row leaving the GPU as it comes (no clip-sized tensor there)
+                rows = [(row, pixels.to("cpu")) for row, pixels in vae._decode_clip_rows(z)]
             decoded = time.monotonic()
+            clip = rows[0][1] if len(rows) == 1 else torch.cat([pixels for _, pixels in rows], dim=-2)
             meta, buffer = pack(clip)
-            meta.update(decode_s=round(decoded - started, 4), pack_s=round(time.monotonic() - decoded, 4))
+            meta.update(rows=[row for row, _ in rows], decode_s=round(decoded - started, 4), pack_s=round(time.monotonic() - decoded, 4))
             conn.send(("clip", meta))
             conn.send_bytes(buffer)
         except Exception as exc:  # noqa: BLE001
