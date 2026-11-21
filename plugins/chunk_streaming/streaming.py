@@ -13,10 +13,12 @@ the clip is still decoding.
 recorder callbacks; the returned tensor is bit-identical to the original.
 `_decode` converts every finalized chunk with `_prepare_decoded_chunk` (in
 `MiniMaxH3VideoVAE`: ImageNet de-normalization, clamp, and uint8 rounding when
-the pipeline asks for it) and copies it into a CPU output buffer with a
-blocking copy; the recorder reads its uint8 CPU frames from that buffer, so
-they match the frames `MiniMaxH3VideoVAE.decode` returns and the timestamps
-include the device-to-host cost. The audio VAE decode is
+the pipeline asks for it) row of tiles by row of tiles and sends it to a CPU
+output buffer through an mmgp `RamWriter` (the copies land without the decode
+waiting for them); once every row of a clip has landed there, the recorder
+reads its uint8 CPU frames from that buffer, so they match the frames
+`MiniMaxH3VideoVAE.decode` returns and the timestamps include the
+device-to-host cost. The audio VAE decode is
 wrapped for timing and output capture: audio decoding is independent of video
 decoding, so a streaming pipeline reorders it first and every video chunk
 shifts later by its duration (serial execution makes that shift exact).
@@ -29,6 +31,8 @@ it, commit to a start time) that the bench validates against actual arrivals.
 
 from __future__ import annotations
 
+import collections
+import functools
 import queue
 import subprocess
 import sys
@@ -89,12 +93,13 @@ class StreamRecorder:
                 self.live.set_audio(self.audio_out)
 
     def on_chunk(self, vae, decoded: torch.Tensor, frame_start: int, frame_end: int, chunk_index: int) -> None:
+        """Called in chunk order; on a GPU decode, from the RamWriter thread that landed the chunk's last frames."""
         if frame_end <= frame_start:
             return
         u8 = _to_uint8_frames(vae, decoded[:, :, frame_start:frame_end])  # (frames, H, W, 3)
-        # `decoded` is the CPU buffer `_decode` fills with a blocking copy per
-        # finalized chunk: the timestamp includes the decode of this chunk AND
-        # the host copy a streaming mux would need.
+        # `decoded` is the CPU buffer `_decode` fills per finalized chunk, called
+        # once this chunk's frames have landed there: the timestamp includes the
+        # decode of this chunk AND the host copy a streaming mux would need.
         now = time.monotonic()
         meta = {"chunk": chunk_index, "frame_start": frame_start, "frame_end": frame_end, "t": now}
         self.chunks.append(meta)
@@ -198,14 +203,50 @@ def _maybe_prefetch_audio(frame, rec: StreamRecorder) -> bool:
         return False
 
 
+class _LandedReports:
+    """Recorder reports that wait for their frames to reach the CPU output.
+
+    `_decode` sends its finalized pixels there through an mmgp `RamWriter`,
+    which lands the pieces later, in the order they were written, from its own
+    thread (at once, on the calling thread, for a blocking copy) and calls each
+    piece's `done` callback (`landed_one`) after landing it. A report (`add`) waits
+    for every piece written before it; reports run in order, under the lock,
+    on whichever thread completes them, and never stop the decode loop for the
+    GPU.
+    """
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.written = 0  # pieces handed to the writer (decode thread only)
+        self.landed = 0
+        self.waiting: collections.deque = collections.deque()  # (pieces it waits for, report)
+
+    def landed_one(self) -> None:
+        with self.lock:
+            self.landed += 1
+            self._run()
+
+    def add(self, report) -> None:
+        with self.lock:
+            self.waiting.append((self.written, report))
+            self._run()
+
+    def _run(self) -> None:
+        while self.waiting and self.waiting[0][0] <= self.landed:
+            self.waiting.popleft()[1]()
+
+
 def _instrumented_decode(self, z: torch.Tensor, uint8_rounding: str | None = None) -> torch.Tensor:
     """`AutoencoderKLMiniMaxH3._decode` with recorder callbacks.
 
     The body is copied verbatim from components/video_autoencoder.py (upstream
-    9f30419: single-frame decoder and single-latent still paths, CPU output
-    buffer filled by `write_chunk`, `PhaseProgress`); the callbacks only read finalized regions
-    of that buffer, so the returned tensor is bit-identical to the original
-    implementation's.
+    v20: each clip decoded by rows of tiles (`_decode_clip_rows`), the
+    cross-fade frames kept per row, finalized pixels sent to the CPU output
+    buffer by `write` through an mmgp `RamWriter`, single-frame decoder and
+    single-latent still paths, `PhaseProgress`); the callbacks only read
+    finalized regions of that buffer, so the returned tensor is bit-identical
+    to the original implementation's. A clip is reported once all its rows are
+    written and have landed in the buffer (`_LandedReports`).
     """
     rec: StreamRecorder = _STATE["recorder"]
     rec.on_decode_start()
@@ -244,56 +285,72 @@ def _instrumented_decode(self, z: torch.Tensor, uint8_rounding: str | None = Non
         rows = self._split_tiles(height, self.tile_sample_min_height, self.tile_sample_min_overlap_height)[0]
         cols = self._split_tiles(width, self.tile_sample_min_width, self.tile_sample_min_overlap_width)[0]
         spatial_tiles = len(rows) * len(cols)
-    with PhaseProgress(max(1, num_chunks) * spatial_tiles) as progress, progress.track(self.decoder, spatial_tiles):
+    height, width = z.shape[-2] * self.spatial_compression_ratio, z.shape[-1] * self.spatial_compression_ratio
+    reports = _LandedReports()
+    with (PhaseProgress(max(1, num_chunks) * spatial_tiles) as progress, progress.track(self.decoder, lambda inputs: inputs[0].shape[0] // z.shape[0]),
+          _va.transfer.RamWriter("decoded video", depth=64, max_bytes=256 << 20) as writer):  # mmgp.transfer, as upstream
         decoded = None
-        write_position = 0
-        overlap = None
+        overlap = None  # the last frames of the previous clip, which cross-fade with the next one: kept in the decoder's precision
         reported = 0  # end of the frame range already handed to the recorder
 
-        def write_chunk(chunk):
-            # finalized pixels converted and copied to the CPU output by groups of frames (no full-clip conversion copies)
-            nonlocal decoded, write_position
-            copy_frames = min(chunk.shape[2], output_frames - write_position)
+        def write(pixels, row, position):
+            """Finalized pixels (pixel rows from `row` on, frames from output frame `position` on) converted and sent to the CPU
+            output by groups of frames (no clip-sized conversion copies); returns the number of frames."""
+            nonlocal decoded
+            copy_frames = min(pixels.shape[2], output_frames - position)
             for start in range(0, copy_frames, 4):
-                part = self._prepare_decoded_chunk(chunk[:, :, start : min(start + 4, copy_frames)], uint8_rounding)
+                part = self._prepare_decoded_chunk(pixels[:, :, start : min(start + 4, copy_frames)], uint8_rounding)
+                scale = part.shape[-2] // pixels.shape[-2]  # (2: a decoder that upsamples)
                 if decoded is None:
-                    decoded = torch.empty(*part.shape[:2], output_frames, *part.shape[3:], dtype=part.dtype, device="cpu")
-                _va.transfer.copy_(decoded[:, :, write_position : write_position + part.shape[2]], part)  # mmgp.transfer, as upstream
-                write_position += part.shape[2]
+                    decoded = torch.empty(*part.shape[:2], output_frames, height * scale, width * scale, dtype=part.dtype, device="cpu")
+                target = decoded[:, :, position + start : position + start + part.shape[2], row * scale : row * scale + part.shape[-2]]
+                if num_chunks:
+                    # neither the GPU nor this thread waits for the RAM: a wait in the middle of a clip would leave the GPU idle
+                    # while the next decoder call is issued
+                    reports.written += 1
+                    writer.write(target, part, reports.landed_one)
+                else:
+                    _va.transfer.copy_(target, part)
                 del part
+            return copy_frames
 
         if num_chunks == 0:
-            # Short videos still need one decode, without an overlapping temporal chunk.
-            write_chunk(self._decode_clip(z)[:, :, frame_pre_padding : frame_pre_padding + output_frames])
-            rec.on_chunk(self, decoded, 0, write_position, 0)
+            # Short videos still need one decode, without an overlapping temporal chunk: a picture or a few frames, gathered on
+            # the GPU (the frames that are kept only) and copied at once.
+            frames = slice(frame_pre_padding, frame_pre_padding + output_frames)
+            written = write(torch.cat([pixels[:, :, frames].clone() for _, pixels in self._decode_clip_rows(z)], dim=-2), 0, 0)
+            rec.on_chunk(self, decoded, 0, written, 0)  # a blocking copy: already in the CPU output
             rec.on_decode_end()
             return decoded
 
+        write_position = 0
         for i in range(num_chunks):
             start = i * tokens_chunk_size
-            clip = self._decode_clip(z[:, :, start : start + tokens_chunk_size + self.token_overlap])
-            for j in range(int(token_drop > 0) + 1):
-                frame_start = j * chunk_num_frames
-                chunk = clip[:, :, frame_start : frame_start + chunk_num_frames]
-                chunk = chunk[:, :, self.frame_pre_padding :]
-                if j == 0:
-                    if overlap is not None:
-                        chunk = self._blend(overlap, chunk, self.frame_overlap, dim=-3)
-                    write_chunk(chunk)
-                    if i < num_chunks - 1 and write_position > reported:
-                        rec.on_chunk(self, decoded, reported, write_position, i)
-                        reported = write_position
-                else:
-                    overlap = chunk.contiguous()
-            del chunk, clip
+            for row, pixels in self._decode_clip_rows(z[:, :, start : start + tokens_chunk_size + self.token_overlap]):
+                rows = slice(row, row + pixels.shape[-2])
+                chunk = pixels[:, :, self.frame_pre_padding : chunk_num_frames]
+                if i > 0 and overlap is not None:
+                    chunk = self._blend(overlap[..., rows, :], chunk, self.frame_overlap, dim=-3)
+                written = write(chunk, row, write_position)
+                if token_drop > 0:  # what the next clip cross-fades with, written over the rows just read
+                    chunk = pixels[:, :, chunk_num_frames + self.frame_pre_padding : 2 * chunk_num_frames]
+                    if overlap is None:
+                        overlap = torch.empty(*chunk.shape[:3], height, width, dtype=chunk.dtype, device=chunk.device)
+                    overlap[..., rows, :].copy_(chunk)
+                del chunk, pixels
+            write_position += written
+            if i < num_chunks - 1 and write_position > reported:
+                # every row of this clip is written: its frames go to the recorder once they have landed
+                reports.add(functools.partial(rec.on_chunk, self, decoded, reported, write_position, i))
+                reported = write_position
         if overlap is not None:
-            write_chunk(overlap)
+            write_position += write(overlap, 0, write_position)
         if write_position != output_frames:
             raise RuntimeError(f"MiniMax H3 VAE decoded {write_position} frames, expected {output_frames}")
         # The last chunk's frames plus the trailing overlap finalize together.
-        rec.on_chunk(self, decoded, reported, write_position, num_chunks - 1)
-        rec.on_decode_end()
-        return decoded
+        reports.add(functools.partial(rec.on_chunk, self, decoded, reported, write_position, num_chunks - 1))
+    rec.on_decode_end()  # the writer is closed: every report has run
+    return decoded
 
 
 def activate(store_frames: bool = True, live_dir: str | None = None,
