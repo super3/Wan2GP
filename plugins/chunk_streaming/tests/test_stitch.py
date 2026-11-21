@@ -70,7 +70,21 @@ def test_join_replaces_the_second_encode(session, tmp_path):
                           capture_output=True, text=True).stdout.strip() == ""  # video only: WanGP adds the soundtrack itself
 
 
-@pytest.mark.parametrize("change", ["other frames", "other rate", "fewer frames", "float frames"])
+@pytest.mark.parametrize("layout", ["windows (C, F, H, W)", "windows (F, H, W, C)"])
+def test_list_of_windows_is_joined(session, tmp_path, layout):
+    """WanGP saves a generation as the list of its windows' samples (MiniMax H3: one uint8 (C, F, H, W) sample per window)."""
+    rec, wgp, calls = session
+    clip = video()
+    decode_into_segments(rec, clip)
+    windows = [clip[0, :, :20], clip[0, :, 20:]]
+    if layout == "windows (F, H, W, C)":
+        windows = [window.permute(1, 2, 3, 0) for window in windows]
+    out = wgp.save_video(tensor=windows, save_file=str(tmp_path / "out.mp4"), fps=24, codec_type="libx264_8", container="mp4")
+    assert calls == [] and stitch.last_save()["joined"], stitch.last_save()
+    assert int(probe(out, "nb_read_frames")[0]) == FRAMES
+
+
+@pytest.mark.parametrize("change", ["other frames", "other rate", "fewer frames", "float frames", "float windows"])
 def test_anything_else_saves_normally(session, tmp_path, change):
     rec, wgp, calls = session
     clip = video()
@@ -85,6 +99,8 @@ def test_anything_else_saves_normally(session, tmp_path, change):
         saved = clip[:, :, :-3]
     elif change == "float frames":
         saved = clip.float() / 127.5 - 1
+    elif change == "float windows":
+        saved = [clip[0].float() / 127.5 - 1]
     wgp.save_video(tensor=saved, save_file=str(tmp_path / "out.mp4"), fps=fps, codec_type="libx264_8", container="mp4")
     assert calls == [str(tmp_path / "out.mp4")]
     assert not stitch.last_save()["joined"] and stitch.last_save()["reason"]
