@@ -320,39 +320,47 @@ class FakeLatents:
     def __init__(self, shape):
         self.shape = tuple(shape)
 
-    def new_zeros(self, *shape):
-        return ("blank", shape)
+    def new_zeros(self, *shape, **kwargs):
+        return ("blank", shape, *sorted(kwargs.items()))
 
 
 class FakeAutoencoder:
     spatial_compression_ratio = 16
 
-    def _decode_clip(self, z):
+    def _decode_clip_rows(self, z):
         self.decoder_runs += 1
-        return ("decoded", z.shape)
+        yield 0, ("decoded", z.shape)
 
 
 class FakeVAE(FakeAutoencoder):
-    """The parts of MiniMaxH3VideoVAE the skip touches: decode -> _decode -> one _decode_clip (inherited) per clip."""
+    """The parts of MiniMaxH3VideoVAE the skip touches: decode -> _decode -> _decode_clip_rows (inherited) per clip; with
+    Sol-H3-VAE's decoder (output_frames, patch_size), _decode decodes whole frames itself."""
 
-    def __init__(self):
-        self.decoder = type("Decoder", (), {"out_channels": 3, "patch_size_t": 4})()
+    def __init__(self, sol=False):
+        attributes = {"output_frames": lambda _self, t: 17 * (t // 5) + 5, "patch_size": 16} if sol else {}
+        self.decoder = type("Decoder", (), {"out_channels": 3, "patch_size_t": 4, **attributes})()
         self.decoder_runs = 0
 
+    def _decode(self, z, uint8_rounding=None):
+        if hasattr(self.decoder, "output_frames"):
+            self.decoder_runs += 1
+            return ("decoded whole frames", z.shape)
+        return [pixels for _ in range(2) for _row, pixels in self._decode_clip_rows(z)]
+
     def decode(self, latents, uint8_rounding=None):
-        return [self._decode_clip(latents), self._decode_clip(latents)]
+        return self._decode(latents, uint8_rounding)
 
 
 @pytest.fixture
 def skip():
     windows = {"gen": {"window_no": 1, "total_windows": 1}}
-    original = FakeVAE.decode, FakeVAE._decode_clip
+    original = FakeVAE.decode, FakeVAE._decode, FakeVAE._decode_clip_rows
     sync.install_decode_skip(lambda: sync.is_last_window(windows["gen"]), FakeVAE)
     try:
         yield windows
     finally:
         sync.uninstall_decode_skip()
-    assert (FakeVAE.decode, FakeVAE._decode_clip) == original and "_decode_clip" not in FakeVAE.__dict__
+    assert (FakeVAE.decode, FakeVAE._decode, FakeVAE._decode_clip_rows) == original and "_decode_clip_rows" not in FakeVAE.__dict__
 
 
 def test_helper_skips_only_the_last_windows_final_decode(skip):
@@ -361,6 +369,17 @@ def test_helper_skips_only_the_last_windows_final_decode(skip):
     assert vae.decoder_runs == 0 and "_usp_blank_decode" not in vae.__dict__
     assert vae.decode(z, uint8_rounding="truncate")[0][0] == "blank"
     assert vae.decoder_runs == 0
+
+
+def test_helper_skips_the_sol_decoders_final_decode(skip, monkeypatch):
+    # Sol-H3-VAE decodes whole frames in _decode, not clips: the blank is the uint8 CPU video it would have written
+    monkeypatch.setitem(sys.modules, "torch", type("Torch", (), {"uint8": "uint8"}))  # this suite runs without torch
+    vae = FakeVAE(sol=True)
+    assert vae.decode(FakeLatents((1, 24, 37, 30, 52)), "truncate") == ("blank", (1, 3, 124, 480, 832), ("device", "cpu"), ("dtype", "uint8"))
+    assert vae.decode(FakeLatents((1, 24, 1, 30, 52)), "truncate")[1] == (1, 3, 1, 480, 832)  # a lone latent: one frame
+    assert vae.decoder_runs == 0
+    assert vae.decode(FakeLatents((1, 24, 37, 30, 52)), "round")[0] == "decoded whole frames"
+    assert vae.decoder_runs == 1
 
 
 @pytest.mark.parametrize("rounding", ["round", None])
@@ -400,6 +419,6 @@ def test_uninstall_leaves_a_patch_made_on_top_of_ours():
     FakeVAE.decode = later
     try:
         sync.uninstall_decode_skip()
-        assert FakeVAE.decode is later and "_decode_clip" not in FakeVAE.__dict__
+        assert FakeVAE.decode is later and "_decode_clip_rows" not in FakeVAE.__dict__
     finally:
         FakeVAE.decode = original

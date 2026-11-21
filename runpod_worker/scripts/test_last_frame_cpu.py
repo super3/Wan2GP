@@ -29,8 +29,9 @@ from models.minimax_h3.components.video_autoencoder import AutoencoderKLMiniMaxH
 class _Stub(AutoencoderKLMiniMaxH3):
     """Real chunk geometry, fake decoder.
 
-    ``_decode_clip`` must be a deterministic function of its input so a chunk
-    decoded in isolation is comparable with the same chunk decoded in sequence.
+    ``_decode_clip_rows`` must be a deterministic function of its input so a chunk
+    decoded in isolation is comparable with the same chunk decoded in sequence. It
+    yields the whole clip as one band of rows, as the untiled decoder does.
     Each latent frame expands to ``temporal_ratio`` pixel frames carrying the
     latent's own value, so a mis-sliced tail shows up as a wrong value, not just
     a wrong shape.
@@ -40,14 +41,14 @@ class _Stub(AutoencoderKLMiniMaxH3):
         super().__init__()
         self.calls = 0
 
-    def _decode_clip(self, z):
+    def _decode_clip_rows(self, z):
         self.calls += 1
         b, _, t, h, w = z.shape
         ratio = self.temporal_compression_ratio
         # value of each latent frame -> repeated across its pixel frames
         marks = z[:, :1].mean(dim=(3, 4))                     # [b, 1, t]
         frames = marks.repeat_interleave(ratio, dim=2)        # [b, 1, t*ratio]
-        return frames.view(b, 1, t * ratio, 1, 1).expand(
+        yield 0, frames.view(b, 1, t * ratio, 1, 1).expand(
             b, 3, t * ratio, h * self.spatial_compression_ratio,
             w * self.spatial_compression_ratio).contiguous()
 

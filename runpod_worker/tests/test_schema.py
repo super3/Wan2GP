@@ -238,10 +238,10 @@ def test_letter_whitelists_match_the_handler_source():
         pytest.skip(f"{HANDLER_PY} not found")
     source = _read(HANDLER_PY)
     upstream = set(re.findall(r'"letters_filter"\s*:\s*"([^"]*)"', source))
-    # FL2VA "GVUKFI"/"AKS2"; Ref2VA "KFI"/"GPDEV+*-U1"/"ABDKS1"; the rest belong to
+    # FL2VA "GVUKFI"/"AKS2"; Ref2VA "KFI"/"GPDEV+*-U12"/"ABDKS1"; the rest belong to
     # models this worker does not serve (Viggle "I"/"V-U"/"AK", Viggle Remake
     # "FI"/"V-UA"/"AK", Control "AKS", TTS "ABD").
-    assert upstream == {"GVUKFI", "AKS2", "KFI", "GPDEV+*-U1", "ABDKS1", "I", "V-U", "AK", "AKS", "ABD", "FI", "V-UA"}, (
+    assert upstream == {"GVUKFI", "AKS2", "KFI", "GPDEV+*-U12", "ABDKS1", "I", "V-U", "AK", "AKS", "ABD", "FI", "V-UA"}, (
         f"minimax_h3_handler.py letters_filter set changed to {sorted(upstream)}; "
         "update _FALLBACK_LETTERS / _FL2VA_MODEL_DEF / _REF2VA_MODEL_DEF in schema.py"
     )
@@ -263,7 +263,7 @@ def test_letter_whitelists_match_the_handler_source():
         fl2va["video_prompt_type"]
     )
     assert set(fl2va["audio_prompt_type"]) == set("AKS2")
-    assert set(ref2va["video_prompt_type"]) == set("GPDEV+*-U1") | set("KFI")
+    assert set(ref2va["video_prompt_type"]) == set("GPDEV+*-U12") | set("KFI")
     assert set(ref2va["audio_prompt_type"]) == set("ABDKS1")
     assert set(S.letters_allowed(REF2VA)["video_prompt_type"]) == set(ref2va["video_prompt_type"])
     assert set(S.letters_allowed(REF2VA)["audio_prompt_type"]) == set(ref2va["audio_prompt_type"])

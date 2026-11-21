@@ -846,11 +846,13 @@ def test_bench_attention_whitelist_matches_config():
     assert ast.literal_eval(literal) == CLI_ATTENTION_MODES
 
 
-def test_vae_config_knob_is_written_and_h3_ignores_vram():
-    """MiniMax H3's get_VAE_tile_size ignores device_mem_capacity and returns a
-    256 px tile on the default vae_config=0, so a 96 GB card still tiles its VAE
-    decode. The worker must therefore be able to set vae_config, and 1 must
-    still mean "no tiling" upstream."""
+def test_vae_config_knob_is_written_and_sets_h3s_decode_vram():
+    """MiniMax H3's decoder always works on 256 px tiles (the pipeline's
+    _configure_tiling ignores the tile size), so a 96 GB card tiles its VAE decode
+    whatever vae_config says. Since upstream v20, vae_config sets the VRAM a decode
+    may use instead (decode_vram, from shared.image_vae.tiling.vram_budget): how many
+    tiles go through the decoder per call. The worker's default 0 is WanGP's Auto (what
+    the card has free); 1 still returns tile size 0 for the post-processing upsamplers."""
     keys = C.authoritative_keys()
     assert keys["vae_config"] == 0, "default must stay WanGP's own default"
     os.environ["WANGP_VAE_CONFIG"] = "1"
@@ -861,8 +863,12 @@ def test_vae_config_knob_is_written_and_h3_ignores_vram():
 
     vae = (REPO_ROOT / "models" / "minimax_h3" / "video_vae.py").read_text()
     block = vae.split("def get_VAE_tile_size")[1].split("@property")[0]
-    assert "device_mem_capacity" not in block.split("return")[1], (
-        "upstream started honouring device_mem_capacity -- re-measure whether "
-        "vae_config=1 is still needed on big cards"
+    assert "self.decode_vram = tiling.vram_budget(vae_config, device_mem_capacity)" in block, (
+        "H3's get_VAE_tile_size no longer records the decode VRAM budget -- re-read what "
+        "vae_config does for H3 upstream before relying on the worker's default"
     )
-    assert "{1: 0," in block, "vae_config=1 no longer means 'no tiling' upstream"
+    assert "{1: 0," in block, "vae_config=1 no longer means 'no tiling' for the upsamplers upstream"
+    pipeline = (REPO_ROOT / "models" / "minimax_h3" / "pipeline.py").read_text()
+    assert "enable_tiling(tile_sample_min_height=256, tile_sample_min_width=256)" in pipeline, (
+        "H3 no longer always tiles its decode at 256 px -- re-measure vae_config on big cards"
+    )

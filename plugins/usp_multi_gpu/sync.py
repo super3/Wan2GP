@@ -320,12 +320,14 @@ def install_decode_skip(last_window, vae_class=None) -> None:
     phase 2, so those keep running, and so do image and refinement decodes (no rounding). The skipped decode is the
     one with rounding "truncate" (WanGP's uint8 video) while ``last_window()`` is true. ``_decode`` still runs around
     the blank clips, so the video keeps its frame count, size and dtype and the rest of the helper's task is unchanged.
+    With Sol-H3-VAE's decoder of whole frames (VAE config ``sol_int8``), which never decodes clips, ``_decode`` itself
+    returns the blank uint8 video instead.
     """
     if vae_class is None:
         from models.minimax_h3.video_vae import MiniMaxH3VideoVAE as vae_class
     if _STATE["orig_decode"] is not None:
         return
-    original_decode, original_clip = vae_class.decode, vae_class._decode_clip
+    original_decode, original_rows, original_inner = vae_class.decode, vae_class._decode_clip_rows, vae_class._decode
 
     @functools.wraps(original_decode)
     def decode(self, latents, *args, **kwargs):
@@ -338,19 +340,34 @@ def install_decode_skip(last_window, vae_class=None) -> None:
         finally:
             self.__dict__.pop(_BLANK, None)
 
-    @functools.wraps(original_clip)
-    def _decode_clip(self, z):
+    @functools.wraps(original_rows)
+    def _decode_clip_rows(self, z):
         if not self.__dict__.get(_BLANK):
-            return original_clip(self, z)
-        # the shape the decoder gives one clip (see AutoencoderKLMiniMaxH3._decode_clip), without running it
+            yield from original_rows(self, z)
+            return
+        # one band of rows with the shape the decoder gives the whole clip (as AutoencoderKLMiniMaxH3._decode_clip_rows does
+        # untiled), without running it
         ratio = self.spatial_compression_ratio
-        return z.new_zeros(z.shape[0], self.decoder.out_channels, z.shape[2] * self.decoder.patch_size_t,
-                           z.shape[-2] * ratio, z.shape[-1] * ratio)
+        yield 0, z.new_zeros(z.shape[0], self.decoder.out_channels, z.shape[2] * self.decoder.patch_size_t,
+                             z.shape[-2] * ratio, z.shape[-1] * ratio)
+
+    @functools.wraps(original_inner)
+    def _decode(self, z, uint8_rounding=None):
+        output_frames = getattr(self.decoder, "output_frames", None)  # only Sol-H3-VAE's decoder has it
+        if not self.__dict__.get(_BLANK) or output_frames is None:
+            return original_inner(self, z, uint8_rounding)
+        # the uint8 CPU video MiniMaxH3VideoVAE._decode writes for Sol (a lone latent gives one frame), decoder never run
+        import torch  # noqa: PLC0415 - this module stays importable without torch (CPU CI)
+
+        frames = 1 if z.shape[2] == 1 else output_frames(z.shape[2])
+        size = self.decoder.patch_size
+        return z.new_zeros(z.shape[0], 3, frames, z.shape[-2] * size, z.shape[-1] * size, dtype=torch.uint8, device="cpu")
 
     # what each attribute was in the class's own __dict__ (None: inherited), to put back exactly
-    _STATE["orig_decode"] = (vae_class, {"decode": (decode, vae_class.__dict__.get("decode")),
-                                         "_decode_clip": (_decode_clip, vae_class.__dict__.get("_decode_clip"))})
-    vae_class.decode, vae_class._decode_clip = decode, _decode_clip
+    wrappers = {"decode": decode, "_decode_clip_rows": _decode_clip_rows, "_decode": _decode}
+    _STATE["orig_decode"] = (vae_class, {name: (wrapper, vae_class.__dict__.get(name)) for name, wrapper in wrappers.items()})
+    for name, wrapper in wrappers.items():
+        setattr(vae_class, name, wrapper)
 
 
 def uninstall_decode_skip() -> None:
