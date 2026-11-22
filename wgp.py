@@ -87,8 +87,6 @@ from shared.utils.loras_mutipliers import preparse_loras_multipliers, parse_lora
 from shared.utils.utils import convert_tensor_to_image, convert_video_tensor_to_uint8_chunked, save_image, get_video_info, get_video_real_fps, get_file_creation_date, convert_image_to_video, calculate_new_dimensions, convert_image_to_tensor, calculate_dimensions_and_resize_image, rescale_and_crop, get_video_frame, resize_and_remove_background, rgb_bw_to_rgba_mask, image_editor_layer_to_rgb_mask, to_rgb_tensor, get_resampled_video_transparent, get_video_summary_extras
 from shared.utils.utils import calculate_new_dimensions, get_outpainting_dims, get_outpainting_frame_location, get_outpainting_full_area_dimensions, resolve_outpainting_dims
 from shared.utils.utils import has_video_file_extension, has_image_file_extension, has_audio_file_extension, has_mesh_file_extension, has_world_file_extension, has_app_file_extension, MESH_IMPORT_EXTENSIONS, guide_to_float, guide_mask_to_float
-from shared.utils.kept_loras import kept_lora_signature, models_stay_loaded, reuse_kept_loras
-from shared.utils.background_save import background_save_blockers, background_saves
 from shared.utils.audio_video import extract_audio_tracks, subtitle_stream_count, combine_video_with_audio_tracks, combine_and_concatenate_video_with_audio_tracks, cleanup_temp_audio_files, normalize_audio_volumes_to_temp_files, save_video, save_hdr_video, save_image, get_image_format, get_media_duration_and_audio_layouts
 from shared.utils.audio_video import append_sliding_window_audio, audio_overlap_repair_seconds, source_audio_repair_ms, read_image_metadata, extract_audio_track_to_wav, write_wav_file, save_audio_file, get_audio_codec_extension, create_silent_wav_file
 from shared.utils.audio_video import truncate_audio, shift_audio_trim_ranges, trim_audio_ranges, trim_audio_file_ranges, slice_audio_window, resolve_mux_audio_sampling_rate
@@ -4648,10 +4646,6 @@ def load_models(model_type, override_profile = -1, output_type="video", config_i
             kwargs = pipe
             pipe = kwargs.pop("pipe")
         if "coTenantsMap" not in kwargs: kwargs["coTenantsMap"] = {}
-        if server_config.get("keep_model_loaded", 0):  # the transformers stay in VRAM while the model's other parts (VAEs, encoders) run, as
-            for name in ("transformer", "transformer2"):  # mmgp otherwise unloads them for each of those and loads them back for the next clip
-                if name in pipe:
-                    kwargs["coTenantsMap"].setdefault(name, "*")
         if preview_decoder is not None:
             pipe["tiny_vae"] = preview_decoder
             kwargs["coTenantsMap"]["tiny_vae"] = "*"
@@ -7609,34 +7603,6 @@ def record_file_metadata(video_path, configs, is_image, audio_only, gen, embedde
     if record_notification:
         notifications.record_generation(server_config, gen, video_path, configs, replace_last=replaced_file is not None, notify=notify_generation)
 
-kept_models = {"model_type": None}  # server_config "keep_model_loaded": the model type whose models the last task left in VRAM for the next
-
-def publish_saved_media(gen, send_cmd, video_path, configs, is_image, audio_only_file, embedded_images=None, replaced_file=None, notify_generation=True, output_role="final", side_files=None, api_return_side_files=False, store_artifact=False, artifact=None):
-    """What follows the writing of a generated file: its metadata and gallery entry, its side files, the API artifact (`artifact`:
-    store_api_output_artifact's other arguments, stored when `store_artifact` or when side files are returned), the notification
-    sound and the "output" event. Run by generate_media once the file is written, or by the background saver (background_save)."""
-    record_file_metadata(video_path, configs, is_image, audio_only_file, gen, embedded_images=embedded_images, replaced_file=replaced_file, notify_generation=notify_generation, output_role=output_role)
-    main_path = video_path[0] if isinstance(video_path, list) else video_path
-    output_side_files = process_side_files(main_path, side_files, return_files=api_return_side_files)
-    for side_name in output_side_files:  # a saved world file joins the Worlds gallery
-        side_path = os.path.join(os.path.dirname(main_path), side_name)
-        if has_world_file_extension(side_name) and os.path.isfile(side_path):
-            record_file_metadata(side_path, configs, False, False, gen, notify_generation=False, record_notification=False)
-    if store_artifact or (api_return_side_files and output_side_files):
-        store_api_output_artifact(gen, artifact["client_id"], video_path, artifact["media_type"], artifact["video"], artifact["audio"], artifact["audio_sampling_rate"], artifact["fps"], hdr=artifact["hdr"], flashvsr_continue_cache=artifact["flashvsr_continue_cache"], side_files=output_side_files if api_return_side_files else None)
-    # Play notification sound for single video
-    try:
-        if server_config.get("notification_sound_enabled", 0):
-            volume = server_config.get("notification_sound_volume", 50)
-            notification_sound.notify_video_completion(
-                video_path=video_path,
-                volume=volume
-            )
-    except Exception as e:
-        print(f"Error playing notification sound for individual video: {e}")
-
-    send_cmd("output")
-
 
 @workspace_storage.workspace_generation(headless=lambda state: workspace_storage.HeadlessWorkspaceHost(state, args.workspaces_dir or server_config.get('workspaces_dir') or os.path.join(wgp_root, 'workspaces'), lambda path: get_settings_from_file(state, path, False, False, False)[0], output_override=bool(args.output_dir)))
 @generation_downloads(get_gen_info, lambda: offloadobj)
@@ -8031,13 +7997,6 @@ def generate_media(
     else:
         trans_lora, trans2_lora = trans, trans2
 
-    keep_loras = bool(server_config.get("keep_loras_loaded", 0))
-    models_were_kept = kept_models["model_type"] == model_type  # left in VRAM by the last task (keep_model_loaded)
-    kept_models["model_type"] = None
-    if len(loras_selected) == 0 and keep_loras and getattr(trans_lora, "_loras_adapters", None):  # kept from the last task: none now
-        offload.unload_loras_from_model(trans_lora)
-        if trans2_lora is not None:
-            offload.unload_loras_from_model(trans2_lora)
     if len(loras_selected) > 0:
         loras_selected = update_loras_url_cache(lora_dir, loras_selected)
         errors = check_loras_exist(model_type, loras_selected, True, send_cmd, gen=gen)
@@ -8065,10 +8024,6 @@ def generate_media(
         pinnedLora = not is_mps and loaded_profile !=5  # and transformer_loras_filenames == None False # # #
         preprocess_target = trans_lora if trans_lora is not None else trans
         split_linear_modules_map = getattr(preprocess_target, "split_linear_modules_map", None)
-        lora_signature = kept_lora_signature(trans_lora, trans2_lora, loras_selected, loras_list_mult_choices_nums, base_model_type, pinnedLora) if keep_loras else None
-    if len(loras_selected) > 0 and lora_signature is not None and reuse_kept_loras(trans_lora, trans2_lora, lora_signature, loras_list_mult_choices_nums):
-        pass  # the same LoRAs as the last task are still loaded: multipliers and step counters reset, no reload
-    elif len(loras_selected) > 0:
         offload.load_loras_into_model(
             trans_lora,
             loras_selected,
@@ -8086,7 +8041,7 @@ def generate_media(
             raise gr.Error("Error while loading Loras: " + ", ".join(error_files))
         if trans2_lora is not None: 
             offload.sync_models_loras(trans_lora, trans2_lora)
-        if model_def.get("no_model_swap", False) or models_were_kept:  # blocks kept in VRAM by the previous task (only the LoRAs changed): their GPU copies
+        if model_def.get("no_model_swap", False):  # blocks kept in VRAM by the previous task (only the LoRAs changed): their GPU copies
             for lora_model in (trans_lora, trans2_lora):
                 if lora_model is not None:
                     offloadobj.refresh_loras(lora_model)
@@ -8395,9 +8350,8 @@ def generate_media(
     os.makedirs(save_path, exist_ok=True)
     os.makedirs(image_save_path, exist_ok=True)
     os.makedirs(audio_save_path, exist_ok=True)
-    if not models_were_kept:  # models left in VRAM for this task (keep_model_loaded): nothing to free
-        gc.collect()
-        torch.cuda.empty_cache()
+    gc.collect()
+    torch.cuda.empty_cache()
     wan_model._interrupt = False
     abort = False
     if gen.get("abort", False):
@@ -9261,18 +9215,12 @@ def generate_media(
                     samples = samples.to("cpu") # a video stays where it was decoded until it is converted to uint8 below, the RAM only gets the uint8 frames
   
             clear_gen_cache()
-            # server_config "keep_model_loaded": the models stay in VRAM when this model runs again right after (another window or sample of
-            # this task, or the next queued task of the same model): no unload, no reload of their blocks, no full garbage collection
-            keep_models = models_stay_loaded(server_config.get("keep_model_loaded", 0), gen.get("abort", False), window_no < total_windows,
-                                             repeat_no < total_generation, queued_model_type_after(gen, task), model_type)
-            kept_models["model_type"] = model_type if keep_models else None
             # a model whose generation never swaps models stays loaded (parked: other models and programs reclaim its VRAM as they need it)
             # for the next sample of this task, or for the next queued task of the same model (decided at the end of the task)
-            if not keep_models and not (model_def.get("no_model_swap", False) and offloadobj.park()):
+            if not (model_def.get("no_model_swap", False) and offloadobj.park()):
                 offloadobj.unload_all()
-            if not keep_models:
-                gc.collect()
-                torch.cuda.empty_cache()
+            gc.collect()
+            torch.cuda.empty_cache()
             ram_debug_mark("output processing")
 
             if samples == None:
@@ -9526,24 +9474,6 @@ def generate_media(
                     saver.wait()
                 write_output = None  # what the save thread writes before recording the output
                 saving_status = f"Saving File {file_name if len(file_name) <= 50 else file_name[:12] + '...' + file_name[-35:]}"
-                # server_config "background_save": a plain generated video (no source or control audio, continuation, HDR, soundtrack or
-                # voice processing, one window) is encoded, muxed and published by the background saver, so the next queued task starts
-                # at once; only inside a caller's background_saves.scope(), which waits for it (shared/utils/background_save.py)
-                # A continued video with nothing before this window (no Source Video, first window) would only encode it to a work file:
-                # the background saver encodes it to the same place instead, so the continued video stays untouched
-                background_save = bool(server_config.get("background_save", 0)) and background_saves.accepting()
-                background_blockers = background_save_blockers(video_file=video_file, not_video=audio_only or mesh_outputs or world_only or is_image, hdr=sample_is_hdr,
-                                                               continued_video=continued_video, windows=total_windows if sliding_window else 1,
-                                                               audio_tracks=len(control_audio_tracks) + len(source_audio_tracks),
-                                                               audio_processing=any_soundtrack_processor or audio_source is not None or bool(replace_voice_method and replace_voice_sample is not None),
-                                                               flashvsr_continue=return_flashvsr_continue_cache) if background_save else []
-                if background_blockers:
-                    print(f"[Background save] {file_name} is saved before the next task starts: {', '.join(background_blockers)}")
-                deferred_save_steps = [] if background_save and not background_blockers else None
-                def save_step(fn, *args, _deferred=deferred_save_steps, **kwargs):  # runs now, or later on the background saver with the arguments given now
-                    if _deferred is None:
-                        return fn(*args, **kwargs)
-                    _deferred.append(partial(fn, *args, **kwargs))
 
                 if not is_image and not background_save:
                     set_progress_status(saving_status)
@@ -9887,9 +9817,6 @@ def _process_tasks(state):
     def queue_worker_func():
         nonlocal gpu_acquired
         gen["prompt_no"] = 0
-        # background_save: a task's file may still be written while the next task runs; the queue ends once every file is
-        save_scope = background_saves.scope(report=lambda label, error: send_cmd("error", f"Saving {label} failed: {error}"))
-        save_scope.__enter__()
         try:
             while len(queue) > 0 and not quitting_app:
                 paused_for_edit = False
@@ -9978,7 +9905,6 @@ def _process_tasks(state):
             notification_run.fail(str(e))
             send_cmd("error", f"Queue worker crashed: {e}")
         finally:
-            save_scope.__exit__(None, None, None)  # waits for the files still being written
             with lock:
                 gen.pop("api_active_queue_task", None)
             send_cmd("worker_exit", None)

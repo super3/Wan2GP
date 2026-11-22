@@ -21,11 +21,11 @@ sound and a continuous music bed is mixed over it).
 Each worker gets its own CPU cores (next to its GPU when the machine reports it) and thread budget, and encodes its
 clips with x264 CRF 10 at the veryfast preset: several workers on one machine otherwise slow each other down.
 
-    python scripts/director.py plan.json --out runs/film --dry-run         # jobs, prompts and a GPU-count estimate
-    python scripts/director.py plan.json --out runs/film --gpus 0,1,2,3    # render
-    python scripts/director.py plan.json --out runs/rehearsal --backend fake --gpus 0,0   # no GPU: ffmpeg test patterns
+    python plugins/director/director.py plan.json --out runs/film --dry-run         # jobs, prompts and a GPU-count estimate
+    python plugins/director/director.py plan.json --out runs/film --gpus 0,1,2,3    # render
+    python plugins/director/director.py plan.json --out runs/rehearsal --backend fake --gpus 0,0   # no GPU: ffmpeg test patterns
 
-See docs/DIRECTOR.md for the plan format.
+See plugins/director/README.md for the plan format.
 """
 
 from __future__ import annotations
@@ -48,7 +48,7 @@ import traceback
 import wave
 from pathlib import Path
 
-WANGP_ROOT = Path(__file__).resolve().parents[1]
+WANGP_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_MODEL = "minimax_h3_fasth3_omni_nvfp4"
 H3_FRAMES = {"fps": 24, "minimum": 107, "step": 17, "offset": 5}  # minimax_h3_handler: frames_minimum / steps / offset
 WINDOW_MAX_FRAMES = 362  # one H3 sliding window (15 s): a storyboard split across windows would lose its shot layout
@@ -1452,7 +1452,7 @@ def dry_run(plan: dict, out: Path, gpus: int, scale: float, load_s: float, prebu
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("plan", help="film plan (JSON, see docs/DIRECTOR.md)")
+    parser.add_argument("plan", help="film plan (JSON, see plugins/director/README.md)")
     parser.add_argument("--out", required=True, help="run folder: storyboards/, keyframes/, clips/, stream/, film.mp4, report.json")
     parser.add_argument("--gpus", default=os.environ.get("CUDA_VISIBLE_DEVICES") or "0",
                         help="comma-separated GPU ids, one WanGP worker process each (default: CUDA_VISIBLE_DEVICES or 0)")

@@ -1,5 +1,5 @@
 # Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
-"""CPU tests for scripts/director.py (no GPU, no WanGP import): python -m unittest scripts/test_director.py
+"""CPU tests for plugins/director/director.py (no GPU, no WanGP import): python -m unittest plugins/director/tests/test_director.py
 
 The media tests need ffmpeg on PATH (or DIRECTOR_FFMPEG) and are skipped without it.
 """
@@ -15,7 +15,7 @@ import unittest
 import wave
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import director as D  # noqa: E402
 
 HAVE_FFMPEG = bool(shutil.which("ffmpeg") or D.os.environ.get("DIRECTOR_FFMPEG"))

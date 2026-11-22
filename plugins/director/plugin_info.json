@@ -1,0 +1,14 @@
+{
+  "name": "Director",
+  "author": "super3",
+  "version": "0.1.0",
+  "description": "Renders a planned multi-shot MiniMax H3 film on several GPUs and streams the clips in film order as they finish.",
+  "type": ["app"],
+  "date": "2026-11-23",
+  "wan2gp_version": "20.10",
+  "info_card": {
+    "tagline": "Multi-GPU H3 Films",
+    "description": "A storyboard generation keeps the look consistent, then one clip per shot runs on each GPU, streamed in order over HLS and joined into a film.",
+    "details": "MiniMax H3 · Multi-GPU · HLS Stream"
+  }
+}

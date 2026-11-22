@@ -1,6 +1,6 @@
 # Director: multi-GPU shot rendering with consistent keyframes
 
-`scripts/director.py` renders a planned film with MiniMax H3 (FastH3 Omni NVFP4 by default). It runs several GPUs in parallel and streams the finished clips in order while later ones are still rendering.
+`plugins/director/director.py` renders a planned film with MiniMax H3 (FastH3 Omni NVFP4 by default). It runs several GPUs in parallel and streams the finished clips in order while later ones are still rendering.
 
 1. **Storyboard.** One short H3 generation holds one still shot per planned clip, joined by hard cuts at fixed times (`[Shot 2] At 00:01.000, cut to …`). A single generation keeps faces, wardrobe, light and places consistent across its shots. Long films use several boards. Each board after the first starts on the previous board's last keyframe, which carries the look forward.
 2. **Keyframes.** The director takes the middle frame of every storyboard shot, at least 4 frames from any cut. It reads the decoded frames losslessly through the API's `return_media` (`keyframes/kf_NNN.png`).
@@ -11,17 +11,26 @@ The [cut-away mode](#cut-away-mode-no-storyboard) skips steps 1 and 2: every cli
 
 It has run on RTX 5090s: see [Measured on RTX 5090](#measured-on-rtx-5090).
 
+## In WanGP
+
+This folder goes in WanGP's `plugins/` folder (as `plugins/director`). In WanGP, open **Plugins**, enable **Director** and restart WanGP. The **Director** tab then runs `director.py`:
+- pick an example plan or give a plan file;
+- list the GPUs;
+- choose a mode: **Dry run**, **Rehearsal** (test patterns, no GPU) or **Render**.
+
+It shows the run's log and where its stream and film are. Each GPU runs its own WanGP process, so unload the WebUI's model first or list other GPUs. The command line below does the same, with every option.
+
 ## Running it
 
 ```bash
 # what will run: boards, frames, the first prompts, and a GPU-count estimate from measured RTX 5090 times
-python scripts/director.py scripts/director_example_plan.json --out runs/signal --dry-run --gpus 0,1,2,3
+python plugins/director/director.py plugins/director/examples/plan.json --out runs/signal --dry-run --gpus 0,1,2,3
 
 # render on four GPUs
-python scripts/director.py scripts/director_example_plan.json --out runs/signal --gpus 0,1,2,3
+python plugins/director/director.py plugins/director/examples/plan.json --out runs/signal --gpus 0,1,2,3
 
 # rehearse without a GPU: ffmpeg test patterns, the same scheduling, keyframes and stream
-python scripts/director.py my_plan.json --out runs/rehearsal --backend fake --gpus 0,0,0 --fake-seconds 2
+python plugins/director/director.py my_plan.json --out runs/rehearsal --backend fake --gpus 0,0,0 --fake-seconds 2
 ```
 
 | Option | Meaning |
@@ -43,9 +52,9 @@ Watch the stream while it renders. `ffplay runs/signal/stream/playlist.m3u8` or 
 ## The plan
 
 Paths are relative to the plan file. Three complete six-clip, one-minute examples are included:
-- `scripts/director_example_plan.json` uses reference images for a character and a place.
-- `scripts/director_example_textonly_plan.json` needs no assets. It describes its character the same way in every shot, and the single storyboard generation keeps the look consistent.
-- `scripts/director_example_cutaway_plan.json` is the same film in [cut-away mode](#cut-away-mode-no-storyboard). It needs one source image, `scripts/refs/keeper_source.png`.
+- `plugins/director/examples/plan.json` uses reference images for a character and a place.
+- `plugins/director/examples/textonly_plan.json` needs no assets. It describes its character the same way in every shot, and the single storyboard generation keeps the look consistent.
+- `plugins/director/examples/cutaway_plan.json` is the same film in [cut-away mode](#cut-away-mode-no-storyboard). It needs one source image, `plugins/director/examples/refs/keeper_source.png` (not included).
 
 ```json
 {
@@ -176,7 +185,7 @@ Measured times are the best case: they reuse a cached prompt and the fastest hos
 
 These runs predate the cut-away mode and the [CPU pinning and veryfast encoding](#several-workers-on-one-machine).
 
-`scripts/director_example_textonly_plan.json` (one 6-shot storyboard, then six 10 s clips: 60.8 s of film) on FastH3 Omni NVFP4 at 832×480, with `"wgp_config": {"int8_kernels": "kitchen", "compute_cache": true, "video_profile": 1, "profile": 1, "kernel_precision": "fast"}`, weights already downloaded, `--parallel-start`.
+`plugins/director/examples/textonly_plan.json` (one 6-shot storyboard, then six 10 s clips: 60.8 s of film) on FastH3 Omni NVFP4 at 832×480, with `"wgp_config": {"int8_kernels": "kitchen", "compute_cache": true, "video_profile": 1, "profile": 1, "kernel_precision": "fast"}`, weights already downloaded, `--parallel-start`.
 
 | Setup | Storyboard | 10 s clip | First clip live | Film rendered | Stalls |
 |---|---|---|---|---|---|
@@ -191,7 +200,7 @@ These runs predate the cut-away mode and the [CPU pinning and veryfast encoding]
 ## Tests
 
 ```bash
-python -m unittest scripts/test_director.py
+python -m unittest plugins/director/tests/test_director.py
 ```
 
 The tests need no GPU and do not import WanGP. They cover:

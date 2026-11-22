@@ -1,0 +1,14 @@
+{
+  "name": "Speedups",
+  "author": "super3",
+  "version": "0.1.0",
+  "description": "NVENC output codecs, background save, and the model and LoRAs kept loaded between queued tasks of the same model.",
+  "type": ["app"],
+  "date": "2026-11-23",
+  "wan2gp_version": "20.10",
+  "info_card": {
+    "tagline": "Faster Queues",
+    "description": "Writes each video with the GPU's encoder and in the background while the next task runs, and keeps the model and its LoRAs loaded between queued tasks that reuse them.",
+    "details": "NVENC · Background Save · Kept Model and LoRAs"
+  }
+}
