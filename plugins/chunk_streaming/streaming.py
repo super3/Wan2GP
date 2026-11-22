@@ -13,7 +13,10 @@ the clip is still decoding.
 recorder callbacks; the returned tensor is bit-identical to the original.
 Sol-H3-VAE's whole-frame decoder (VAE config `sol_int8`, upstream v20) has
 its own `_decode` in `MiniMaxH3VideoVAE`, instrumented the same way: it
-reports a chunk per native block of 5 latents (17 frames).
+reports a chunk per native block of 5 latents (17 frames). The pi-H3 DWD
+models (models/minimax_h3/pi_h3_dwd.py, where present) decode their frames
+without a VAE, inside the transformer's last step, with the same Sol layers:
+`pi_h3_dwd.decode` is instrumented the same way.
 `_decode` converts every finalized chunk with `_prepare_decoded_chunk` (in
 `MiniMaxH3VideoVAE`: ImageNet de-normalization, clamp, and uint8 rounding when
 the pipeline asks for it) row of tiles by row of tiles and sends it to a CPU
@@ -84,6 +87,9 @@ class StreamRecorder:
         self.audio_cache: tuple[object, object] | None = None
         #: True when the audio-first hook actually decoded audio before video
         self.audio_first_effective = False
+        #: True when the live segments waited for the audio instead (pi-H3 DWD decodes the video before the audio is known):
+        #: their landing times then include that wait, as with audio first
+        self.segments_wait_audio = False
 
     # -- hooks ------------------------------------------------------------
     def on_decode_start(self) -> None:
@@ -142,7 +148,7 @@ def _to_uint8_frames(vae, sl: torch.Tensor) -> torch.Tensor:
         # .float() is a no-op view when the buffer is already float32, so clone
         # explicitly: the in-place ops below must never touch the output buffer.
         sl = sl.detach().float().clone()
-        if type(vae)._prepare_decoded_chunk is _va.AutoencoderKLMiniMaxH3._prepare_decoded_chunk:
+        if getattr(type(vae), "_prepare_decoded_chunk", None) is _va.AutoencoderKLMiniMaxH3._prepare_decoded_chunk:  # vae None: [-1, 1] (DWD)
             std = getattr(vae, "pixel_std", None)
             mean = getattr(vae, "pixel_mean", None)
             if std is not None and mean is not None:
@@ -155,7 +161,7 @@ def _to_uint8_frames(vae, sl: torch.Tensor) -> torch.Tensor:
 
 
 _STATE: dict = {"active": False, "recorder": None, "orig_decode": None,
-                "orig_audio_decode": None, "orig_video_decode": None, "orig_sol_decode": None}
+                "orig_audio_decode": None, "orig_video_decode": None, "orig_sol_decode": None, "orig_dwd_decode": None}
 
 
 def recorder() -> StreamRecorder | None:
@@ -431,6 +437,70 @@ def _instrumented_sol_decode(self, z: torch.Tensor, uint8_rounding: str | None =
     return decoded
 
 
+def _instrumented_dwd_decode(refiner, features, token_grid, uint8_rounding=None, interrupt=None):
+    """`models.minimax_h3.pi_h3_dwd.decode` with recorder callbacks (pi-H3 DWD models: the adapter's pixel head decodes the video
+    inside the transformer's last step, without the VAE).
+
+    The body is copied from pi_h3_dwd.decode: its refiner is WanGP's Sol decoder (components/dwd_refiner.py), which emits the
+    frames of one latent frame after another by bands of pixel rows, and `emit` converts every band and sends it to the CPU output
+    through an mmgp `RamWriter`. As for the Sol VAE, a chunk is reported at each native block of 5 latents (17 frames) once every
+    band before it has landed, the last block after the decode; the returned tensor is bit-identical to pi_h3_dwd.decode's.
+
+    The audio: DWD decodes the video before the last step's audio is stepped and decoded, so the audio-first prefetch cannot run.
+    Each generation drops the previous one's audio here (the Sol VAE path does it in its video decode wrapper, which DWD never
+    calls); with `audio_first`, the live segments wait for this generation's audio, set by the audio decode moments later, instead
+    of being muxed silent.
+    """
+    from models.minimax_h3.components.sol_decoder import BLOCK as SOL_BLOCK
+    from models.minimax_h3.video_vae import IMAGENET_MEAN, IMAGENET_STD
+
+    transfer, SOL_PATCH = _va.transfer, _dwd_module().SOL_PATCH
+    rec: StreamRecorder = _STATE["recorder"]
+    rec.audio_out = rec.audio_cache = rec.audio_start_t = rec.audio_end_t = None
+    rec.audio_first_effective = False
+    rec.on_decode_start()
+    rec.segments_wait_audio = bool(rec.audio_first and rec.live is not None)
+    if rec.segments_wait_audio:
+        rec.live.wait_for_audio()
+    t, h, w = token_grid
+    e_h, e_w = refiner.expansion
+    frames, height, width = refiner.output_frames(t), h * e_h * SOL_PATCH, w * e_w * SOL_PATCH
+    mean = torch.tensor(IMAGENET_MEAN, dtype=torch.float32, device=features.device).view(1, 3, 1, 1, 1)
+    std = torch.tensor(IMAGENET_STD, dtype=torch.float32, device=features.device).view(1, 3, 1, 1, 1)
+    decoded = torch.empty(1, 3, frames, height, width, dtype=torch.float32 if uint8_rounding is None else torch.uint8, device="cpu")
+    position = latents = reported = chunk_index = 0
+    reports = _LandedReports()
+
+    def emit(pixels, row, last):
+        nonlocal position, latents, reported, chunk_index
+        part = pixels.float().mul_(std).add_(mean).clamp_(0.0, 1.0).mul_(2.0).sub_(1.0)
+        if uint8_rounding == "round":
+            part = part.add_(1.0).mul_(127.5).round_().clamp_(0, 255).to(torch.uint8)
+        elif uint8_rounding == "truncate":
+            part = part.to(torch.float16).sub_(-1).mul_(127.5).clamp_(0, 255).to(torch.uint8)
+        reports.written += 1
+        writer.write(decoded[:, :, position:position + part.shape[2], row:row + part.shape[-2]], part, reports.landed_one)
+        if last:
+            position += part.shape[2]
+            latents += 1
+            if latents % SOL_BLOCK == 0 and reported < position < frames:  # a native block is written: reported once it has landed
+                reports.add(functools.partial(rec.on_chunk, None, decoded, reported, position, chunk_index))
+                reported, chunk_index = position, chunk_index + 1
+
+    with PhaseProgress(refiner.steps(t)) as progress, transfer.RamWriter("decoded video", depth=64, max_bytes=256 << 20) as writer:
+        refiner.progress, refiner.interrupt = progress, interrupt
+        try:
+            refiner(features, token_grid, emit)
+        finally:
+            refiner.progress = refiner.interrupt = None
+        if position == frames and reported < frames:  # the last block
+            reports.add(functools.partial(rec.on_chunk, None, decoded, reported, frames, chunk_index))
+    if position != frames:
+        raise RuntimeError(f"pi-H3 DWD decoded {position} frames, expected {frames}")
+    rec.on_decode_end()  # the writer is closed: every report has run
+    return decoded
+
+
 def activate(store_frames: bool = True, live_dir: str | None = None,
              audio_first: bool = False, segment_video_args: list[str] | None = None) -> StreamRecorder:
     """Install the instrumented decode paths; returns the shared recorder.
@@ -488,15 +558,28 @@ def activate(store_frames: bool = True, live_dir: str | None = None,
         # A new video decode starts a new generation's segments: drop the previous generation's audio, or
         # its segments would carry it (the UI never calls reset() between generations).
         rec.audio_out = rec.audio_cache = rec.audio_start_t = rec.audio_end_t = None
-        rec.audio_first_effective = False
+        rec.audio_first_effective = rec.segments_wait_audio = False
         if rec.audio_first:
             rec.audio_first_effective = _maybe_prefetch_audio(sys._getframe(1), rec)
         return orig_video_decode(self, latents, *args, **kwargs)
 
     _STATE["orig_video_decode"] = orig_video_decode
     _video_mod.MiniMaxH3VideoVAE.decode = audio_first_video_decode
+    dwd_mod = _dwd_module()
+    if dwd_mod is not None:  # the transformer of a pi-H3 DWD model calls pi_h3_dwd.decode through its module at each generation
+        _STATE["orig_dwd_decode"] = dwd_mod.decode
+        dwd_mod.decode = _instrumented_dwd_decode
     _STATE["active"] = True
     return rec
+
+
+def _dwd_module():
+    """models.minimax_h3.pi_h3_dwd, None in a WanGP without the pi-H3 DWD models."""
+    try:
+        from models.minimax_h3 import pi_h3_dwd
+    except ImportError:
+        return None
+    return pi_h3_dwd
 
 
 def deactivate() -> None:
@@ -512,8 +595,10 @@ def deactivate() -> None:
     _video_mod.MiniMaxH3VideoVAE._decode = _STATE["orig_sol_decode"]
     _audio_mod.MiniMaxH3AudioVAE.decode = _STATE["orig_audio_decode"]
     _video_mod.MiniMaxH3VideoVAE.decode = _STATE["orig_video_decode"]
+    if _STATE["orig_dwd_decode"] is not None:
+        _dwd_module().decode = _STATE["orig_dwd_decode"]
     _STATE.update({"active": False, "recorder": None, "orig_decode": None,
-                   "orig_audio_decode": None, "orig_video_decode": None, "orig_sol_decode": None})
+                   "orig_audio_decode": None, "orig_video_decode": None, "orig_sol_decode": None, "orig_dwd_decode": None})
 
 
 # -- segment muxing -------------------------------------------------------
@@ -524,9 +609,10 @@ class LiveSegmenter:
     One instance per generation. `submit` is called from the decode hook with
     each chunk's metadata and uint8 CPU frames; a background thread encodes
     the segment (with its audio slice when `set_audio` has been called, which
-    the audio-first hook guarantees happens before the first chunk) and stamps
-    the wall-clock time the finished file hit disk. `close` drains the queue
-    and returns the per-segment records.
+    the audio-first hook guarantees happens before the first chunk; after
+    `wait_for_audio`, the thread waits for it) and stamps the wall-clock time
+    the finished file hit disk. `close` drains the queue and returns the
+    per-segment records.
     """
 
     def __init__(self, out_dir: str | Path, fps: int = 24, sample_rate: int = 32000,
@@ -537,6 +623,8 @@ class LiveSegmenter:
         self.video_args = video_args
         self.sample_rate = sample_rate
         self.audio: torch.Tensor | None = None
+        self._audio_ready = threading.Event()
+        self._audio_wait_s = 0.0
         self.results: list[dict] = []
         self._queue: queue.Queue = queue.Queue()
         self._closed = False
@@ -547,6 +635,12 @@ class LiveSegmenter:
         if audio is not None and audio.dim() == 3:
             audio = audio[0]
         self.audio = audio
+        self._audio_ready.set()
+
+    def wait_for_audio(self, timeout_s: float = 60.0) -> None:
+        """Mux the segments with the audio `set_audio` gives later (pi-H3 DWD: the video is decoded before the audio is known):
+        the background thread waits for it, at most timeout_s, or until `close`."""
+        self._audio_wait_s = timeout_s
 
     def submit(self, meta: dict, frames_u8: torch.Tensor) -> None:
         if not self._closed:
@@ -559,6 +653,8 @@ class LiveSegmenter:
             if item is None:
                 return
             meta, frames = item
+            if self._audio_wait_s and self.audio is None:
+                self._audio_ready.wait(self._audio_wait_s)  # off the GPU path: the decode goes on
             seg_path = self.out_dir / f"segment_{index:03d}.mp4"
             record = {"segment": index, "frame_start": meta["frame_start"],
                       "frame_end": meta["frame_end"],
@@ -587,6 +683,7 @@ class LiveSegmenter:
     def close(self) -> list[dict]:
         if not self._closed:
             self._closed = True
+            self._audio_ready.set()  # no audio is coming any more: mux what is left as it is
             self._queue.put(None)
         self._thread.join(timeout=120)
         return self.results

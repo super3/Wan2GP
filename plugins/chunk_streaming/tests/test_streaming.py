@@ -731,3 +731,133 @@ def test_deactivate_restores_the_sol_decode():
     assert _video_vae.MiniMaxH3VideoVAE.__dict__["_decode"] is not original
     streaming.deactivate()
     assert _video_vae.MiniMaxH3VideoVAE.__dict__["_decode"] is original
+
+
+# -- pi-H3 DWD (models/minimax_h3/pi_h3_dwd.py, where present): the transformer's pixel head decodes the video, without a VAE ---
+
+try:
+    _dwd = importlib.import_module("models.minimax_h3.pi_h3_dwd")
+    _dwd_refiner = importlib.import_module("models.minimax_h3.components.dwd_refiner")
+except ImportError:  # a WanGP without the pi-H3 DWD models
+    _dwd = _dwd_refiner = None
+needs_dwd = pytest.mark.skipif(_dwd is None, reason="no pi-H3 DWD (models/minimax_h3/pi_h3_dwd.py) in this WanGP")
+DWD_GRID_H, DWD_GRID_W = 3, 6  # DiT tokens: 6 x 12 Sol tokens, 96 x 192 pixels
+
+
+@pytest.fixture
+def dwd_cpu(monkeypatch):
+    """A one-layer DWD refiner (Sol width, DiT width 6) with random weights, and the Sol CPU stand-ins of `sol_cpu`: bands of 2
+    Sol rows, so each latent frame is emitted in 3 bands."""
+    ops = importlib.import_module("shared.kernels.ops")
+    monkeypatch.setattr(ops, "mlp_chunk_rows", lambda tokens, *_a, **_k: tokens)
+    monkeypatch.setattr(_dwd_refiner, "EMIT_BYTES", 2 * 2 * DWD_GRID_W * _sol_mod.EMIT_TOKEN_BYTES)
+    torch.manual_seed(0)
+    refiner = _dwd_refiner.MiniMaxH3DWDRefiner(6, 1, (2, 2)).eval()
+    with torch.no_grad():
+        for parameter in refiner.parameters():
+            parameter.normal_(0.0, 0.05)
+    return refiner
+
+
+def _dwd_decode(refiner, latents, uint8_rounding):
+    features = torch.randn(latents * DWD_GRID_H * DWD_GRID_W, 6, generator=torch.Generator().manual_seed(latents))
+    with torch.no_grad():
+        return _dwd.decode(refiner, features, (latents, DWD_GRID_H, DWD_GRID_W), uint8_rounding)  # through the module, as the transformer
+
+
+@needs_dwd
+@pytest.mark.parametrize("latents,uint8_rounding", [(7, "round"), (12, None), (22, "truncate")])
+def test_dwd_decode_bit_identical_and_reports_each_block(dwd_cpu, latents, uint8_rounding):
+    expected = _dwd_decode(dwd_cpu, latents, uint8_rounding)
+    rec = streaming.activate(store_frames=True)
+    try:
+        rec.reset()
+        got = _dwd_decode(dwd_cpu, latents, uint8_rounding)
+    finally:
+        streaming.deactivate()
+    assert torch.equal(expected, got), "instrumented DWD decode diverged from pi_h3_dwd.decode"
+    frames = dwd_cpu.output_frames(latents)
+    assert expected.shape == (1, 3, frames, DWD_GRID_H * 32, DWD_GRID_W * 32)
+    blocks = -(-latents // _sol_mod.BLOCK)
+    assert [(c["frame_start"], c["frame_end"]) for c in rec.chunks] == [(17 * b, min(17 * (b + 1), frames)) for b in range(blocks)]
+    reference = expected if uint8_rounding else expected.clamp(-1.0, 1.0).add(1.0).mul(127.5).round().to(torch.uint8)
+    assert torch.equal(torch.cat(rec.frames), reference[0].permute(1, 2, 3, 0))
+    assert rec.decode_start_t is not None and rec.decode_end_t is not None
+
+
+@needs_dwd
+@pytest.mark.parametrize("deferred", [False, True])
+def test_dwd_decode_reports_blocks_once_they_have_landed(dwd_cpu, monkeypatch, deferred):
+    expected = _dwd_decode(dwd_cpu, 12, "round")
+    if deferred:
+        monkeypatch.setattr(streaming._va.transfer, "RamWriter", _DeferredRamWriter)
+    rec = streaming.activate(store_frames=True)
+    seen = []
+    on_chunk = rec.on_chunk
+
+    def checked_on_chunk(vae_, decoded, frame_start, frame_end, chunk_index):
+        seen.append((threading.current_thread().name, torch.equal(decoded[:, :, :frame_end], expected[:, :, :frame_end])))
+        on_chunk(vae_, decoded, frame_start, frame_end, chunk_index)
+
+    monkeypatch.setattr(rec, "on_chunk", checked_on_chunk)
+    try:
+        rec.reset()
+        got = _dwd_decode(dwd_cpu, 12, "round")
+    finally:
+        streaming.deactivate()
+    assert torch.equal(expected, got)
+    assert len(seen) == 3 and all(landed for _, landed in seen), "a block was reported before its bands landed"
+    if deferred:
+        assert any(name == "DeferredRamWriter" for name, _ in seen)
+
+
+@needs_dwd
+def test_dwd_live_segments_wait_for_the_audio(dwd_cpu, tmp_path):
+    """DWD decodes the video before the audio is known: with audio first, the segments wait for this generation's audio (never
+    the previous generation's) instead of being muxed silent."""
+    rec = streaming.activate(store_frames=False, live_dir=str(tmp_path), audio_first=True)
+    try:
+        rec.audio_out = torch.ones(2, 32000)  # the previous generation's
+        decoded = _dwd_decode(dwd_cpu, 7, "round")
+        assert rec.segments_wait_audio and not rec.audio_first_effective and rec.audio_out is None
+        time.sleep(0.3)
+        assert rec.live.results == []  # nothing muxed while the audio is pending
+        frames = decoded.shape[2]
+        audio = (torch.sin(torch.linspace(0, 400, 32000 * frames // 24)) * 0.3).repeat(2, 1)
+        rec.live.set_audio(audio)  # what the audio decode wrapper does once the pipeline decodes the audio
+        results = rec.live.close()
+    finally:
+        streaming.deactivate()
+    assert [(r["frame_start"], r["frame_end"]) for r in results] == [(0, 17), (17, frames)]
+    for r in results:
+        assert "error" not in r, r
+        assert r["has_audio"]
+        assert _ffprobe_frames(r["path"])[0] == r["frame_end"] - r["frame_start"]
+
+
+def test_live_segmenter_stops_waiting_for_audio_at_close(tmp_path):
+    seg = streaming.LiveSegmenter(tmp_path, fps=24, sample_rate=32000)
+    seg.wait_for_audio(60.0)
+    seg.submit({"chunk": 0, "frame_start": 0, "frame_end": 17, "t": 0.0}, torch.zeros(17, 48, 64, 3, dtype=torch.uint8))
+    started = time.monotonic()
+    results = seg.close()
+    assert time.monotonic() - started < 30
+    assert len(results) == 1 and "error" not in results[0] and not results[0]["has_audio"]
+
+
+@needs_dwd
+def test_deactivate_restores_the_dwd_decode():
+    original = _dwd.decode
+    streaming.activate()
+    assert _dwd.decode is not original
+    streaming.deactivate()
+    assert _dwd.decode is original
+
+
+def test_a_wangp_without_dwd_still_activates(monkeypatch):
+    monkeypatch.setattr(streaming, "_dwd_module", lambda: None)
+    streaming.activate()
+    try:
+        assert streaming._STATE["orig_dwd_decode"] is None
+    finally:
+        streaming.deactivate()

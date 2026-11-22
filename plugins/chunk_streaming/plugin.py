@@ -105,7 +105,7 @@ class ChunkStreamingPlugin(WAN2GPPlugin):
                 f"Relative to decode start: playback could begin at **{est['start_s']:.2f}s** "
                 f"(padded linear estimate; oracle {oracle:.2f}s) "
                 f"{'with' if not est['would_rebuffer'] else 'WITH RISK OF'} zero rebuffering. "
-                f"Audio-first decode {'active' if rec.audio_first_effective else 'fell back to default order'}; "
+                f"Audio-first decode {'active' if rec.audio_first_effective else 'not possible: the segments waited for the audio (pi-H3 DWD)' if rec.segments_wait_audio else 'fell back to default order'}; "
                 f"audio decode took {rec.audio_s:.2f}s. Generated {time.strftime('%H:%M:%S')}."
             )
         return rows, note

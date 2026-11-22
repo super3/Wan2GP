@@ -147,11 +147,12 @@ def main() -> int:
                     # landed on disk, with mux overlapping the next chunk's
                     # decode. In the fallback ordering segments are silent, so
                     # model the audio-first shift additively instead.
-                    shift = 0.0 if rec.audio_first_effective else audio_s
+                    shift = 0.0 if rec.audio_first_effective or rec.segments_wait_audio else audio_s  # DWD: the wait is in t_done
                     ready = [s["t_done"] - started + shift for s in segments if s.get("t_done")]
                     durations = [s["duration_s"] for s in segments if s.get("t_done")]
                     leg.update({
                         "audio_first_effective": rec.audio_first_effective,
+                        "segments_wait_audio": rec.segments_wait_audio,
                         "audio_decode_s": round(audio_s, 3),
                         "chunk_ready_rel_s": [round(c, 3) for c in chunk_rel],
                         "segments": [{k: v for k, v in s.items() if k != "path"} for s in segments],
