@@ -891,12 +891,17 @@ class MiniMaxH3Pipeline:
         if hyperflow_phase_1 and (int(sampling_steps) not in hyperflow_steps or custom_sigmas and custom_sigmas[0] is not None):
             raise ValueError(f"HyperFlow runs {' or '.join(map(str, hyperflow_steps))} steps on its own schedule, without phase-1 custom sigmas")
         pi_h3 = pi_h3_selected_adapter(loras_selected, loras_slists, int(sampling_steps))  # pi-H3: its adapter sets the schedule
+        pi_h3_dwd = getattr(self, "pi_h3_dwd", False)  # a pi-H3 DWD model: its adapter's head decodes the video
         if getattr(self, "pi_h3", False) and not pi_h3:
-            raise ValueError("pi-H3 needs its adapter (pi_h3_2step_adapter or pi_h3_4step_adapter) selected at multiplier 1")
+            raise ValueError(f"pi-H3 needs its adapter ({'pi_h3_2step_dwd_adapter or pi_h3_4step_dwd_adapter' if pi_h3_dwd else 'pi_h3_2step_adapter or pi_h3_4step_adapter'}) selected at multiplier 1")
         if pi_h3:
             if hyperflow_phase_1 or hyperflow_phase_2 or regenerate_ic or self.reference_mode or self.image_model or self.remake_mode:
                 raise ValueError("pi-H3 adapters apply to MiniMax H3 FL2VA Pruned, without HyperFlow or Regenerate LoRAs")
+            if pi_h3.dwd != pi_h3_dwd:
+                raise ValueError("pi-H3 DWD adapters run on the pi-H3 DWD models, the other pi-H3 adapters on the VAE-decoded ones")
             pi_h3_check_settings(sampling_steps, sample_solver, shift, guide_phases, starting_sigma, self.transformer.cache, custom_sigmas)
+        if pi_h3_dwd and (image_mode > 0 or self.audio_only or self.vae.upsampling):
+            raise ValueError("pi-H3 DWD predicts the frames of one video itself: no image output and no VAE upsampling")
         if self.h3_image and (int(guide_phases) > 1 or any(sigmas is not None for sigmas in custom_sigmas or ()) or starting_sigma is not None
                               or sample_solver != "euler" or self.transformer.cache is not None):
             raise ValueError("H3-Image samples one phase of 6 Euler steps on its own schedule, without custom sigmas or step skipping")
@@ -1407,7 +1412,8 @@ class MiniMaxH3Pipeline:
         cache = self.transformer.cache
         audio_scale = float(shift) / 3.0
 
-        def run_denoising(stage_sigmas_video, stage_sigmas_audio, description, denoising_extra="", pass_no=-1, freeze_audio=False, stage_solver=None, use_cache=True, effective_sigmas_video=None):
+        def run_denoising(stage_sigmas_video, stage_sigmas_audio, description, denoising_extra="", pass_no=-1, freeze_audio=False, stage_solver=None, use_cache=True, effective_sigmas_video=None,
+                          dwd_request=None):
             nonlocal video, audio
             stage_solver = stage_solver or sample_solver
             audio_on_video_schedule = stage_solver in ("res_multistep", "ralston_2s")
@@ -1485,7 +1491,10 @@ class MiniMaxH3Pipeline:
                                                sigma_video, source_buffer, 1.0 - VISUAL_COND_TIMESTEP)
                     model_sigma_video = condition_control_video(video, sigma_video)
                     payload["endpoint_sigmas"] = (sigma_video_next, stage_sigmas_audio[step + 1])  # where the step lands: HyperFlow's r
+                    if dwd_request is not None and step == model_steps - 1:  # pi-H3 DWD: the transformer decodes the pixels of its last step
+                        payload["dwd"] = dwd_request
                     video_velocity, audio_velocity = self.transformer(video, audio, model_sigma_video, stage_sigmas_audio[step:step + 1], context, payload, spectrum=spectrum, first_block_cache=first_block_cache)
+                    payload.pop("dwd", None)
                     if spectrum is not None:
                         spectrum.finish_step()
                     if stage_solver == "er_sde":
@@ -1656,10 +1665,16 @@ class MiniMaxH3Pipeline:
         phase_1_extra = "Phase 1/2 Low Resolution" if two_phase else ""
         if set_progress_status is not None:
             set_progress_status(phase_1_extra or "Denoising")
+        # pi-H3 DWD: the frames as the VAE would give them (uint8 truncated as WGP converts videos, [-1, 1] floats for refinements); a frozen
+        # target video keeps its own frames
+        dwd_request = {"uint8_rounding": None if refinement_mode else "truncate"} if pi_h3_dwd and frozen_target_video is None else None
         run_denoising(sigmas_video, sigmas_audio, "H3 phase 1 denoising" if two_phase else "H3 denoising", phase_1_extra, 1 if two_phase else -1,
-                      effective_sigmas_video=refinement_sigmas_video)
+                      effective_sigmas_video=refinement_sigmas_video, dwd_request=dwd_request)
 
         decoded_video = None
+        if dwd_request is not None:
+            decoded_video = dwd_request.pop("pixels")[0, :, :target_frames]
+            dwd_request = None
         if two_phase:
             self._use_shared_components()
             if set_progress_status is not None:

@@ -31,6 +31,7 @@ def _load_pi_h3():
 
 
 pi_h3 = _load_pi_h3()
+from models.minimax_h3 import pi_h3_dwd  # noqa: E402
 from models.minimax_h3.lora_affine import _load_affine_package  # noqa: E402
 
 
@@ -87,8 +88,12 @@ def test_steps_and_settings_checks():
 def test_adapter_steps_from_path():
     assert pi_h3.adapter_steps_from_path("/loras/minimax_h3/pi_h3_4step_adapter/diffusion_pytorch_model.safetensors") == 4
     assert pi_h3.adapter_steps_from_path("pi_h3_2step_adapter/diffusion_pytorch_model.safetensors|x") == 2
-    assert pi_h3.adapter_steps_from_path("/loras/minimax_h3/pi_h3_4step_dwd_adapter/diffusion_pytorch_model.safetensors") is None
+    assert pi_h3.adapter_steps_from_path("/loras/minimax_h3/pi_h3_4step_dwd_adapter/diffusion_pytorch_model.safetensors") == 4
     assert pi_h3.adapter_steps_from_path("/loras/minimax_h3/some_lora.safetensors") is None
+    assert pi_h3.adapter_from_path("/loras/minimax_h3/pi_h3_2step_dwd_adapter/diffusion_pytorch_model.safetensors") == (2, True)
+    assert pi_h3.adapter_from_path("https://huggingface.co/Lakonik/pi-H3/resolve/main/pi_h3_4step_dwd_adapter/diffusion_pytorch_model.safetensors"
+                                   "|pi_h3_4step_dwd_adapter") == (4, True)  # a model definition's URL
+    assert pi_h3.adapter_from_path("/loras/minimax_h3/pi_h3_2step_adapter/diffusion_pytorch_model.safetensors") == (2, False)
 
 
 HIDDEN, BLOCK_ROWS, VIDEO, AUDIO = 4, 18 * 4, 6, 3
@@ -220,6 +225,54 @@ def test_other_loras_are_left_alone():
     assert state.keys() == lora.keys()
 
 
+def _dwd_tensors(seed=3):
+    """A DWD adapter's extra tensors (diffusers names): its last block's replaced linears and AdaLN bias, and part of its head."""
+    generator = torch.Generator().manual_seed(seed)
+    return {"transformer_blocks.0.attn.to_out.0.weight": torch.randn(5, 7, generator=generator).half(),
+            "transformer_blocks.0.ff.net.0.proj.weight": torch.randn(6, 5, generator=generator).half(),
+            "transformer_blocks.0.ff.net.2.weight": torch.randn(5, 3, generator=generator).half()}
+
+
+def _dwd_adapter(seed=3):
+    """The DWD adapter as preprocess_loras gives it to the conversion: WanGP names, full linears as stored (fc1 unswapped)."""
+    generator = torch.Generator().manual_seed(seed + 1)
+    renamed = {pi_h3_dwd.merged_linear_name(key) + ".weight": value for key, value in _dwd_tensors(seed).items()}
+    return {**_adapter(), **renamed, "blocks.0.adaln_proj.linear.bias": torch.randn(BLOCK_ROWS, generator=generator).half(),
+            "dwd_norm_out.linear.weight": torch.zeros(2 * HIDDEN, 8), "dwd_pixel_refiner.proj_out.weight": torch.zeros(3, 3)}
+
+
+def _dwd_model(seed=3):
+    """FakeH3 with the linears of its block, after pi_h3_dwd.install merged the adapter's (its fingerprints recorded)."""
+    model = FakeH3()
+    block = model.blocks[0]
+    block.attn, block.mlp = nn.Module(), nn.Module()
+    block.attn.out_proj, block.mlp.fc1, block.mlp.fc2 = nn.Linear(7, 5, bias=False), nn.Linear(5, 6, bias=False), nn.Linear(3, 5, bias=False)
+    model.pi_h3_dwd = {"steps": 2, "fingerprints": pi_h3_dwd.merge_linears(model, _dwd_tensors(seed))}
+    return model
+
+
+def test_dwd_adapter_conversion():
+    model, adapter = _dwd_model(), _dwd_adapter()
+    state = dict(adapter)
+    assert pi_h3.convert_full_tensors(model, state) == 2 + 3 + 4  # block AdaLN weight and bias; final AdaLN weight, bias and norm fold; heads
+    # the head and the merged linears are in the model already: only the LoRA part and the differences remain
+    assert sorted(key for key in state if not key.endswith((".diff", ".diff_b"))) == ["blocks.0.attn.out_proj.lora_A.weight", "blocks.0.attn.out_proj.lora_B.weight"]
+    weights = _apply(model, state)
+    torch.testing.assert_close(weights["blocks.0.adaln_proj.linear.bias"], adapter["blocks.0.adaln_proj.linear.bias"].float())  # no signs
+    torch.testing.assert_close(weights["blocks.0.adaln_proj.linear.weight"], adapter["blocks.0.adaln_proj.linear.weight"].float() * torch.tensor(pi_h3.ADALN_SIGNS))
+
+
+def test_dwd_adapter_refusals():
+    with pytest.raises(ValueError, match="select a pi-H3 DWD model"):  # a model that did not install it
+        pi_h3.convert_full_tensors(FakeH3(), _dwd_adapter())
+    with pytest.raises(ValueError, match="not the one this model installed"):  # another DWD adapter (the 4-step one on the 2-step model)
+        pi_h3.convert_full_tensors(_dwd_model(), _dwd_adapter(seed=7))
+    adapter = _dwd_adapter()
+    adapter.pop("blocks.0.mlp.fc2.weight")
+    with pytest.raises(ValueError, match="not the one this model installed"):
+        pi_h3.convert_full_tensors(_dwd_model(), adapter)
+
+
 def test_refusals():
     with pytest.raises(ValueError, match="DWD"):
         pi_h3.convert_full_tensors(FakeH3(), {**_adapter(), "dwd_pixel_refiner.proj_out.weight": torch.zeros(3, 3)})
@@ -243,7 +296,8 @@ def test_refusals():
 def test_selected_adapter():
     adapter = "/loras/minimax_h3/pi_h3_4step_adapter/diffusion_pytorch_model.safetensors"
     other = "/loras/minimax_h3/some_lora.safetensors"
-    assert pi_h3.selected_adapter([other, adapter], {"phase1": [0.7, 1.0]}, 4)
+    assert pi_h3.selected_adapter([other, adapter], {"phase1": [0.7, 1.0]}, 4) == (4, False)
+    assert pi_h3.selected_adapter(["/loras/minimax_h3/pi_h3_2step_dwd_adapter/diffusion_pytorch_model.safetensors"], None, 2) == (2, True)
     assert pi_h3.selected_adapter([adapter], {"phase1": [[1.0, 1.0, 1.0, 1.0]]}, 4)  # one multiplier per step
     assert not pi_h3.selected_adapter([other], {"phase1": [1.0]}, 4)
     assert not pi_h3.selected_adapter([], None, 4)

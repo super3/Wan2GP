@@ -1112,6 +1112,15 @@ class MiniMaxH3Model(nn.Module):
         h_list = [hidden]
         hidden = None
         final_input, length = temb if final_temb is None else final_temb, layout.sequence_length
+        dwd_request, dwd_features = payload.get("dwd"), None  # pi-H3 DWD, at the last step: the pixels from the final hidden states
+        if dwd_request is not None:
+            if batch != 1 or endpoints is not None or final_temb is not None or not hasattr(self, "dwd_pixel_refiner"):
+                raise ValueError("pi-H3 DWD decodes one video with the transformer of a pi-H3 DWD model, without HyperFlow")
+            # taken before the final layer, which consumes the hidden states; the target video rows with their timestep rows, as its head
+            dwd_features = self.dwd_norm_out(h_list[0][video_start:length], temb,
+                                             video_head_row if isinstance(video_head_row, list) else [(0, length - video_start, video_head_row)])
+            if target_video_inverse_order is not None:
+                dwd_features = dwd_features.index_select(0, target_video_inverse_order)
         if batch == 1:
             video, audio = self.final_layer(h_list, final_input, (video_start, length, video_head_row), (audio_start, video_start, audio_row))
             audios = [audio]
@@ -1123,6 +1132,12 @@ class MiniMaxH3Model(nn.Module):
             video, audios = torch.cat([output[0] for output in outputs]), [output[1] for output in outputs]
             del outputs
         del temb, ref2va_temb, rope, timestep_indices, block_offsets, final_temb, final_input
+        if dwd_features is not None:
+            from .pi_h3_dwd import decode as decode_dwd
+
+            dwd_request["pixels"] = decode_dwd(self.dwd_pixel_refiner, dwd_features, (latent_t, latent_h // self.patch_size[1], latent_w // self.patch_size[2]),
+                                               dwd_request.get("uint8_rounding"), interrupt=lambda: self._interrupt)
+            dwd_features = None
         if target_video_inverse_order is not None:
             video = video.index_select(0, target_video_inverse_order)
         video = _to_dtype([video], video_dtype)

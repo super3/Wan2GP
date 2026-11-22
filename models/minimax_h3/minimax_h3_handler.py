@@ -32,7 +32,7 @@ from .h3_image import (H3_IMAGE_ARCHITECTURE, H3_IMAGE_ARCHITECTURES, H3_IMAGE_F
                        H3_IMAGE_PRUNED_ARCHITECTURE, H3_IMAGE_STEPS, H3_IMAGE_VAE_FILE, query_h3_image_def)
 from .hyperflow import HYPERFLOW_DEFAULT_STEPS, HYPERFLOW_STEPS, HYPERFLOW_VIDEO_SHIFT
 from .pdd import PDD_BLOCK_SIZE, PDD_NUM_STEPS
-from .pi_h3 import PI_H3_STEPS, PI_H3_VIDEO_SHIFT
+from .pi_h3 import PI_H3_STEPS, PI_H3_VIDEO_SHIFT, adapter_from_path as pi_h3_adapter_from_path
 from .pika import PIKA_SOLVER, PIKA_STEPS, PIKA_VIDEO_SHIFT
 from .dmad import DMAD_SOLVER
 from .ptd import PTD_FOLDER, PTD_HEAD_FILE, PTD_INFOS, PTD_DEEPY_INFOS
@@ -67,6 +67,20 @@ H3_IMAGE_OLD_LORA_KEY = "minimax_h3_image"  # H3-Image's own LoRA folder before 
 H3_IMAGE_LORA_SUFFIX = "_h3_image"
 _fp32_regenerate_checked = False
 _h3_image_loras_merged = False
+
+
+def _pi_h3_dwd_adapter_file(model_type, model_def):
+    """(local file, steps) of a pi-H3 DWD model's adapter, where WanGP keeps the model's LoRAs (it is loaded as one too): downloaded now
+    when missing, since the transformer takes its head and last blocks when it loads, before the LoRAs are fetched."""
+    wgp = sys.modules.get("wgp")
+    url = next((lora for lora in model_def.get("loras", ()) if (pi_h3_adapter_from_path(lora) or (0, False))[1]), None)
+    if url is None or wgp is None:
+        raise ValueError("A pi-H3 DWD model lists its DWD adapter (pi_h3_2step_dwd_adapter or pi_h3_4step_dwd_adapter) in its LoRAs, loaded by WanGP")
+    path = wgp.get_lora_local_path(wgp.get_lora_dir(model_type), url)
+    if not os.path.isfile(path):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        wgp.download_file(url, path)
+    return path, pi_h3_adapter_from_path(url).steps
 
 
 def _remove_fp32_regenerate_lora(lora_key):
@@ -482,7 +496,13 @@ PI_H3_INFOS = """
 
 Lakonik's pi-H3 adapters (pi-Flow v2 distillation) of the Pruned FL2VA model: text, a first frame, a last frame or both, in **2 or 4 steps** without a guidance pass. The adapter is loaded automatically from Lakonik/pi-H3 and runs at multiplier 1 with its own schedule (Euler, flow shift 12 for the video and 3 for the audio, the last step 0.6 of the others).
 
-The 2-step version halves the denoising time of the 4-step one; Lakonik finds 2 steps enough for simpler scenes and 4 steps better for structure and motion. The video goes through the selected VAE decoder: pi-H3's DWD adapters, which predict the pixels at the last step without a decoder, and the latent variance calibration of Lakonik's pipeline are not supported yet (their inference code is not published).
+The 2-step version halves the denoising time of the 4-step one; Lakonik finds 2 steps enough for simpler scenes and 4 steps better for structure and motion. The video goes through the selected VAE decoder; the pi-H3 DWD models predict it without one.
+"""
+
+PI_H3_DWD_INFOS = """
+### pi-H3 DWD: no video decoder
+
+Lakonik's pi-H3 DWD adapters (Decoding Without a Decoder) predict the frames at the last step from the transformer's own hidden states: an 8-layer Sol refiner replaces the video VAE decoder, and the VAE only encodes the first and last frames. When the model loads, its transformer gets the adapter's pixel head and last four blocks (switching to or from it reloads the transformer); the rest of the adapter runs as a LoRA at multiplier 1. VAE upsampling does not apply.
 """
 
 H3_VDN_INFOS = "\n\n### Automatic 8-step acceleration\nThe VDN 8-step acceleration LoRA is automatically loaded and generation defaults to 8 steps."
@@ -869,6 +889,9 @@ class family_handler:
         if hyperflow and (not pruned or any(model_def.get(flag, False) for flag in ("pdd", "ptd", "vdn", "veda", "fasth3"))):
             raise ValueError("HyperFlow H3 Flash is declared on the pruned FL2VA or Ref2VA architecture, without other acceleration flags")
         pi_h3 = model_def.get("pi_h3", False)
+        pi_h3_dwd = model_def.get("pi_h3_dwd", False)
+        if pi_h3_dwd and not pi_h3:
+            raise ValueError("pi-H3 DWD is declared on a pi-H3 model (pi_h3 and pi_h3_dwd)")
         if pi_h3 and (base_model_type != FL2VA_PRUNED_ARCHITECTURE or any(model_def.get(flag, False) for flag in ("pdd", "ptd", "vdn", "veda", "fasth3", "hyperflow"))):
             raise ValueError("pi-H3 is declared on the pruned FL2VA architecture, without other acceleration flags")
         fixed_schedule = pdd or fasth3 or hyperflow or pi_h3
@@ -970,7 +993,7 @@ class family_handler:
             "control_video_trim_disabled": True,
             "extract_guide_from_window_start": True,  # sliding windows get pure window-aligned guide frames; continuation comes through input_video
             "prompt_enhancer_picture_labels": True,  # enhancer images are labelled with the <Picture N> the pipeline presents
-            "infos": (H3_FASTH3_RUNTIME_INFOS if fasth3 else (REF2VA_INFOS if reference_mode else FL2VA_INFOS) + (H3_PDD_RUNTIME_INFOS if pdd else H3_HYPERFLOW_RUNTIME_INFOS if hyperflow else H3_PI_H3_RUNTIME_INFOS if pi_h3 else H3_RUNTIME_INFOS))
+            "infos": (H3_FASTH3_RUNTIME_INFOS if fasth3 else (REF2VA_INFOS if reference_mode else FL2VA_INFOS) + (H3_PDD_RUNTIME_INFOS if pdd else H3_HYPERFLOW_RUNTIME_INFOS if hyperflow else (H3_PI_H3_RUNTIME_INFOS + (PI_H3_DWD_INFOS if pi_h3_dwd else "")) if pi_h3 else H3_RUNTIME_INFOS))
                      + (PRUNED_INFOS if pruned and not hyperflow else "") + (H3_VDN_INFOS if vdn else "") + model_def.get("infos", ""),
             "prompt_infos": REF2VA_PROMPT_INFOS if reference_mode else FL2VA_PROMPT_INFOS,
             "prompt_enhancer_button_label": "Write",
@@ -995,7 +1018,7 @@ class family_handler:
             "profiles_dir": ["minimax_h3_vdn"] if vdn else ["minimax_h3_fasth3"] if fasth3 else [("minimax_h3_hyperflow_ref2va" if reference_mode else "minimax_h3_hyperflow")] if hyperflow else [] if pdd or pi_h3 else ["minimax_h3", "minimax_h3_ref2va" if reference_mode else "minimax_h3_fl2va"],
             "preset_profiles_dir": [] if fixed_schedule or vdn else ["minimax_h3_presets", "minimax_h3_ref2va_presets"] if reference_mode else ["minimax_h3_presets"],
             "finetune_custom_urls": ["video_vae_file", "audio_vae_file"],
-            "vae_upsamplers": {X2_VAE_METHOD: [0, 1, 2]},
+            "vae_upsamplers": {} if pi_h3_dwd else {X2_VAE_METHOD: [0, 1, 2]},  # DWD predicts the frames at their size
             "finetunes_infos": H3_FINETUNES_INFOS,
             "finetunes_params": H3_FINETUNES_PARAMS,
             TURBO_LORA_KEY: build_hf_url(REPO_ID, "loras", TURBO_LORA_FILE),
@@ -1636,6 +1659,13 @@ class family_handler:
                                  image_model=image_model, distilled_text_encoder=distilled_text_encoder, remake_mode=remake_mode)
         pipeline.ptd = model_def.get("ptd", False)
         pipeline.pi_h3 = model_def.get("pi_h3", False)  # its adapter must stay selected (the pipeline also detects it on other models)
+        pipeline.pi_h3_dwd = model_def.get("pi_h3_dwd", False)
+        if pipeline.pi_h3_dwd:  # the adapter's pixel head and last blocks go into the transformer now, before MMGP takes it
+            from .pi_h3_dwd import install as install_pi_h3_dwd
+
+            adapter_path, adapter_steps = _pi_h3_dwd_adapter_file(model_type, model_def)
+            count = install_pi_h3_dwd(pipeline.transformer, adapter_path, adapter_steps)
+            tqdm.write(f"MiniMax H3: pi-H3 DWD head installed from '{adapter_path}', {count} linears of the last blocks replaced")
         pipe = {"transformer": pipeline.transformer}
         if image_model:
             pipe.update({"vae": pipeline.video_decoder, "video_encoder": pipeline.video_encoder, "text_encoder": pipeline.text_encoder.language_model,

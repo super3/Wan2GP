@@ -17,11 +17,14 @@ at multiplier 1.
   linspace(max_raw_t, max_raw_t * f / (steps - 1 + f), steps) (f = 0.6: the last step is 0.6 of the others), then 0, shifted by 12
   for the video and 3 for the audio; the noise starts at the first noise level.
 
-Not supported yet, until LakonLab publishes pi-H3's inference code: the DWD adapters (pixels from the last step without the VAE
-decoder: their refiner's attention layout is not in the weights) and the pipeline's latent variance calibrations."""
+- DWD adapters (pi_h3_2step_dwd_adapter / pi_h3_4step_dwd_adapter) also predict the pixels at the last step, without the VAE decoder:
+  pi_h3_dwd.py installs their head and replaced linears when a pi-H3 DWD model loads; their LoRA part is converted here.
+
+LakonLab's released pipeline (v0.3.0) has no latent variance calibration: the schedule and the pixel color codec are all it applies."""
 
 import math
 import os
+from typing import NamedTuple
 
 import torch
 
@@ -32,9 +35,12 @@ PI_H3_VIDEO_SHIFT = 12.0
 PI_H3_AUDIO_SHIFT = 3.0
 ADALN_SIGNS = (1.0, 1.0, 1.0, -1.0, -1.0, 1.0, 1.0, -1.0)  # multimodalart/MiniMax-H3-Pruned coordinates -> WanGP's official FL2VA ones
 ADAPTER_FOLDERS = {2: "pi_h3_2step_adapter", 4: "pi_h3_4step_adapter"}
+DWD_ADAPTER_FOLDERS = {2: "pi_h3_2step_dwd_adapter", 4: "pi_h3_4step_dwd_adapter"}
 DWD_PREFIXES = ("dwd_pixel_refiner.", "dwd_norm_out.", "dwd_linear_head.")
 _LORA_MARKERS = (".lora_", ".lora.", ".alpha", ".diff", ".diff_b", ".dora_scale", ".lokr_")
 _BLOCK_ADALN = ".adaln_proj.linear.weight"
+_BLOCK_ADALN_TENSORS = (_BLOCK_ADALN, ".adaln_proj.linear.bias")
+_MERGED_LINEARS = (".attn.out_proj.weight", ".mlp.fc1.weight", ".mlp.fc2.weight")  # a DWD adapter's last blocks, merged when its model loads
 _FINAL = "final_layer."
 
 
@@ -65,29 +71,41 @@ def is_full_tensor(key):
     return not any(marker in key for marker in _LORA_MARKERS)
 
 
-def adapter_steps_from_path(path):
-    """The step count a pi-H3 adapter's folder names (pi_h3_2step_adapter / pi_h3_4step_adapter), None when it names none."""
+class PiH3Adapter(NamedTuple):
+    steps: int
+    dwd: bool
+
+
+def adapter_from_path(path):
+    """The pi-H3 adapter a LoRA's folder names (pi_h3_2step_adapter, pi_h3_4step_dwd_adapter...), None when it names none."""
     folder = os.path.basename(os.path.dirname(str(path).split("|", 1)[0]))
-    for steps, name in ADAPTER_FOLDERS.items():
-        if folder.startswith(name):
-            return steps
+    for dwd, folders in ((True, DWD_ADAPTER_FOLDERS), (False, ADAPTER_FOLDERS)):
+        for steps, name in folders.items():
+            if folder.startswith(name):
+                return PiH3Adapter(steps, dwd)
     return None
 
 
+def adapter_steps_from_path(path):
+    """The step count a pi-H3 adapter's folder names, None when it names none."""
+    adapter = adapter_from_path(path)
+    return None if adapter is None else adapter.steps
+
+
 def selected_adapter(loras_selected, loras_slists, steps):
-    """True when a pi-H3 adapter (its folder: pi_h3_2step_adapter / pi_h3_4step_adapter) is among the selected LoRAs; it must run at
-    multiplier 1 (phase 1) with its own step count."""
+    """The pi-H3 adapter (PiH3Adapter) among the selected LoRAs, None when there is none; it must run at multiplier 1 (phase 1) with its
+    own step count."""
     for index, lora in enumerate(loras_selected or ()):
-        adapter_steps = adapter_steps_from_path(lora)
-        if adapter_steps is None:
+        adapter = adapter_from_path(lora)
+        if adapter is None:
             continue
         multipliers = 1.0 if loras_slists is None else loras_slists["phase1"][index]
         if any(float(value) != 1.0 for value in (multipliers if isinstance(multipliers, list) else [multipliers])):
             raise ValueError("A pi-H3 adapter runs at multiplier 1 (its replaced tensors are exact differences from the base)")
-        if adapter_steps != int(steps):
-            raise ValueError(f"This pi-H3 adapter runs {adapter_steps} steps, not {steps}")
-        return True
-    return False
+        if adapter.steps != int(steps):
+            raise ValueError(f"This pi-H3 adapter runs {adapter.steps} steps, not {steps}")
+        return adapter
+    return None
 
 
 def is_adapter(state_dict):
@@ -103,10 +121,21 @@ def convert_full_tensors(model, state_dict):
         return 0
     full = {key: state_dict[key] for key in state_dict if is_full_tensor(key)}
     dwd = sorted(key for key in full if key.startswith(DWD_PREFIXES))
-    if dwd:
-        raise ValueError("This is a pi-H3 DWD adapter (it predicts pixels without the VAE decoder): WanGP does not support DWD yet, its "
-                         "inference code is not published. Use pi_h3_2step_adapter or pi_h3_4step_adapter.")
-    unexpected = sorted(key for key in full if not (key.startswith("blocks.") and key.endswith(_BLOCK_ADALN) or key.startswith(_FINAL)))
+    merged = sorted(key for key in full if key.startswith("blocks.") and key.endswith(_MERGED_LINEARS))
+    if dwd:  # a DWD adapter: its head and replaced linears are in the model since it loaded (pi_h3_dwd.install), the LoRA part goes on
+        installed = getattr(model, "pi_h3_dwd", None)
+        if installed is None:
+            raise ValueError("This is a pi-H3 DWD adapter (it predicts the pixels without the VAE decoder): select a pi-H3 DWD model, which "
+                             "installs its pixel head and last blocks when it loads")
+        from .pi_h3_dwd import fingerprint
+
+        fingerprints = installed["fingerprints"]
+        if merged != sorted(fingerprints) or any(not torch.equal(fingerprint(full[key]), fingerprints[key]) for key in merged):
+            raise ValueError(f"This pi-H3 DWD adapter is not the one this model installed when it loaded ({DWD_ADAPTER_FOLDERS[installed['steps']]})")
+        for key in dwd + merged:
+            state_dict.pop(key)
+            full.pop(key)
+    unexpected = sorted(key for key in full if not (key.startswith("blocks.") and key.endswith(_BLOCK_ADALN_TENSORS) or key.startswith(_FINAL)))
     if unexpected:
         raise ValueError(f"MiniMax H3 LoRA: unsupported full tensors {unexpected[:4]}{' ...' if len(unexpected) > 4 else ''}")
     if not getattr(model, "use_adaln_curves", False) or model.adaln_t_table.shape[1] != len(ADALN_SIGNS) or model.endpoint_gate is not None:
@@ -136,7 +165,10 @@ def convert_full_tensors(model, state_dict):
 
     converted = 0
     for key in [key for key in full if key.startswith("blocks.")]:
-        put_diff(key[:-len(".weight")], "weight", state_dict.pop(key).float() * signs)
+        if key.endswith(".bias"):  # DWD adapters replace the biases of their last blocks' AdaLN too (output rows: no signs)
+            put_diff(key[:-len(".bias")], "bias", state_dict.pop(key).float())
+        else:
+            put_diff(key[:-len(".weight")], "weight", state_dict.pop(key).float() * signs)
         converted += 1
     final = {key[len(_FINAL):]: state_dict.pop(key) for key in [key for key in full if key.startswith(_FINAL)]}
     adaln = "final_layer.adaln_proj.linear"
