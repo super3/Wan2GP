@@ -18,8 +18,10 @@ REPO = Path(__file__).resolve().parents[2]
 #: sha256 of MiniMaxH3Model.forward's source at the revision usp.py mirrors
 #: (upstream c8d47da: several H3 images denoised as one batch, which USP refuses, and an optional
 #: audio stream, H3-Image having none; upstream v20 f4cfc12: the video and audio patch projections
-#: write into the sequence by chunks of rows (_project_into), ported to usp._usp_forward).
-MIRRORED_FORWARD_SHA256 = "55f0a470021bb0c80c0ba2bd4642fef41a4f37d9ea9ecc1d356a637a6ff47768"
+#: write into the sequence by chunks of rows (_project_into), ported to usp._usp_forward; upstream v20.10 994642c8:
+#: pi-H3 DWD's head reads the last step's video rows and decodes after the final layer, ported; the extreme low-VRAM
+#: mode around the blocks (attention_kit.plan_extreme), left off under USP).
+MIRRORED_FORWARD_SHA256 = "6f0dd204375e8fc82707d37977772b57eb76ad5e7ad7297de675b5b325ff60ab"
 
 
 def _forward_source() -> str:

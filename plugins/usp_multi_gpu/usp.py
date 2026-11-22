@@ -327,7 +327,7 @@ def _usp_forward(self, video_x, audio_x, sigma_video, sigma_audio, context, payl
     """Rank-aware copy of MiniMaxH3Model.forward (transformer.py:846-1099).
 
     Kept as close to upstream as possible; the USP deltas are marked. Pinned to
-    the upstream revision this branch tracks (c8d47da) — re-diff on upstream
+    the upstream revision this branch tracks (v20.10, 994642c8) — re-diff on upstream
     bumps; runpod_worker/tests/test_usp_drift.py fails when the original moves.
     Upstream paths this copy drops are refused up front instead of ported: the
     Spectrum forecast branch and the FirstBlockCache loop (step caches), the
@@ -497,6 +497,8 @@ def _usp_forward(self, video_x, audio_x, sigma_video, sigma_audio, context, payl
     # rope is [1, seq, 1, pairs, 2], or (that, its Kitchen-packed twin [1, seq, 1, pairs, 2, 2]).
     shard_rope = tuple(table[:, lo:hi] for table in rope) if isinstance(rope, tuple) else rope[:, lo:hi]
     _S.bounds = bounds
+    # (USP delta: no extreme low-VRAM mode, upstream's attention_kit.plan_extreme around the blocks: its inputs given by ranges of
+    # rows would bypass the sequence exchange, and each rank holds 1 / world of the sequence already.)
     try:
         with cuda_graphs.scope():  # _usp_graph_gate keeps every block eager
             # USP delta: no per-block self._check_interrupt(). One rank raising between
@@ -518,6 +520,8 @@ def _usp_forward(self, video_x, audio_x, sigma_video, sigma_audio, context, payl
 
     audio_row = int(timestep_indices[audio_start + min(layout.num_target_condition_audio_latents,
                                                        max(audio_t - 1, 0))])
+    dwd_convert = payload.pop("dwd_convert", None)  # the last step of a DWD model: its head reads the video rows the final layer is about to consume
+    dwd_features = None if dwd_convert is None else self.dwd_head.features(hidden[video_start:layout.sequence_length], timestep, video_head_row, dtype)
     h_list = [hidden]
     hidden = None
     final_input, length = temb if final_temb is None else final_temb, layout.sequence_length
@@ -528,6 +532,13 @@ def _usp_forward(self, video_x, audio_x, sigma_video, sigma_audio, context, payl
         video = video.index_select(0, target_video_inverse_order)
     video = T._to_dtype([video], video_dtype)
     audio = T.unpack_audio(T._to_dtype([audio], audio_dtype))
+    # The DWD head decodes after the gather, outside the sharded blocks (_S.bounds is None: attention is not exchanged), the same
+    # frames on every rank.
+    if dwd_features is not None:
+        if target_video_inverse_order is not None:
+            dwd_features = dwd_features.index_select(0, target_video_inverse_order)
+        features_list, dwd_features = [dwd_features], None
+        payload["dwd_video"] = self.dwd_head.decode(features_list, (latent_t, latent_h // self.patch_size[1], latent_w // self.patch_size[2]), dwd_convert, self._interrupt)
     return T.unpatchify_video_tokens(video, latent_t, latent_h, latent_w, self.latents_dim, self.patch_size), audio
 
 
