@@ -74,10 +74,27 @@ if "shared.attention" not in sys.modules:
     def _no_launch_waves(*_args, **_kw):
         return None
 
+    # Imported by attention_kit since upstream v20.10 (SageGP): with no Sage core staged, as on CPU, the real helpers report no
+    # direct FP4 kernel (False) and pass the staged value (None) through unchanged.
+    def _no_fp4_geometry(*_args, **_kw):
+        return False
+
+    def _staged_unchanged(staged, *_args, **_kw):
+        return staged
+
+    # Imported by the Sol-H3-VAE decoder since v20.10: shared Sage2 plans for its windows, None off CUDA (as the real helper).
+    def _no_indexed_window_plans(*_args, **_kw):
+        return None
+
     attn_mod.pay_attention = _sdpa_pay_attention
     attn_mod.sage_staged = _no_sage_staged
     attn_mod.sage_attention_mask = _sage_attention_mask
     attn_mod.launch_waves = _no_launch_waves
+    attn_mod.fp4_geometry = _no_fp4_geometry
+    attn_mod.dense_staged = _staged_unchanged
+    attn_mod.kv_first_staged = _staged_unchanged
+    attn_mod.owned_query_staged = _staged_unchanged
+    attn_mod.indexed_window_plans = _no_indexed_window_plans
     sys.modules["shared.attention"] = attn_mod
     shared_pkg.attention = attn_mod
 
