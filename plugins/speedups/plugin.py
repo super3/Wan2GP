@@ -27,9 +27,8 @@ Nothing in WanGP is edited: the plugin hooks into it while it runs, and removing
 - **Keep the LoRAs loaded**: when the next queued task selects the same LoRAs with the same multipliers, they are reused instead of
   being read, converted and pinned again.
 
-Measured with the same changes built into wgp.py (before they became this plugin), MiniMax H3 pi-H3 2-step, 832×480 5 s clips, RTX
-PRO 6000, time per queued clip: NVENC and kept LoRAs 7.37 → 6.89 s, with background save 6.19 s; keeping the model loaded (another
-host) 7.35 → 5.97 s."""
+Measured with this plugin on an RTX 5090 (WanGP v20.10, MiniMax H3 pi-H3 DWD 2-Step, 832×480, 5 s clips, a queue of 4): 6.95 s per
+clip without it, 4.75 s with every setting on and H.264 NVENC, faster than real time."""
 
 
 def load_settings() -> hooks.Settings:
