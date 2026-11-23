@@ -25,9 +25,12 @@ def codecs(monkeypatch):
     inherited from the environment."""
     for name in ("IMAGEIO_FFMPEG_EXE", "FFMPEG_BINARY"):
         monkeypatch.delenv(name, raising=False)
-    spec = importlib.util.spec_from_file_location("video_codecs_under_test", ROOT / "shared" / "utils" / "video_codecs.py")
+    # inside WanGP's shared.utils package: since v20.12 the module imports its sibling video_decode where it encodes
+    spec = importlib.util.spec_from_file_location("shared.utils.video_codecs_under_test", ROOT / "shared" / "utils" / "video_codecs.py")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    if hasattr(module, "set_hardware_video_encoding"):  # v20.12's own NVENC (Hardware Video Encoding) off: the plugin's codecs alone
+        module.set_hardware_video_encoding("off")
     nvenc = importlib.reload(importlib.import_module("speedups.nvenc"))
     nvenc.install(module)
     return module, nvenc
@@ -100,3 +103,12 @@ def test_other_codecs_unchanged_and_uninstall(codecs, tmp_path, monkeypatch):
     nvenc.uninstall(module)
     assert "h264_nvenc" not in [key for _, key in module.SDR_VIDEO_CODEC_CHOICES]
     assert module.get_video_encode_args("h264_nvenc", "mp4")[1] == "libx264"  # WanGP's fallback for a codec it does not know
+
+
+def test_the_wrapper_takes_the_arguments_of_v20_12(codecs, tmp_path, monkeypatch):
+    """v20.12 calls _get_video_codec_spec(codec_key, container, hardware, ffmpeg_exe): the wrapper passes them on to WanGP's."""
+    module, _ = codecs
+    ffmpeg, _ = fake_ffmpeg(tmp_path / "bin")
+    monkeypatch.setenv("PATH", f"{ffmpeg.parent}{os.pathsep}{os.environ['PATH']}")
+    assert module._get_video_codec_spec("libx264_8", "mp4", False, str(ffmpeg))[0] == "libx264"
+    assert module._get_video_codec_spec("h264_nvenc", "mp4", None, str(ffmpeg))[0] == "h264_nvenc"

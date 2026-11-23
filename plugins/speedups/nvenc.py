@@ -74,12 +74,12 @@ def nvenc_ready(codec_key: str) -> bool:
 def wrap_codec_spec(original):
     """WanGP's video_codecs._get_video_codec_spec, with the NVENC codecs."""
     @functools.wraps(original)
-    def get_video_codec_spec(codec_key, container):
+    def get_video_codec_spec(codec_key, container, *args, **kwargs):  # v20.12 adds hardware and ffmpeg_exe: passed on as they come
         key = str(codec_key or "").strip().lower()
         if key in NVENC_VIDEO_CODECS:
             codec, pixel_format, params = NVENC_VIDEO_CODECS[key] if nvenc_ready(key) else FALLBACK
             return codec, pixel_format, list(params)
-        return original(codec_key, container)
+        return original(codec_key, container, *args, **kwargs)
 
     get_video_codec_spec._speedups_nvenc = True
     return get_video_codec_spec
