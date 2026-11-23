@@ -44,8 +44,35 @@ python plugins/h3_live/demo/h3live_demo.py --port 8000 -- --attention sage2 --pr
 
 The session is paced: it keeps at most `--lead` seconds (12 by default) of video ahead of the stream's clock, so the GPU, faster than real time, waits instead of running away from the viewers, and the playlist holds the last `--window` clips (8), older clip files being deleted. `--prompt`, `--resolution`, `--frames` and `--model` change what it generates. `--dry-run` streams synthetic clips without WanGP or a GPU, to try the page. Ctrl+C stops after the current clip.
 
+## Prompt embeddings made elsewhere
+
+H3 is conditioned on its text encoder's output for the prompt, not on the prompt itself. `embed_server.py` makes that output on one machine, and a video generation on another uses it instead of running its own text encoder: the prompts of a session can come from an LLM, and their encoding from a separate GPU.
+
+**What an embedding is.** Two tensors: `prompt_embeds`, bfloat16 `[1, tokens, 5120]` (Qwen3-VL's hidden states: the 32B encoder truncated after layer 50, or the distilled 4B through its connector), and `text_token_tags`, int64 `[tokens]` (1 for a text token, 0 for an image token and its markers). That is 10,240 bytes per token. With a start or end image the encoder also sees the picture, which adds its image tokens (390 for an 832×480 picture, plus a few markers), so the same prompt has a different embedding with and without its pictures, and with other pictures. Estimated sizes for an FL2VA prompt of 150–300 tokens: about 1.5–3 MB as text only, about 10–11 MB with a start and an end image at 832×480.
+
+**The endpoint.** WanGP runs headless and loads `--model` with one generation that does not end; H3 Live's hook turns it into a service that encodes each request with the pipeline's own text encoding, while the model stays loaded.
+
+```bash
+cd Wan2GP   # with this plugin in plugins/h3_live
+python plugins/h3_live/embed_server.py --port 8890 -- --attention sage2 --profile 1
+python plugins/h3_live/embed_server.py --dry-run   # no WanGP, no GPU: made-up embeddings of the right shape
+```
+
+- `POST /v1/embeddings` with JSON `{"prompt": "...", "images": ["<base64 PNG or JPEG>", ...], "width": 832, "height": 480, "format": "safetensors"}`. `images` are the start image, then the end image, as the video generation will get them (none for text only); `width` and `height` are the video's size, which the pictures are resized to, as the pipeline does. The answer is a safetensors file (`prompt_embeds`, `text_token_tags`, and the prompt, its picture kinds and their digest in the metadata), or with `"format": "json"` the same as JSON with `prompt_embeds` as base64 of the raw little-endian bfloat16 values. The headers `X-H3-Tokens`, `X-H3-Dim` and `X-H3-Encode-S` give the shape and the encode time.
+- `GET /v1/health`: ready or not, the model, embeddings served, mean encode time.
+- It listens on 127.0.0.1 unless `--host` says otherwise; `--token` (or `H3_EMBED_TOKEN`) then asks every request for `Authorization: Bearer <token>`.
+
+```bash
+curl -s localhost:8890/v1/embeddings -H 'Content-Type: application/json' \
+  -d "{\"prompt\": \"$PROMPT\", \"images\": [\"$(base64 -w0 start.png)\", \"$(base64 -w0 start.png)\"]}" -o clip1.safetensors
+```
+
+From Python, `embeddings.fetch(url, prompt, images)` returns one embedding and `embeddings.save(embedding, path)` writes it.
+
+**Using them.** Put the `.safetensors` files in a folder and give it to a session: `LiveSettings(embeddings_dir=...)`, or `--embeddings-dir` for the demo. A supplied embedding is used when the generation's prompt is the same text and it shows the encoder the same kinds of pictures (two images for a start and an end image); anything else is encoded as usual. `embeddings.supply(..., strict=True)` also requires the pictures to be the same ones (the pipeline's digest of them). From a script, `embeddings.supply(embedding)` works for any generation once the plugin's hooks are installed.
+
 ## Tests
 
 ```bash
-python -m pytest plugins/h3_live/tests -q   # CPU only, needs torch, ffmpeg and ffprobe
+python -m pytest plugins/h3_live/tests -q   # CPU only, needs torch, safetensors, ffmpeg and ffprobe
 ```
