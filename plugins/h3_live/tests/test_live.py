@@ -332,3 +332,38 @@ def test_a_session_with_a_start_image_encodes_it_once(tmp_path, cache):
     live.run_session(EncodingPipeline.generate, pipe, {"input_prompt": "task", "seed": 1, "frame_num": 17, "fps": 24, "image_start": start}, settings, root=tmp_path)
     assert pipe.vae_encodes == (1 if cache else 3) and len(pipe.calls) == 3
     assert "_encode_video" not in pipe.__dict__
+
+
+def test_workloads_are_rounded_up_to_a_64th_of_their_power_of_two():
+    assert live.bucket_workload(10) == 10
+    for elements in (51_000 * 5120, 51_003 * 5120, 50_997 * 5120, 123_457, 2**20 + 1):
+        bucketed = live.bucket_workload(elements)
+        assert elements <= bucketed <= elements * 1.016 and live.bucket_workload(bucketed) == bucketed
+    # prompts a few tokens apart in a clip of ~51,000 rows of 5120: one workload
+    assert len({live.bucket_workload((51_000 + tokens) * 5120) for tokens in (166, 169, 173, 175)}) == 1
+
+
+def test_steady_preload_buckets_the_transformer_plans_for_the_session(monkeypatch):
+    plans = {"transformer": types.SimpleNamespace(workload_of=lambda args, kwargs: args[0]),
+             "vae": types.SimpleNamespace(workload_of=lambda args, kwargs: args[0])}
+    planner = types.SimpleNamespace(plans=plans)
+    fake = types.ModuleType("mmgp.auto_preload")
+    fake._planners = [planner]  # a WeakSet of AutoPreload objects in mmgp
+    package = types.ModuleType("mmgp")
+    package.auto_preload = fake
+    monkeypatch.setitem(sys.modules, "mmgp", package)
+    monkeypatch.setitem(sys.modules, "mmgp.auto_preload", fake)
+    original = plans["transformer"].workload_of
+    with live.steady_preload() as patched:
+        assert patched == 1
+        assert plans["transformer"].workload_of((51_169 * 5120,), {}) == plans["transformer"].workload_of((51_173 * 5120,), {})
+        assert plans["vae"].workload_of((51_169,), {}) == 51_169  # other models as they are
+        with live.steady_preload() as again:
+            assert again == 0  # never bucketed twice
+    assert plans["transformer"].workload_of is original
+
+
+def test_steady_preload_without_mmgp_does_nothing(monkeypatch):
+    monkeypatch.setitem(sys.modules, "mmgp", None)
+    with live.steady_preload() as patched:
+        assert patched == 0

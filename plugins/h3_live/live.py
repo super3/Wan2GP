@@ -59,6 +59,7 @@ class LiveSettings:
     playlist_window: int = 0  # > 0: a live playlist of the last N clips, older clip files deleted (endless sessions); 0: keep them all
     embeddings_dir: str = ""  # a folder of prompt embeddings made elsewhere (*.safetensors, embed_server.py), used instead of the text encoder
     cache_image_encodes: bool = True  # a start / end image's VAE encoding made once per session (the same picture every clip)
+    steady_vram_preload: bool = True  # the clips of a session share mmgp's VRAM preload measure, instead of one per prompt length
 
     @classmethod
     def from_dict(cls, data):
@@ -438,6 +439,48 @@ def image_encode_cache(pipe):
             pipe.__dict__.pop("_encode_video", None)
 
 
+WORKLOAD_STEPS = 64  # a workload rounded up to 1/64 of its power of two
+
+
+def bucket_workload(elements: int) -> int:
+    """`elements` rounded up to a step of 1/64 of its power of two (at most 1.6% more): workloads a few tokens apart are one."""
+    elements = int(elements)
+    if elements <= WORKLOAD_STEPS:
+        return elements
+    step = (1 << (elements.bit_length() - 1)) // WORKLOAD_STEPS
+    return -(-elements // step) * step
+
+
+@contextmanager
+def steady_preload(model_id: str = "transformer"):
+    """mmgp's automatic VRAM preload (profiles 1 and 3, and Dynamic) keeps its measure of the VRAM a workload needs by the size of
+    the largest input of a block, and runs the first step of a workload it has not measured with the budget's preload: most of the
+    transformer streamed from RAM. In a live session every clip's prompt is a few tokens longer or shorter, so every clip was a new
+    workload, and with DWD's two steps half of the denoising streamed the weights. For the session, the transformer's workloads
+    are rounded up (bucket_workload): the clips share one measure, and after the first clip the transformer stays in VRAM."""
+    try:
+        from mmgp import auto_preload
+    except ImportError:
+        yield 0
+        return
+    patched = []
+    for planner in list(getattr(auto_preload, "_planners", ()) or ()):
+        plan = getattr(planner, "plans", {}).get(model_id)
+        workload_of = getattr(plan, "workload_of", None)
+        if callable(workload_of) and not getattr(workload_of, "_h3_live_bucketed", False):
+            def bucketed(args, kwargs, original=workload_of):
+                return bucket_workload(original(args, kwargs))
+
+            bucketed._h3_live_bucketed = True
+            plan.workload_of = bucketed
+            patched.append((plan, workload_of))
+    try:
+        yield len(patched)
+    finally:
+        for plan, original in patched:
+            plan.workload_of = original
+
+
 def _live_root() -> Path:
     wgp = _wgp()
     save_path = getattr(wgp, "save_path", None) or "outputs"
@@ -506,7 +549,8 @@ def run_session(orig_generate, pipe, kwargs: dict, settings: LiveSettings, root=
     print(f"[H3 Live] session {session.dir.name}: {'endless' if count == math.inf else count} clips, encoder {session.encoder}")
     pacer = Pacer(settings.pace_lead_s)
     try:
-        with transformer_resident(), (image_encode_cache(pipe) if settings.cache_image_encodes else _nothing()):
+        with transformer_resident(), (image_encode_cache(pipe) if settings.cache_image_encodes else _nothing()), \
+                (steady_preload() if settings.steady_vram_preload else _nothing()):
             if settings.pre_encode_prompts and kwargs.get("image_start") is None and kwargs.get("image_end") is None:
                 _pre_encode(pipe, prompts)
             index = 0
