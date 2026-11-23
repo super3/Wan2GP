@@ -487,9 +487,14 @@ def run_session(orig_generate, pipe, kwargs: dict, settings: LiveSettings, root=
 
 def continues_a_video(kwargs: dict) -> bool:
     """A sliding window after the first, or a video continued from a source: generated as usual (a live session per window
-    would repeat the whole session)."""
-    return (kwargs.get("input_video") is not None or int(kwargs.get("window_start_frame_no") or 0) > 0
-            or int(kwargs.get("prefix_frames_count") or 0) > 0)
+    would repeat the whole session). A start image is not one: WanGP hands it to the pipeline as a one-frame prefix (input_video
+    of one frame, prefix_frames_count 1) beside image_start, and every clip of the session starts on it."""
+    if int(kwargs.get("window_start_frame_no") or 0) > 0:
+        return True
+    prefix = int(kwargs.get("prefix_frames_count") or 0)
+    if kwargs.get("image_start") is not None and prefix <= 1:
+        return False
+    return kwargs.get("input_video") is not None or prefix > 0
 
 
 def _make_wrapper(orig_generate):

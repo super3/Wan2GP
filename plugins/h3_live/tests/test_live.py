@@ -188,6 +188,11 @@ def test_the_hook_passes_through_unless_live_mode_applies(monkeypatch):
             pipe.generate(input_prompt="x", **kwargs)  # images, continuations and later windows: as usual
         assert not sessions
         assert pipe.generate(input_prompt="x") == "session" and len(sessions) == 1
+        # a start image arrives as a one-frame prefix beside image_start: a session, every clip starting on it
+        start = {"image_start": torch.zeros(3, 1, 8, 8), "input_video": torch.zeros(3, 1, 8, 8), "prefix_frames_count": 1}
+        assert pipe.generate(input_prompt="x", **start) == "session" and len(sessions) == 2
+        pipe.generate(input_prompt="x", **dict(start, prefix_frames_count=17))  # a start image on a continued video: as usual
+        assert len(sessions) == 2
         assert live.install(Pipeline) == [] and Pipeline.generate.__wrapped__ is live.STATE["orig_generate"]  # installed once
     finally:
         live.configure(None)
