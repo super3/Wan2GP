@@ -23,6 +23,16 @@ The session folder (`outputs/h3_live/live_<date>/`) holds `clip_NNNNN.mp4` per c
 - **GPU:** 32 GB or more, and about RTX 5090 compute or better (measured: RTX 5090, 1.19× on v20.10, 25 GB of VRAM used). The INT8 transformer (21 GB) and the DWD head have to stay in VRAM; below 32 GB their weights are streamed from RAM at every step, several times slower.
 - **Prompts:** encoded once, before the first clip (the default). On a 32 GB GPU the text encoder does not fit beside the transformer, so a prompt encoded during the session would move the transformer out and back.
 - **Model:** pi-H3 DWD 2-Step. The VAE-decoded models work too, about 1.0× on an RTX PRO 6000, because of their 1–1.5 s video decode per clip.
+- **Start and end images:** a session encodes each picture with the VAE once and reuses it in every clip (`cache_image_encodes`, on by default). Without it the VAE encoder ran in every clip, which also moved the audio VAE out of the GPU and back. Measured on an RTX PRO 6000 (Nov 23), four clips of the same lines, prompts pre-encoded:
+
+  | | Seconds per 5.17 s clip | Real time |
+  |---|---|---|
+  | Text only | 4.27 | 1.21× |
+  | Start image | 5.38 | 0.96× |
+  | Start and end image | 5.81 | 0.89× |
+  | Start and end image, encodes cached | 4.66 | **1.11×** |
+
+  What is left (0.4 s a clip) is the longer sequence: the two pictures' 780 conditioning rows, and the prompt as the text encoder sees it with them (1,019 tokens instead of 169).
 
 ## How it works
 
