@@ -286,3 +286,49 @@ def test_segments_continue_each_other(tmp_path, encoder):
     starts = [float(probe(session.dir / f"clip_{index:05d}.ts")["video"]["start_time"]) for index in range(3)]
     assert starts[0] == pytest.approx(live.STREAM_START_S, abs=0.01)  # B-frames: no shifted first segment
     assert starts[1] - starts[0] == pytest.approx(17 / FPS, abs=0.01) and starts[2] - starts[1] == pytest.approx(17 / FPS, abs=0.01)
+
+
+class EncodingPipeline(FakePipeline):
+    """Encodes its start image every clip, as the H3 pipeline does for a start / end image."""
+
+    def __init__(self):
+        super().__init__()
+        self.vae_encodes = 0
+
+    def _encode_video(self, video, keep_all_latents=False):
+        self.vae_encodes += 1
+        return video.mean(dim=(2, 3), keepdim=True) + 1  # stands for the latents
+
+    def generate(self, input_prompt="", seed=0, frame_num=17, fps=24, image_start=None, **kwargs):
+        if image_start is not None:
+            self.latents = self._encode_video(image_start[:, :1])
+        return super().generate(input_prompt=input_prompt, seed=seed, frame_num=frame_num, fps=fps, **kwargs)
+
+
+def test_the_image_encode_cache_encodes_each_picture_once():
+    pipe = EncodingPipeline()
+    one, other = torch.rand(3, 1, 8, 8), torch.rand(3, 1, 8, 8)
+    with live.image_encode_cache(pipe) as stats:
+        first = pipe._encode_video(one)
+        again = pipe._encode_video(one.clone())  # the same picture, another tensor
+        pipe._encode_video(other)
+        pipe._encode_video(torch.rand(3, 5, 8, 8))  # not one frame: never cached
+        pipe._encode_video(one, keep_all_latents=True)
+        assert torch.equal(first, again) and again is not first
+        again += 1  # a caller changing its latents does not change the cache
+        assert torch.equal(pipe._encode_video(one), first)
+    assert pipe.vae_encodes == 4 and stats == {"hits": 2, "misses": 2}
+    assert "_encode_video" not in pipe.__dict__  # the method again
+    pipe._encode_video(one)
+    assert pipe.vae_encodes == 5
+
+
+@needs_ffmpeg
+@pytest.mark.parametrize("cache", [True, False])
+def test_a_session_with_a_start_image_encodes_it_once(tmp_path, cache):
+    pipe = EncodingPipeline()
+    start = torch.rand(3, 1, 8, 8)
+    settings = live.LiveSettings(enabled=True, prompts=["a", "b", "c"], encoder="x264", cache_image_encodes=cache)
+    live.run_session(EncodingPipeline.generate, pipe, {"input_prompt": "task", "seed": 1, "frame_num": 17, "fps": 24, "image_start": start}, settings, root=tmp_path)
+    assert pipe.vae_encodes == (1 if cache else 3) and len(pipe.calls) == 3
+    assert "_encode_video" not in pipe.__dict__
