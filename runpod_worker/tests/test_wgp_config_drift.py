@@ -762,8 +762,11 @@ def test_video_output_codec_is_worker_owned_and_nvenc_exists():
 
     codec, _pixfmt, params = codecs._get_video_codec_spec("h264_nvenc", "mp4")
     assert codec == "h264_nvenc" and "-cq" in params
-    # the default must be untouched
-    assert codecs._get_video_codec_spec("libx264_8", "mp4")[0] == "libx264"
+    # the default must be untouched. Since v20.12 WanGP itself may encode libx264_8 on NVENC (Hardware Video Encoding "auto", probed with
+    # an ffmpeg binary): the CPU path is asked for explicitly where the function takes that choice.
+    import inspect
+    cpu_only = {"hardware": False} if "hardware" in inspect.signature(codecs._get_video_codec_spec).parameters else {}
+    assert codecs._get_video_codec_spec("libx264_8", "mp4", **cpu_only)[0] == "libx264"
     # libx264_23 exists so API delivery has a codec whose output fits the 10 MB
     # base64 envelope, and stays H.264/yuv420p so any browser can play it.
     codec, pixfmt, params = codecs._get_video_codec_spec("libx264_23", "mp4")
