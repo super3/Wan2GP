@@ -1,19 +1,20 @@
 # Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
-"""The Speedups hooks: keep the model loaded, keep the LoRAs loaded and background save, installed from outside WanGP.
+"""The Speedups hook: keep the model loaded between queued tasks of the same model, installed from outside WanGP.
 
 Nothing in WanGP is edited. install(wgp_globals) replaces names in wgp.py's globals, which its code looks up when it runs:
 
-- generate_media: wrapped, to know the task running (its queue, model and LoRAs) and to decide at its end, with the next queued
-  task in view, what stays loaded and whether to wait for the files being written.
+- generate_media: wrapped, to know the task running (its queue and model) and to decide at its end, with the next queued task in
+  view, whether its models stay loaded.
 - offload (mmgp.offload, as wgp.py sees it): profile() puts the transformers in the co-tenant map of a model loaded with "keep the
-  model loaded" on, and wraps the unload_all() of what it returns; load_loras_into_model / unload_loras_from_model /
-  sync_models_loras keep and reuse LoRAs.
+  model loaded" on, and wraps the unload_all() of what it returns; LoRAs loaded into a model kept in VRAM get their GPU copies
+  (load_loras_into_model, sync_models_loras).
 - gc (as wgp.py sees it): collect() skips the full garbage collections around a model kept in VRAM.
-- save path: ContinuedVideo.append, save_video, combine_and_concatenate_video_with_audio_tracks, record_file_metadata and
-  store_api_output_artifact defer a plain generated video's save to the background saver; the generation's "output" event submits it.
+
+WanGP v20.12 does the rest of what this plugin used to: NVENC output (Hardware Video Encoding), background save and kept LoRAs.
+It keeps a model loaded between queued tasks only for models marked no_model_swap; this hook does it for the others.
 
 Every hook checks where it is called from (wgp.py's generate_media, the line or the locals it expects). When something does not
-match this WanGP version, the hook does what WanGP does without it: a file is saved in the foreground, a model is unloaded."""
+match this WanGP version, the hook does what WanGP does without it: the model is unloaded."""
 
 from __future__ import annotations
 
@@ -21,21 +22,14 @@ import functools
 import gc as _gc
 import inspect
 import linecache
-import os
-import shutil
 import sys
 import threading
-import uuid
 from dataclasses import asdict, dataclass, fields
-
-from .background_save import BackgroundSaver, remove_placeholder
 
 
 @dataclass
 class Settings:
     keep_model_loaded: bool = False  # the models stay in VRAM when the next queued task uses the same model
-    keep_loras_loaded: bool = False  # the LoRAs stay loaded when the next queued task selects the same ones
-    background_save: bool = False  # a plain generated video is written while the next queued task runs
 
     @classmethod
     def from_dict(cls, data: dict) -> "Settings":
@@ -46,11 +40,8 @@ class Settings:
         return asdict(self)
 
 
-STATE = {"installed": False, "globals": None, "originals": {}, "settings": Settings(), "kept_model_type": None, "kept_loras": None,
-         "notes": set()}
-saver = BackgroundSaver(max_waiting=1)
+STATE = {"installed": False, "globals": None, "originals": {}, "settings": Settings(), "kept_model_type": None}
 _local = threading.local()
-_REQUIRED_SAVE_LOCALS = ("video_path", "container", "sample_is_hdr", "control_audio_tracks", "source_audio_tracks", "sliding_window", "side_files")
 
 
 def settings() -> Settings:
@@ -61,37 +52,19 @@ def configure(new_settings: Settings) -> None:
     STATE["settings"] = new_settings
 
 
-def _note(text: str) -> None:
-    """Print a message once per process."""
-    if text not in STATE["notes"]:
-        STATE["notes"].add(text)
-        print(f"[Speedups] {text}")
-
-
 # --- the running generation -----------------------------------------------------------------------------------------------------
 
 class Call:
     """One generate_media call: its task and queue, and what the hooks deferred during it."""
 
-    def __init__(self, task, gen, model_type, send_cmd):
-        self.task, self.gen, self.model_type, self.send_cmd = task, gen, model_type, send_cmd
+    def __init__(self, task, gen, model_type):
+        self.task, self.gen, self.model_type = task, gen, model_type
         self.thread = threading.current_thread()
         self.model_kept = False  # the previous task left this model in VRAM
         self.skip_next_gc = False  # the next full garbage collection of generate_media is skipped (a model kept in VRAM)
         self.unload_deferred = False  # its models were not unloaded after a generation: decided at the end of the call
-        self.lora_models = []  # models whose LoRA unload at the end of the task was deferred: decided at the end of the call
-        self.loras_reloaded = False  # LoRAs were loaded (not reused) while the model was kept in VRAM
-        self.save = None  # the file being collected for the background saver (Save), until the "output" event submits it
+        self.loras_reloaded = False  # LoRAs were loaded while the model was kept in VRAM
         self.failed = False
-
-
-class Save:
-    def __init__(self, video_path: str):
-        self.video_path = video_path
-        self.label = os.path.basename(video_path)
-        self.steps = []
-        self.temp_files = []  # removed once the file is written (or its save failed)
-        self.renamed = {}  # an intermediate file WanGP names, as the save writes it instead
 
 
 def current_call() -> Call | None:
@@ -110,11 +83,6 @@ def _params(task) -> dict:
     return (task or {}).get("params") or {}
 
 
-def lora_selection(task) -> tuple:
-    params = _params(task)
-    return params.get("model_type"), tuple(params.get("activated_loras") or ()), str(params.get("loras_multipliers") or "")
-
-
 def _caller(depth: int = 2):
     """The frame of wgp.py's generate_media that called the hook, or None."""
     frame = sys._getframe(depth)
@@ -131,13 +99,10 @@ def _wrap_generate_media(original):
         G = STATE["globals"]
         state, model_type = kwargs.get("state"), kwargs.get("model_type")
         gen = G["get_gen_info"](state) if isinstance(state, dict) else {}
-        call = Call(task, gen, model_type, send_cmd)
+        call = Call(task, gen, model_type)
         call.model_kept = STATE["kept_model_type"] is not None and STATE["kept_model_type"] == model_type
         call.skip_next_gc = call.model_kept
         STATE["kept_model_type"] = None
-        kept = STATE["kept_loras"]
-        if kept is not None and kept[0] != lora_selection(task):  # the queue changed since: the LoRAs kept for the next task are not its own
-            _release_kept_loras()
         outer = getattr(_local, "call", None)
         _local.call = call
         result = None
@@ -156,46 +121,25 @@ def _wrap_send_cmd(send_cmd, call: Call):
     def send(cmd, *args, **kwargs):
         if cmd == "error":
             call.failed = True
-        if cmd == "output" and call.save is not None and current_call() is call:
-            _submit(call, functools.partial(send_cmd, cmd, *args, **kwargs))  # the event follows the file it announces
-            return None
         return send_cmd(cmd, *args, **kwargs)
 
     return send
 
 
 def _finish(call: Call, result) -> None:
-    """End of a generate_media call: what stays loaded for the next task, and the files still being written."""
-    G = STATE["globals"]
-    if call.save is not None:  # stopped between writing a file and announcing it: written now, as WanGP would have
-        save, call.save = call.save, None
-        try:
-            for step in save.steps:
-                step()
-        except Exception as error:  # noqa: BLE001 - reported like a failed background save
-            print(f"[Speedups] Saving {save.label} failed: {error!r}")
-        _remove_files(save.temp_files)
+    """End of a generate_media call: whether its models stay loaded for the next task."""
+    if not call.unload_deferred:
+        return
     following = next_task(call.gen, call.task)
     ok = result is not False and not call.failed and not call.gen.get("abort", False)
-    same_model_next = ok and following is not None and _params(following).get("model_type") == call.model_type
-    if call.lora_models:
-        if settings().keep_loras_loaded and same_model_next and lora_selection(following) == lora_selection(call.task):
-            STATE["kept_loras"] = (lora_selection(call.task), list(call.lora_models))
-        else:
-            for model in call.lora_models:
-                _unload_loras(model)
-    if call.unload_deferred:
-        if settings().keep_model_loaded and same_model_next:
-            STATE["kept_model_type"] = call.model_type
-        else:
-            offloadobj = G.get("offloadobj")
-            if offloadobj is not None:
-                STATE["originals"]["unload_all"](offloadobj)
-            _gc.collect()
-            _empty_cuda_cache()
-    if following is None:  # the end of the queue (or a caller that keeps none): every file is written before it returns
-        for label, error in saver.wait():
-            call.send_cmd("error", f"Saving {label} failed: {error}")
+    if settings().keep_model_loaded and ok and following is not None and _params(following).get("model_type") == call.model_type:
+        STATE["kept_model_type"] = call.model_type
+        return
+    offloadobj = STATE["globals"].get("offloadobj")
+    if offloadobj is not None:
+        STATE["originals"]["unload_all"](offloadobj)
+    _gc.collect()
+    _empty_cuda_cache()
 
 
 def _empty_cuda_cache() -> None:
@@ -250,30 +194,6 @@ class _GcProxy:
         return _gc.collect(*args, **kwargs)
 
 
-# --- keep the LoRAs loaded ------------------------------------------------------------------------------------------------------
-
-def lora_signature(lora_paths, lora_multipliers, pinned, max_reserved):
-    """What makes a task's LoRAs the ones already loaded in a model: the same files (path, size, modification time), multipliers and
-    pinning. Kept on the model object itself, so a reloaded model never matches."""
-    try:
-        files = tuple((os.path.abspath(path), os.path.getsize(path), os.path.getmtime(path)) for path in lora_paths)
-    except (OSError, TypeError):
-        return None
-    return files, repr(lora_multipliers), bool(pinned), max_reserved
-
-
-def _unload_loras(model) -> None:
-    if model is not None:
-        model.__dict__.pop("_speedups_lora_signature", None)
-    STATE["originals"]["offload"].unload_loras_from_model(model)  # mmgp.offload, as wgp.py had it
-
-
-def _release_kept_loras() -> None:
-    kept, STATE["kept_loras"] = STATE["kept_loras"], None
-    for model in (kept[1] if kept else []):
-        _unload_loras(model)
-
-
 class _OffloadProxy:
     """mmgp.offload as wgp.py sees it, with the Speedups hooks."""
 
@@ -300,235 +220,34 @@ class _OffloadProxy:
         _wrap_unload_all(offloadobj)
         return offloadobj
 
-    def load_loras_into_model(self, model, lora_path, lora_multi=None, *args, **kwargs):
+    def load_loras_into_model(self, model, *args, **kwargs):
+        result = self._offload.load_loras_into_model(model, *args, **kwargs)
         call = current_call()
-        options = inspect.signature(self._offload.load_loras_into_model).bind(model, lora_path, lora_multi, *args, **kwargs).arguments
-        if options.get("check_only") or call is None or not settings().keep_loras_loaded:
+        if call is not None and call.model_kept:
+            options = inspect.signature(self._offload.load_loras_into_model).bind(model, *args, **kwargs).arguments
             if not options.get("check_only"):
-                model.__dict__.pop("_speedups_lora_signature", None)
-            return self._offload.load_loras_into_model(model, lora_path, lora_multi, *args, **kwargs)
-        STATE["kept_loras"] = None  # this task takes them over
-        signature = lora_signature(lora_path, lora_multi, options.get("pinnedLora"), options.get("maxReservedLoras"))
-        adapters = getattr(model, "_loras_adapters", None)
-        if signature is not None and adapters and getattr(model, "_speedups_lora_signature", None) == signature and not getattr(model, "_loras_errors", None):
-            # the LoRAs the last task left loaded: activated again with this task's multipliers, as a load does at its end
-            names = list(adapters)
-            multipliers = [lora_multi[index] if lora_multi is not None and index < len(lora_multi) else 1.0 for index in range(len(names))]
-            self._offload.activate_loras(model, names, multipliers)
-            return None
-        if getattr(model, "_speedups_lora_signature", None) is not None:  # other LoRAs kept from the last task
-            _unload_loras(model)
-        result = self._offload.load_loras_into_model(model, lora_path, lora_multi, *args, **kwargs)
-        if signature is not None and not getattr(model, "_loras_errors", None):
-            model._speedups_lora_signature = signature
-        if call.model_kept:  # its blocks stayed in VRAM: they get the GPU copies a load of them would have made
-            call.loras_reloaded = True
-            STATE["globals"]["offloadobj"].refresh_loras(model)
+                # its blocks stayed in VRAM: they get the GPU copies a load of them would have made (WanGP does the same for its
+                # no_model_swap models; LoRAs it reuses as they are are activated, not loaded, and need none)
+                call.loras_reloaded = True
+                STATE["globals"]["offloadobj"].refresh_loras(model)
         return result
 
-    def sync_models_loras(self, model, model2):
-        result = self._offload.sync_models_loras(model, model2)
+    def sync_models_loras(self, model, model2, *args, **kwargs):
+        result = self._offload.sync_models_loras(model, model2, *args, **kwargs)
         call = current_call()
         if call is not None and call.loras_reloaded and model2 is not None:
             STATE["globals"]["offloadobj"].refresh_loras(model2)
         return result
 
-    def unload_loras_from_model(self, model):
-        call = current_call()
-        if (call is not None and settings().keep_loras_loaded and model is not None and sys.exc_info()[0] is None
-                and getattr(model, "_speedups_lora_signature", None) is not None):
-            call.lora_models.append(model)  # the end of the task decides: kept when the next task selects the same LoRAs
-            return None
-        if model is not None:
-            model.__dict__.pop("_speedups_lora_signature", None)
-        return self._offload.unload_loras_from_model(model)
-
-
-# --- background save ------------------------------------------------------------------------------------------------------------
-
-def save_blockers(local_vars: dict, continued_video=None) -> list[str]:
-    """Why a generated output must be written before the next task starts (empty: it may be written in the background). The background
-    path writes a plain generated video: its frames encoded with WanGP's codec, then muxed with the generated sound."""
-    missing = [name for name in _REQUIRED_SAVE_LOCALS if name not in local_vars]
-    if missing:
-        return [f"this WanGP's save code is not the one the plugin knows ({', '.join(missing)})"]
-    L = local_vars
-    windows = L.get("total_windows", 1) if L.get("sliding_window") else 1
-    reasons = [(L.get("video_file") is not None, "the model wrote the video itself"), (L.get("is_image") or L.get("audio_only"), "not a video"),
-               (L.get("sample_is_hdr"), "HDR"), (continued_video is not None and (continued_video.video_source is not None or continued_video.file is not None), "it continues a video"),
-               (windows != 1, "several windows"), (len(L["control_audio_tracks"] or []) + len(L["source_audio_tracks"] or []) > 0, "source or control audio"),
-               (L.get("any_soundtrack_processor") or L.get("audio_source") is not None or bool(L.get("replace_voice_method") and L.get("replace_voice_sample") is not None), "soundtrack or voice processing"),
-               (L.get("return_flashvsr_continue_cache"), "FlashVSR continuation"), (bool(L["side_files"]), "side files")]
-    return [reason for blocked, reason in reasons if blocked]
-
-
-def _start_save(call: Call, frame, continued_video=None) -> Save | None:
-    """A Save for the file generate_media is writing, or None when it must be written now (and why is printed)."""
-    if not settings().background_save or call.save is not None:
-        return None
-    blockers = save_blockers(frame.f_locals, continued_video)
-    if blockers:
-        print(f"[Speedups] {os.path.basename(str(frame.f_locals.get('video_path', 'the file')))} is saved before the next task starts: {', '.join(blockers)}")
-        return None
-    call.save = Save(frame.f_locals["video_path"])
-    return call.save
-
-
-def _work_file(video_path: str, suffix: str) -> str:
-    base = video_path.rsplit(".", 1)[0]
-    return f"{base}_speedups{uuid.uuid4().hex[:8]}{suffix}"
-
-
-def _reserve(path: str) -> None:
-    """An empty file reserves the name until the video is written (WanGP's get_available_filename skips existing files)."""
-    if not os.path.exists(path):
-        open(path, "ab").close()
-
-
-def _patch_continued_video(continued_video_cls) -> None:
-    original = continued_video_cls.append
-    STATE["originals"]["ContinuedVideo.append"] = (continued_video_cls, original)
-
-    @functools.wraps(original)
-    def append(self, frames):
-        call = current_call()
-        frame = _caller() if call is not None else None
-        if frame is None:
-            return original(self, frames)
-        line = _line(frame)
-        with_sound = line.startswith("save_path_tmp = continued_video.append(")
-        if not (with_sound or line.startswith("continued_video_path = continued_video.append(")):
-            return original(self, frames)
-        save = _start_save(call, frame, self)
-        if save is None:
-            return original(self, frames)
-        # a fresh continued video (nothing before this window) would only encode the window to a work file of its own: the save
-        # encodes it instead, and the continued video stays untouched
-        container = frame.f_locals["container"]
-        if with_sound:  # encoded alone, muxed with the sound below (combine_and_concatenate_video_with_audio_tracks)
-            path = _work_file(save.video_path, f".{container}")
-            save.steps.append(functools.partial(self.encode, frames, path))
-            save.temp_files.append(path)
-            _reserve(save.video_path)
-            return path
-        # no sound: WanGP copies the returned file to the video's path. It gets an empty one, which reserves the name; the save then
-        # writes the video there
-        empty = _work_file(save.video_path, f".{container}")
-        open(empty, "wb").close()
-        save.temp_files.append(empty)
-        save.steps.append(functools.partial(self.encode, frames, save.video_path))
-        return empty
-
-    append._speedups = True
-    continued_video_cls.append = append
-
-
-def _wrap_save_video(original):
-    """WanGP's save_video, for a video without a continued video (an API call that returns the frames): deferred to the save."""
-    @functools.wraps(original)
-    def save_video(*args, **kwargs):
-        call = current_call()
-        frame = _caller() if call is not None else None
-        if frame is None or not _line(frame).startswith("save_video(") or "save_file" not in kwargs:
-            return original(*args, **kwargs)
-        target = kwargs["save_file"]
-        save = _start_save(call, frame)
-        if save is None:
-            return original(*args, **kwargs)
-        if target == save.video_path:  # no sound: written where it belongs
-            _reserve(target)
-            save.steps.append(functools.partial(original, *args, **kwargs))
-            return target
-        # with sound: WanGP removes this temporary file after the mux, so it gets an empty one; the save writes and muxes its own
-        path = _work_file(save.video_path, os.path.splitext(target)[1])
-        open(target, "wb").close()
-        save.renamed[target] = path
-        save.temp_files.append(path)
-        _reserve(save.video_path)
-        save.steps.append(functools.partial(original, *args, **dict(kwargs, save_file=path)))
-        return target
-
-    save_video._speedups = True
-    return save_video
-
-
-def _keep_link(path: str, save: Save) -> str:
-    """A name of the save's own for a file WanGP removes once the mux is called (its temporary sound tracks)."""
-    if not isinstance(path, str) or not os.path.isfile(path):
-        return path
-    base, extension = os.path.splitext(path)
-    kept = f"{base}_speedups{uuid.uuid4().hex[:8]}{extension}"
-    try:
-        os.link(path, kept)
-    except OSError:
-        shutil.copyfile(path, kept)
-    save.temp_files.append(kept)
-    return kept
-
-
-def _wrap_combine(original):
-    @functools.wraps(original)
-    def combine(*args, **kwargs):
-        call = current_call()
-        if call is None or call.save is None or _caller() is None:
-            return original(*args, **kwargs)
-        save = call.save
-        bound = inspect.signature(original).bind(*args, **kwargs)
-        names = list(bound.arguments)
-        video_in = names[1]  # (output file, video file, source tracks, new tracks, ...)
-        bound.arguments[video_in] = save.renamed.get(bound.arguments[video_in], bound.arguments[video_in])
-        if "new_audio_tracks" in bound.arguments:
-            bound.arguments["new_audio_tracks"] = [_keep_link(path, save) for path in bound.arguments["new_audio_tracks"] or []]
-        save.steps.append(functools.partial(original, *bound.args, **bound.kwargs))
-        return None
-
-    combine._speedups = True
-    return combine
-
-
-def _wrap_deferred(original):
-    """record_file_metadata, store_api_output_artifact: after the file is written."""
-    @functools.wraps(original)
-    def deferred(*args, **kwargs):
-        call = current_call()
-        if call is None or call.save is None or _caller() is None:
-            return original(*args, **kwargs)
-        call.save.steps.append(functools.partial(original, *args, **kwargs))
-        return None
-
-    deferred._speedups = True
-    return deferred
-
-
-def _remove_files(paths) -> None:
-    for path in paths:
-        try:
-            os.remove(path)
-        except OSError:
-            pass
-
-
-def _submit(call: Call, announce) -> None:
-    save, call.save = call.save, None
-    steps = save.steps + [functools.partial(_remove_files, list(save.temp_files)), announce]
-
-    def failed():
-        _remove_files(save.temp_files)
-        remove_placeholder(save.video_path)
-
-    saver.submit(save.label, steps, on_failure=failed)  # blocks while an earlier save waits: never more than one clip ahead
-
 
 # --- install --------------------------------------------------------------------------------------------------------------------
 
-_WRAPPED = {"generate_media": _wrap_generate_media, "save_video": _wrap_save_video,
-            "combine_and_concatenate_video_with_audio_tracks": _wrap_combine,
-            "record_file_metadata": _wrap_deferred, "store_api_output_artifact": _wrap_deferred}
+_WRAPPED = {"generate_media": _wrap_generate_media}
 
 
 def install(wgp_globals: dict, new_settings: Settings | None = None) -> list[str]:
     """Install the hooks into wgp.py's globals (the WebUI's plugin does it at start; an API script passes
-    `session._ensure_runtime().module.__dict__`). Returns what this WanGP lacks (the hooks that need it stay off)."""
+    `session._ensure_runtime().module.__dict__`). Returns what this WanGP lacks (the hooks then stay off)."""
     if new_settings is not None:
         configure(new_settings)
     if STATE["installed"]:
@@ -545,8 +264,6 @@ def install(wgp_globals: dict, new_settings: Settings | None = None) -> list[str
     wgp_globals["gc"] = _GcProxy()
     if wgp_globals.get("offloadobj") is not None:  # a model loaded before the install
         _wrap_unload_all(wgp_globals["offloadobj"])
-    from shared.utils.video_continuation import ContinuedVideo
-    _patch_continued_video(ContinuedVideo)
     STATE["installed"] = True
     return []
 
@@ -557,10 +274,7 @@ def uninstall() -> None:
     G, originals = STATE["globals"], STATE["originals"]
     for name in [*_WRAPPED, "offload", "gc"]:
         G[name] = originals[name]
-    if "ContinuedVideo.append" in originals:
-        cls, append = originals["ContinuedVideo.append"]
-        cls.append = append
     offloadobj = G.get("offloadobj")
     if offloadobj is not None:
         offloadobj.__dict__.pop("unload_all", None)
-    STATE.update(installed=False, globals=None, originals={}, kept_model_type=None, kept_loras=None)
+    STATE.update(installed=False, globals=None, originals={}, kept_model_type=None)
