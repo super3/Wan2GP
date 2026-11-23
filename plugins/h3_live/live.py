@@ -9,8 +9,10 @@ as a segment of a rolling HLS playlist that a player follows while the next clip
 
 WanGP is patched from outside: the only hooks are `MiniMaxH3Pipeline.generate` (keyword arguments `input_prompt`, `seed`,
 `frame_num`, `fps`; a result with `x`, `audio`, `audio_sampling_rate`), `MiniMaxH3Pipeline._encode_prompt(prompt,
-presentation)` to encode a session's prompts once before its first clip, and mmgp's `offloadobj.cotenants_map`, so that the
-audio decode does not evict the transformer between clips. `compatibility_problems()` checks them; live mode refuses to start
+presentation)` to encode a session's prompts once before its first clip (and, from embeddings.py, to use embeddings made
+elsewhere in its place), and mmgp's `offloadobj.cotenants_map`, so that the audio decode does not evict the transformer
+between clips. The same generate hook serves prompt embeddings instead of a video while an `embeddings.EmbeddingService` is
+waiting for a model (embed_server.py). `compatibility_problems()` checks them; live mode refuses to start
 when they do not match this WanGP, instead of breaking its generations.
 """
 
@@ -40,7 +42,8 @@ RESULT_KEYS = ("x", "audio", "audio_sampling_rate")
 BIG_VRAM_BYTES = 60 * 2**30  # from here the transformer stays beside the text encoder; below, prompt changes may move it out
 SESSION_PREFIX = "live_"
 STREAM_START_S = 1.0  # where the stream's timestamps start
-STATE: dict = {"installed": False, "pipeline_cls": None, "orig_generate": None, "settings": None, "session": None, "last_session": None}
+STATE: dict = {"installed": False, "pipeline_cls": None, "orig_generate": None, "settings": None, "session": None, "last_session": None,
+               "embed_service": None}
 
 
 @dataclass
@@ -54,6 +57,7 @@ class LiveSettings:
     pre_encode_prompts: bool = True  # encode every prompt of the session before its first clip
     pace_lead_s: float = 0.0  # > 0: never more than this much video ahead of the stream's clock (a broadcast); 0: as fast as it goes
     playlist_window: int = 0  # > 0: a live playlist of the last N clips, older clip files deleted (endless sessions); 0: keep them all
+    embeddings_dir: str = ""  # a folder of prompt embeddings made elsewhere (*.safetensors, embed_server.py), used instead of the text encoder
 
     @classmethod
     def from_dict(cls, data):
@@ -438,6 +442,8 @@ class Pacer:
 def run_session(orig_generate, pipe, kwargs: dict, settings: LiveSettings, root=None, web_uri=None, ffmpeg=None):
     """The live session behind one WanGP generation: the pipeline once per clip, each clip to the encoder. Returns the last
     clip (WanGP saves it), or None when WanGP stopped the generation."""
+    if settings.embeddings_dir:
+        print(f"[H3 Live] {_embeddings().supply_dir(settings.embeddings_dir)} prompt embeddings from {settings.embeddings_dir}")
     prompts = [prompt for prompt in settings.prompts if prompt.strip()] or [kwargs.get("input_prompt", "")]
     count = math.inf if int(settings.clips) < 0 else int(settings.clips) if int(settings.clips) > 0 else len(prompts)
     fps = float(kwargs.get("fps") or 24)
@@ -497,9 +503,30 @@ def continues_a_video(kwargs: dict) -> bool:
     return kwargs.get("input_video") is not None or prefix > 0
 
 
+def _embeddings():
+    """embeddings.py beside this file: the plugin's module in WanGP and the demo, loaded by path when live.py is on its own."""
+    try:
+        from . import embeddings
+        return embeddings
+    except ImportError:
+        import importlib.util
+
+        name = "h3_live_embeddings"
+        if name not in sys.modules:
+            spec = importlib.util.spec_from_file_location(name, Path(__file__).with_name("embeddings.py"))
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[name] = module
+            spec.loader.exec_module(module)
+        return sys.modules[name]
+
+
 def _make_wrapper(orig_generate):
     @functools.wraps(orig_generate)
     def generate(self, *args, **kwargs):
+        service = STATE.get("embed_service")
+        if service is not None and not service.running and not args and int(kwargs.get("image_mode") or 0) == 0:
+            service.run(self)  # until the service stops: this generation makes no video
+            return None
         settings: LiveSettings | None = STATE["settings"]
         if (settings is None or not settings.enabled or STATE["session"] is not None or args or int(kwargs.get("image_mode") or 0) > 0
                 or getattr(self, "audio_only", False) or continues_a_video(kwargs)):
@@ -520,6 +547,7 @@ def install(pipeline_cls=None) -> list[str]:
     if not STATE["installed"]:
         STATE.update(installed=True, pipeline_cls=pipeline_cls, orig_generate=pipeline_cls.generate)
         pipeline_cls.generate = _make_wrapper(pipeline_cls.generate)
+        _embeddings().install(pipeline_cls)
     return problems
 
 
@@ -527,6 +555,7 @@ def uninstall() -> None:
     if STATE["installed"]:
         STATE["pipeline_cls"].generate = STATE["orig_generate"]
         STATE.update(installed=False, pipeline_cls=None, orig_generate=None)
+        _embeddings().uninstall()
 
 
 def configure(settings: LiveSettings | None) -> None:

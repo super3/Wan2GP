@@ -59,6 +59,7 @@ def parse_args(argv=None):
     parser.add_argument("--encoder", default="auto", choices=["auto", "nvenc", "x264"])
     parser.add_argument("--lead", type=float, default=12.0, help="at most this many seconds of video ready ahead of the stream's clock")
     parser.add_argument("--window", type=int, default=8, help="clips in the live playlist (older clip files are deleted)")
+    parser.add_argument("--embeddings-dir", default="", help="prompt embeddings made elsewhere (*.safetensors from embed_server.py), used instead of the text encoder")
     parser.add_argument("--dry-run", action="store_true", help="no WanGP, no GPU: synthetic clips 1.3x faster than real time, to try the page")
     argv = sys.argv[1:] if argv is None else argv
     wangp_args = []
@@ -115,7 +116,7 @@ class Demo:
 
     def _settings(self, live):
         return live.LiveSettings(enabled=True, clips=-1, seed_step=1, encoder=self.args.encoder, keep_sessions=2, pace_lead_s=self.args.lead,
-                                 playlist_window=self.args.window)
+                                 playlist_window=self.args.window, embeddings_dir=getattr(self.args, "embeddings_dir", ""))
 
     def _dry_run(self) -> None:
         """Synthetic clips (a colour per seed, a moving bar, a tone) through the same live session, stream and page."""
