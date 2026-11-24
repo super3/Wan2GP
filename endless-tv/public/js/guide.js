@@ -103,11 +103,6 @@
         if (airing.program.isNew) sub.append(el('span', 'tag-new', 'NEW'));
         sub.append(document.createTextNode(`${fmt(airing.start)} – ${fmt(airing.end)}`));
         cell.append(title, sub);
-        if (isNow) {
-          const bar = el('span', 'cell-progress');
-          bar.style.width = `${(100 * (t - airing.start)) / (airing.end - airing.start)}%`;
-          cell.append(bar);
-        }
         cell.addEventListener('click', () => {
           state.selected = { channelId: channel.id, start: airing.start };
           renderHero();
@@ -177,7 +172,6 @@
     $('watchLabel').textContent = live ? 'Watch now' : `Watch ${channel.name} now`;
     $('screen').setAttribute('aria-label', `Watch ${channel.name}`);
     const clips = channel.clips.length;
-    $('selMade').textContent = clips ? `${clips} AI-generated clip${clips === 1 ? '' : 's'} on a loop, ${Math.round(Live.loopSeconds(channel.clips))} s in all` : 'No clips yet';
 
     const cover = $('cover');
     const note = $('screenNote');
