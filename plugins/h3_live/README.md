@@ -33,6 +33,17 @@ The session folder (`outputs/h3_live/live_<date>/`) holds `clip_NNNNN.mp4` per c
   | Start and end image, encodes cached | 4.66 | **1.11×** |
 
   What is left (0.4 s a clip) is the longer sequence: the two pictures' 780 conditioning rows, and the prompt as the text encoder sees it with them (1,019 tokens instead of 169).
+- **Prompts of different lengths:** with profile 1, mmgp's automatic VRAM preload measures each new workload (the size of a block's largest input, which follows the prompt's length) and runs it with the transformer streamed from RAM until it is measured, then loads the transformer back. A session whose lines differ in length paid that in every clip. `steady_vram_preload` (on by default) rounds the workloads up (by at most 1.6%), so the clips share one measure. Measured on an RTX PRO 6000 Workstation (Clore, Nov 24, WanGP v20.12), sessions of four clips with a different line each, prompts pre-encoded, the image encodes cached:
+
+  | | Weight copies from RAM per clip | Seconds per 5.17 s clip | Real time |
+  |---|---|---|---|
+  | Start and end image, without it | 0.70 s | 5.05 | 1.02× |
+  | Start and end image, with it | 0.16 s | **4.83** | **1.07×** |
+  | Start and end image, whole transformer preloaded (`--preload 40000`) | 0.15 s | 4.83 | 1.07× |
+  | Text only, without it | | 4.22 | 1.23× |
+  | Text only, with it | | **4.14** | **1.25×** |
+
+  With it a session's clips run as fast as with the whole transformer preloaded by hand. Seconds per clip are the time between clips, which leaves out the first clip of a session: it measures its workload either way (and took about 0.6 s longer with it in this test).
 
 ## How it works
 
