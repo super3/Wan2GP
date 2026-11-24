@@ -37,6 +37,17 @@ describe('read API', () => {
     await request(app).get('/api/channels/Bad_Id').expect(400);
   });
 
+  test('the Discord link is shown only when it is an https URL', async () => {
+    const { app } = await setup();
+    expect((await request(app).get('/api/channels')).body.site).toEqual({ discord: null });
+    const store = await new Store(tmpDir()).init();
+    const invite = 'https://discord.gg/abc123';
+    expect((await request(createApp({ store, discordUrl: invite })).get('/api/channels')).body.site).toEqual({ discord: invite });
+    for (const bad of ['http://discord.gg/abc', 'javascript:alert(1)', 'https://x.y/"onload="x', 'https://a b', 42]) {
+      expect((await request(createApp({ store, discordUrl: bad })).get('/api/channels')).body.site.discord).toBeNull();
+    }
+  });
+
   test('every response carries the security headers', async () => {
     const { app } = await setup();
     const res = await request(app).get('/api/channels');

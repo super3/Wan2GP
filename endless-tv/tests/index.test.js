@@ -3,10 +3,10 @@ const { config, start } = require('../server/index');
 const { tmpDir } = require('./helpers');
 
 test('reads its settings from the environment, the Railway volume first', () => {
-  expect(config({})).toMatchObject({ port: 3000, persistent: false, token: '', maxUploadBytes: 300e6, keepClips: 0 });
+  expect(config({})).toMatchObject({ port: 3000, persistent: false, token: '', maxUploadBytes: 300e6, keepClips: 0, discordUrl: '' });
   expect(config({}).dataDir).toBe(path.resolve('data'));
-  expect(config({ RAILWAY_VOLUME_MOUNT_PATH: '/data', PORT: '8080', INGEST_TOKEN: 't', MAX_UPLOAD_MB: '50', KEEP_CLIPS: '200' }))
-    .toEqual({ port: 8080, dataDir: '/data', persistent: true, token: 't', maxUploadBytes: 50e6, keepClips: 200 });
+  expect(config({ RAILWAY_VOLUME_MOUNT_PATH: '/data', PORT: '8080', INGEST_TOKEN: 't', MAX_UPLOAD_MB: '50', KEEP_CLIPS: '200', DISCORD_URL: 'https://discord.gg/x' }))
+    .toEqual({ port: 8080, dataDir: '/data', persistent: true, token: 't', maxUploadBytes: 50e6, keepClips: 200, discordUrl: 'https://discord.gg/x' });
   expect(config({ RAILWAY_VOLUME_MOUNT_PATH: '/data', DATA_DIR: '/other' }).dataDir).toBe('/other');
   expect(config().port).toBe(Number(process.env.PORT) || 3000);  // the process environment by default
 });

@@ -30,6 +30,7 @@ export default defineRailway(() => {
       INGEST_TOKEN: preserve(),  // the upload token: set it in Railway (never here); applying keeps its value
       KEEP_CLIPS: "0",           // clips kept per channel, oldest dropped first; 0 keeps them all
       MAX_UPLOAD_MB: "300",
+      DISCORD_URL: preserve(),   // the invite the header's Discord button opens: set it in Railway
     },
     // Railway's edge cache keeps clips, logos and posters (served as immutable) off the app's bandwidth. It needs a
     // public domain: generate one in the service's settings first, then uncomment and apply again.

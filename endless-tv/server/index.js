@@ -13,13 +13,14 @@ function config(env = process.env) {
     token: env.INGEST_TOKEN || '',
     maxUploadBytes: (Number(env.MAX_UPLOAD_MB) || 300) * 1e6,
     keepClips: Number(env.KEEP_CLIPS) || 0,
+    discordUrl: env.DISCORD_URL || '',  // the invite the header's Discord button opens
   };
 }
 
 async function start(env) {
   const settings = config(env);
   const store = await new Store(settings.dataDir, { keepClips: settings.keepClips }).init();
-  const app = createApp({ store, token: settings.token, maxUploadBytes: settings.maxUploadBytes, persistent: settings.persistent });
+  const app = createApp({ store, token: settings.token, maxUploadBytes: settings.maxUploadBytes, persistent: settings.persistent, discordUrl: settings.discordUrl });
   const server = app.listen(settings.port, () => {
     console.log(`Endless TV on port ${server.address().port}, data in ${settings.dataDir}${settings.persistent ? '' : ' (not persistent)'}, uploads ${settings.token ? 'on' : 'off (no INGEST_TOKEN)'}`);
   });

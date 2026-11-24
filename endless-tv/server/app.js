@@ -58,12 +58,18 @@ function requireToken(token) {
   };
 }
 
-function createApp({ store, token = '', maxUploadBytes = 300e6, persistent = false }) {
+// A link the site may show (the Discord invite): only an https URL, anything else shows nothing.
+function httpsUrl(value) {
+  return typeof value === 'string' && /^https:\/\/[^\s"'<>]+$/.test(value) ? value : null;
+}
+
+function createApp({ store, token = '', maxUploadBytes = 300e6, persistent = false, discordUrl = '' }) {
   const app = express();
   app.disable('x-powered-by');
   app.set('trust proxy', true);  // behind Railway's proxy
   const auth = requireToken(token);
   const json = express.json({ limit: '1mb' });
+  const site = { discord: httpsUrl(discordUrl) };  // what the pages show besides the channels
 
   app.use((req, res, next) => {
     res.set({ 'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'strict-origin-when-cross-origin', 'Content-Security-Policy': CSP });
@@ -82,7 +88,7 @@ function createApp({ store, token = '', maxUploadBytes = 300e6, persistent = fal
   // --- read API (public) -------------------------------------------------------------------------------------------
   app.get('/api/channels', (req, res) => {
     res.set('Cache-Control', 'no-cache');
-    res.json({ now: Date.now(), channels: store.list().map(publicChannel) });
+    res.json({ now: Date.now(), site, channels: store.list().map(publicChannel) });
   });
 
   app.get('/api/channels/:id', (req, res) => {

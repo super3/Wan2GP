@@ -46,7 +46,7 @@ Then, in the service's settings:
 | Start Command | `npm start` (the default) |
 | Healthcheck Path | `/health` |
 | Volume | add one, mounted at `/data` |
-| Variables | `INGEST_TOKEN` (as above) |
+| Variables | `INGEST_TOKEN` (as above), `DISCORD_URL` (your invite, for the header's button) |
 | Networking | generate a domain |
 
 Check it: `https://<domain>/health` answers `{"status":"ok","persistent":true,"uploads":true,...}`. `persistent: false`
@@ -109,6 +109,7 @@ served sandboxed.
 | `DATA_DIR` | `./data` | overrides the volume path (local runs) |
 | `MAX_UPLOAD_MB` | 300 | largest upload |
 | `KEEP_CLIPS` | 0 (all) | clips kept per channel; the oldest are deleted first |
+| `DISCORD_URL` | none (no button) | the invite the header's **Join our Discord** button opens; only an `https://` link is used |
 | `PORT` | 3000 | set by Railway |
 
 ## Develop

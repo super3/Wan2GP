@@ -20,6 +20,9 @@
     state.skew = data.now - Date.now();
     state.channels = data.channels;
     if (state.player) state.player.skew = state.skew;
+    const discord = data.site && data.site.discord;  // set by DISCORD_URL on the server
+    if (discord) $('discord').href = discord;
+    $('discord').hidden = !discord;
   }
 
   function genres() {
