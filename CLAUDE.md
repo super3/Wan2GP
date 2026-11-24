@@ -12,3 +12,9 @@ upstream WanGP project.
   turns `owner/repo` into a link. Mention upstream only when the user asks about
   upstream itself, and then say plainly that it is upstream.
 - Open pull requests against the fork's `main`, never against upstream.
+
+## Branches
+
+- Give branches readable names that say what they hold, like the existing
+  `feature/<topic>` branches (`feature/endless-tv`). Never push a pull request
+  from a generated name such as `ccr-...`.

@@ -10,8 +10,8 @@ export default defineRailway(() => {
   });
 
   const web = service("endless-tv", {
-    // The app is on PR #8's branch until that PR merges; then this becomes "main".
-    source: github("super3/Wan2GP", { branch: "ccr-fcf4a278-40swa4", rootDirectory: "endless-tv" }),
+    // The app is on this branch until its PR merges; then this becomes "main".
+    source: github("super3/Wan2GP", { branch: "feature/endless-tv", rootDirectory: "endless-tv" }),
     build: {
       builder: "RAILPACK",
       watchPatterns: ["/endless-tv/**"],  // from the repo root: changes elsewhere in Wan2GP don't redeploy it

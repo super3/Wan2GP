@@ -36,7 +36,7 @@ Then, in the service's settings:
 2. **Networking**: generate a domain (or add yours). Optionally uncomment `cdn` in `.railway/railway.ts` and apply again,
    so Railway's edge serves the clips instead of the app.
 
-**In the dashboard instead**: New service from the GitHub repo `super3/Wan2GP`, branch `ccr-fcf4a278-40swa4` (PR #8;
+**In the dashboard instead**: New service from the GitHub repo `super3/Wan2GP`, branch `feature/endless-tv` (its PR;
 `main` once it merges), then in its settings:
 
 | Setting | Value |
