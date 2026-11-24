@@ -2,3 +2,6 @@ node_modules/
 coverage/
 data/
 .env
+# the repo's root .gitignore ignores every dotfile: these two belong to the app
+!.railway/
+!.env.example
