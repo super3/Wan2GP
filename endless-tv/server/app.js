@@ -29,6 +29,7 @@ function publicChannel(channel) {
     number: channel.number,
     name: channel.name,
     genre: channel.genre,
+    live: channel.live === true,
     blurb: channel.blurb,
     schedule: channel.schedule,
     logo: mediaUrl(channel, channel.logo),

@@ -102,12 +102,13 @@ class Store {
   upsertChannel(id, fields) {
     return this.write(async () => {
       const now = new Date().toISOString();
-      const channel = this.channels.get(id) || { id, number: 0, name: id, genre: '', blurb: '', schedule: [], logo: null, poster: null, clips: [], createdAt: now };
+      const channel = this.channels.get(id) || { id, number: 0, name: id, genre: '', blurb: '', live: false, schedule: [], logo: null, poster: null, clips: [], createdAt: now };
       if (fields.number !== undefined) {
         const number = Math.round(Number(fields.number));
         if (!(number >= 0 && number <= 9999)) throw new HttpError(400, 'number must be between 0 and 9999');
         channel.number = number;
       }
+      if (fields.live !== undefined) channel.live = fields.live === true;  // runs live (a GPU making it now), not pre-generated
       for (const key of ['name', 'genre', 'blurb']) {
         if (fields[key] !== undefined) channel[key] = text(fields[key], TEXT_LIMITS[key]);
       }

@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Publish to Endless TV from a GPU box (Python 3.8+, standard library only), so the box can be thrown away after.
+"""Publish to Endless TV from a GPU box (Python 3.9+, standard library only), so the box can be thrown away after.
 
 The server and its upload token come from the environment, never the command line:
     export ENDLESS_TV_URL=https://<your app>.up.railway.app
     export ENDLESS_TV_TOKEN=<the server's INGEST_TOKEN>
 
-    publish.py channel ID [--number N] [--name NAME] [--genre G] [--blurb TEXT] [--schedule FILE.json] [--logo FILE] [--poster FILE]
+    publish.py channel ID [--number N] [--name NAME] [--genre G] [--blurb TEXT] [--live | --no-live] [--schedule FILE.json] [--logo FILE] [--poster FILE]
     publish.py clip ID FILE.mp4 [--title T] [--prompt TEXT | --prompt-file F] [--seed N] [--sequence N] [--run RUN] [--generate-s S]
     publish.py session ID DIR      the clips of an H3 Live session (clip_*.mp4 in session.json's order), and its numbers as a run
     publish.py run FILE.json [--id RUN]
@@ -119,7 +119,7 @@ def publish_seed(seed_file, media_dir):
     media = media_dir or os.path.dirname(os.path.abspath(seed_file))
     found = lambda name: name and os.path.exists(os.path.join(media, name)) and os.path.join(media, name)  # noqa: E731
     for channel in seed["channels"]:
-        fields = {key: channel.get(key) for key in ("number", "name", "genre", "blurb", "schedule")}
+        fields = {key: channel.get(key) for key in ("number", "name", "genre", "blurb", "live", "schedule")}
         missing = [name for name in [channel.get("logo"), channel.get("poster"), *channel.get("clips", [])] if name and not found(name)]
         if missing:
             print(f"  {channel['id']}: not found in {media}: {', '.join(missing)}", file=sys.stderr)
@@ -137,6 +137,7 @@ def main(argv=None):
     c.add_argument("--name")
     c.add_argument("--genre")
     c.add_argument("--blurb")
+    c.add_argument("--live", action=argparse.BooleanOptionalAction, default=None, help="the channel runs live (only those show LIVE)")
     c.add_argument("--schedule", help="a JSON file: a list of {title, episode, blurb, badges, minutes, isNew}")
     c.add_argument("--logo")
     c.add_argument("--poster")
@@ -173,7 +174,7 @@ def main(argv=None):
             if args.schedule:
                 with open(args.schedule) as handle:
                     schedule = json.load(handle)
-            channel = put_channel(args.id, {"number": args.number, "name": args.name, "genre": args.genre, "blurb": args.blurb, "schedule": schedule},
+            channel = put_channel(args.id, {"number": args.number, "name": args.name, "genre": args.genre, "blurb": args.blurb, "live": args.live, "schedule": schedule},
                                   args.logo, args.poster)
             print(f"channel {channel['id']}: {channel['name']} ({len(channel['clips'])} clips)")
         elif args.command == "clip":

@@ -179,7 +179,7 @@
     if (live && clips) {
       cover.hidden = true;
       note.hidden = true;
-      $('liveBadge').hidden = false;
+      $('liveBadge').hidden = !channel.live;  // only a channel that runs live says so
       state.player.setChannel(channel);
     } else {
       state.player.setChannel(null);

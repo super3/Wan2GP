@@ -33,14 +33,14 @@ test('seeds channels with their logos, posters and clips', async () => {
   writeTmp(media, 'poster.png', PNG);
   writeTmp(media, 'clip.mp4', mp4({ duration: 6 }));
   const seed = writeTmp(media, 'seed.json', JSON.stringify({ channels: [
-    { id: 'drift', number: 106, name: 'Drift', genre: 'Slow TV', logo: 'logo.svg', poster: 'poster.png', clips: ['clip.mp4', 'missing.mp4'],
+    { id: 'drift', number: 106, name: 'Drift', genre: 'Slow TV', live: true, logo: 'logo.svg', poster: 'poster.png', clips: ['clip.mp4', 'missing.mp4'],
       schedule: [{ title: 'Cabin Fire', minutes: 300 }] },
   ] }));
   const { stdout, stderr } = await publish(['seed', seed]);
   expect(stdout).toContain('drift: channel 106, 1 clip(s)');
   expect(stderr).toContain('missing.mp4');
   const drift = store.get('drift');
-  expect(drift).toMatchObject({ name: 'Drift', schedule: [expect.objectContaining({ title: 'Cabin Fire' })] });
+  expect(drift).toMatchObject({ name: 'Drift', live: true, schedule: [expect.objectContaining({ title: 'Cabin Fire' })] });
   expect(drift.logo).toMatch(/\.svg$/);
   expect(drift.poster).toMatch(/\.png$/);
   expect(drift.clips[0].duration).toBeCloseTo(6, 3);
@@ -51,6 +51,11 @@ test('publishes a channel, a clip with its prompt, a run, then deletes them', as
   const dir = tmpDir();
   const schedule = writeTmp(dir, 'schedule.json', JSON.stringify([{ title: 'Open Mic', minutes: 30 }]));
   await publish(['channel', 'laugh-track', '--number', '103', '--name', 'Laugh Track', '--schedule', schedule, '--logo', writeTmp(dir, 'l.png', PNG)]);
+  expect(store.get('laugh-track').live).toBe(false);
+  await publish(['channel', 'laugh-track', '--live']);
+  expect(store.get('laugh-track').live).toBe(true);
+  await publish(['channel', 'laugh-track', '--no-live']);
+  expect(store.get('laugh-track').live).toBe(false);
   const promptFile = writeTmp(dir, 'prompt.txt', 'A comedian — “tiny apartment”, 100% real');
   const clip = await publish(['clip', 'laugh-track', writeTmp(dir, 'c.mp4', mp4({ duration: 5.17 })), '--title', 'Bit 1', '--prompt-file', promptFile, '--seed', '9']);
   expect(clip.stdout).toMatch(/clip c\S+: 5\.17 s/);

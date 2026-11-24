@@ -28,6 +28,14 @@ test('creates a channel, updates only the fields given, and keeps it across a re
   expect(again.get('drift')).toEqual(channel);
 });
 
+test('a channel is pre-generated unless marked live', async () => {
+  const store = await fresh();
+  expect((await store.upsertChannel('drift', {})).live).toBe(false);
+  expect((await store.upsertChannel('news', { live: true })).live).toBe(true);
+  expect((await store.upsertChannel('news', { name: 'News' })).live).toBe(true);  // other updates keep it
+  expect((await store.upsertChannel('news', { live: 'yes' })).live).toBe(false);  // only true means live
+});
+
 test('rejects a bad number or schedule and leaves the channel unchanged', async () => {
   const store = await fresh();
   await store.upsertChannel('news', { number: 101 });

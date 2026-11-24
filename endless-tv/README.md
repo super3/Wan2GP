@@ -57,7 +57,7 @@ Volumes are 0.5 GB on the free plan, 5 GB on Hobby, 50 GB on Pro.
 
 ## Publish from a GPU box
 
-`tools/publish.py` needs only Python 3.8+. The server and token come from the environment:
+`tools/publish.py` needs only Python 3.9+. The server and token come from the environment:
 
 ```bash
 export ENDLESS_TV_URL=https://<domain>
@@ -89,7 +89,7 @@ Reads are public; writes need `Authorization: Bearer <INGEST_TOKEN>`.
 | `GET /health` | status, whether storage is persistent and uploads are on, channel and clip counts |
 | `GET /api/channels` | every channel with its schedule and clips, and the server's clock (`now`, in ms) |
 | `GET /api/channels/:id` | one channel |
-| `PUT /api/channels/:id` | create or update: JSON `{number, name, genre, blurb, schedule: [{title, episode, blurb, badges, minutes, isNew}]}` |
+| `PUT /api/channels/:id` | create or update: JSON `{number, name, genre, blurb, live, schedule: [{title, episode, blurb, badges, minutes, isNew}]}`; `live: true` only for a channel that runs live (it alone shows LIVE) |
 | `PUT /api/channels/:id/logo` and `/poster` | the image as the body: PNG, JPEG, WebP, or SVG without scripts |
 | `POST /api/channels/:id/clips` | the MP4 as the body; `?title=&seed=&sequence=&run=&generate_s=`; a long prompt URI-encoded in `X-Clip-Prompt` |
 | `DELETE /api/channels/:id`, `DELETE /api/channels/:id/clips/:clipId` | remove a channel (with its files) or a clip |

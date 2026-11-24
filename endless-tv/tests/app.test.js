@@ -29,7 +29,7 @@ describe('read API', () => {
     const { app } = await withChannel();
     const list = await request(app).get('/api/channels').expect(200);
     expect(list.body.now).toBeGreaterThan(0);
-    expect(list.body.channels).toEqual([expect.objectContaining({ id: 'laugh-track', number: 103, logo: null, clips: [] })]);
+    expect(list.body.channels).toEqual([expect.objectContaining({ id: 'laugh-track', number: 103, live: false, logo: null, clips: [] })]);
     expect(list.headers['cache-control']).toBe('no-cache');
     const one = await request(app).get('/api/channels/laugh-track').expect(200);
     expect(one.body.channel.name).toBe('Laugh Track');
@@ -81,7 +81,9 @@ describe('channels', () => {
     expect((await request(bare).get('/health')).body).toMatchObject({ persistent: false, uploads: false });
     const { app } = await setup();
     const res = await request(app).put('/api/channels/blank').set(auth).expect(200);
-    expect(res.body.channel).toMatchObject({ id: 'blank', name: 'blank', number: 0 });
+    expect(res.body.channel).toMatchObject({ id: 'blank', name: 'blank', number: 0, live: false });
+    const live = await request(app).put('/api/channels/blank').set(auth).send({ live: true }).expect(200);
+    expect(live.body.channel.live).toBe(true);
   });
 
   test('a bad body is refused', async () => {

@@ -1,7 +1,7 @@
 {
   "channels": [
     {
-      "id": "riverside-news", "number": 101, "name": "Riverside News", "genre": "News",
+      "id": "riverside-news", "number": 101, "name": "Riverside News", "genre": "News", "live": true,
       "blurb": "Local news from Riverside, anchored by Dana Reyes.",
       "logo": "riverside-news.svg", "poster": "news_poster.jpg", "clips": ["news_b.mp4"],
       "schedule": [

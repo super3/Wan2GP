@@ -24,7 +24,7 @@
     }
     $('logo').hidden = !current.logo;
     $('chNum').textContent = String(current.number);
-    $('livePill').hidden = !position;
+    $('livePill').hidden = !position || !current.live;  // only a channel that runs live says so
     $('clipInfo').textContent = position
       ? `Clip ${position.index + 1} of ${position.clips.length}${position.clip.title ? `: ${position.clip.title}` : ''}`
       : 'No clips yet';
