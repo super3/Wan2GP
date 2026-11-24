@@ -1,0 +1,36 @@
+name: Endless TV
+
+on:
+  pull_request:
+    paths:
+      - "endless-tv/**"
+      - ".github/workflows/endless-tv.yml"
+  push:
+    branches: [main]
+    paths:
+      - "endless-tv/**"
+      - ".github/workflows/endless-tv.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Endless TV tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: endless-tv
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.x
+          cache: npm
+          cache-dependency-path: endless-tv/package-lock.json
+      - uses: actions/setup-python@v5  # tools/publish.py is tested against the server
+        with:
+          python-version: "3.12"
+      - run: npm ci
+      - run: npm test
+      - run: npm run check:railway

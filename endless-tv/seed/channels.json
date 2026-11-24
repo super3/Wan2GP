@@ -1,0 +1,76 @@
+{
+  "channels": [
+    {
+      "id": "riverside-news", "number": 101, "name": "Riverside News", "genre": "News",
+      "blurb": "Local news from Riverside, anchored by Dana Reyes.",
+      "logo": "riverside-news.svg", "poster": "news_poster.jpg", "clips": ["news_b.mp4"],
+      "schedule": [
+        { "title": "Riverside Tonight", "episode": "S3 E214 · Captain Comes Home", "minutes": 30, "isNew": true, "badges": ["NEW", "TV-G"],
+          "blurb": "Dana Reyes anchors the evening news. Tonight, Riverside’s missing parrot is back after six weeks away, and he came home speaking fluent Spanish." },
+        { "title": "Riverside Tonight: Late Edition", "episode": "S3 E215", "minutes": 60, "badges": ["TV-G"],
+          "blurb": "The day’s stories, updated, with weather and the late scores." },
+        { "title": "Riverside Weather", "episode": "Overnight forecast", "minutes": 30, "badges": ["TV-G"],
+          "blurb": "Tonight’s forecast and the week ahead." }
+      ]
+    },
+    {
+      "id": "time-machine", "number": 102, "name": "Time Machine", "genre": "History",
+      "blurb": "Live reports from the great moments of history.",
+      "logo": "time-machine.svg", "poster": "time_machine_poster.jpg", "clips": ["time_machine_30s.mp4"],
+      "schedule": [
+        { "title": "Live from History: Giza, 2560 BC", "episode": "S1 E1 · The Great Pyramid", "minutes": 60, "isNew": true, "badges": ["NEW", "TV-PG"],
+          "blurb": "Correspondent Marcus Hale reports live from the Giza plateau as the Great Pyramid of King Khufu rises, block by block." },
+        { "title": "Live from History: Rome, 44 BC", "episode": "S1 E2 · The Ides of March", "minutes": 80, "badges": ["TV-PG"],
+          "blurb": "Marcus Hale reports from the Roman Forum on the morning Julius Caesar is due at the Senate." }
+      ]
+    },
+    {
+      "id": "laugh-track", "number": 103, "name": "Laugh Track", "genre": "Comedy",
+      "blurb": "Stand-up from the brick-wall stage, all night.",
+      "logo": "laugh-track.svg", "poster": "laugh_track_poster.jpg", "clips": ["laugh_track_30s.mp4"],
+      "schedule": [
+        { "title": "Open Mic Night", "episode": "S2 E8 · Tiny Apartment", "minutes": 30, "isNew": true, "badges": ["NEW", "TV-14"],
+          "blurb": "A comedian with a very small apartment and a lot to say about it. Live from the brick-wall stage." },
+        { "title": "Open Mic Night", "episode": "S2 E9 · Bad Roommates", "minutes": 30, "badges": ["TV-14"],
+          "blurb": "Five minutes on living with strangers." },
+        { "title": "The Late Set", "episode": "Stand-up, all night", "minutes": 70, "badges": ["TV-MA"],
+          "blurb": "Back-to-back sets until the club closes." }
+      ]
+    },
+    {
+      "id": "doodle", "number": 104, "name": "Doodle", "genre": "Cartoons",
+      "blurb": "Cartoons, starring Pickles the cat.",
+      "logo": "doodle.svg", "poster": "doodle_poster.jpg", "clips": ["doodle_30s.mp4"],
+      "schedule": [
+        { "title": "Pickles", "episode": "S1 E4 · The Last Cookie", "minutes": 15, "isNew": true, "badges": ["NEW", "TV-Y7"],
+          "blurb": "Pickles the cat has one goal today: the very last cookie in the house. It is on a very high shelf." },
+        { "title": "Pickles", "episode": "S1 E5 · The Ladder", "minutes": 15, "badges": ["TV-Y7"],
+          "blurb": "Pickles brings a ladder. The cookie is not impressed." },
+        { "title": "Pickles", "episode": "S1 E6 · Nap Time", "minutes": 15, "badges": ["TV-Y7"],
+          "blurb": "The sunniest spot in the kitchen is taken." },
+        { "title": "Saturday Morning Block", "episode": "Cartoons back to back", "minutes": 80, "badges": ["TV-Y7"],
+          "blurb": "An hour and change of Doodle originals." }
+      ]
+    },
+    {
+      "id": "heartwood", "number": 105, "name": "Heartwood", "genre": "Drama",
+      "blurb": "A small-town drama about the old house on Elm Street.",
+      "logo": "heartwood.svg", "poster": "heartwood_poster.jpg", "clips": ["heartwood_30s.mp4"],
+      "schedule": [
+        { "title": "Heartwood", "episode": "S1 E12 · The Old House on Elm Street", "minutes": 60, "isNew": true, "badges": ["NEW", "TV-14"],
+          "blurb": "Daniel comes home after midnight with a story Claire can’t believe: someone has been inside the old house on Elm Street." },
+        { "title": "Heartwood", "episode": "S1 E13 · The Only Key", "minutes": 75, "badges": ["TV-14"],
+          "blurb": "Claire goes looking for the key she was sure she had." }
+      ]
+    },
+    {
+      "id": "drift", "number": 106, "name": "Drift", "genre": "Slow TV",
+      "blurb": "Slow TV: nothing happens, beautifully.",
+      "logo": "drift.svg", "poster": "drift_poster.jpg", "clips": ["drift_30s.mp4"],
+      "schedule": [
+        { "title": "Cabin Fire, Rainy Night", "episode": "Slow TV · All night", "minutes": 300, "badges": ["TV-G"],
+          "blurb": "A crackling fire in a log cabin and rain on the window. Nothing else, all night long." }
+      ]
+    }
+  ]
+}
