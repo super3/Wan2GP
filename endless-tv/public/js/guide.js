@@ -11,7 +11,7 @@
   };
   const fmt = (ms) => new Date(ms).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
 
-  const state = { channels: [], skew: 0, filter: 'All', selected: null, player: null };
+  const state = { channels: [], skew: 0, filter: 'All', selected: null, player: null, muted: true };
   const now = () => Date.now() + state.skew;
 
   async function load() {
@@ -143,12 +143,16 @@
     $('nowLabel').textContent = fmt(t);
     $('nowLabel').style.left = `${100 * frac}%`;
     $('nowLine').style.left = `calc(200px + (100% - 200px) * ${frac})`;
-    const sel = selection();
-    if (sel) {
-      const { airing } = sel;
-      const live = airing.start <= t && t < airing.end;
-      $('progress').style.width = live ? `${(100 * (t - airing.start)) / (airing.end - airing.start)}%` : '0%';
-    }
+  }
+
+  // The hero plays muted (browsers only autoplay muted video); the button on it turns the sound on and off.
+  const SOUND_ON = 'M4 9h4l5-4v14l-5-4H4zM16.5 8.5a5 5 0 010 7M19 6a8.5 8.5 0 010 12';
+  const SOUND_OFF = 'M4 9h4l5-4v14l-5-4H4zM17 9l5 6M22 9l-5 6';
+  function setMuted(muted) {
+    state.muted = muted;
+    state.player.setMuted(muted);
+    $('muteIcon').setAttribute('d', muted ? SOUND_OFF : SOUND_ON);
+    $('mute').setAttribute('aria-label', muted ? 'Turn on sound' : 'Turn off sound');
   }
 
   function renderHero() {
@@ -177,6 +181,7 @@
 
     const cover = $('cover');
     const note = $('screenNote');
+    $('mute').hidden = !(live && clips);
     if (live && clips) {
       cover.hidden = true;
       note.hidden = true;
@@ -210,6 +215,7 @@
   }
 
   state.player = new LivePlayer($('player'), { muted: true });
+  $('mute').addEventListener('click', () => setMuted(!state.muted));
   refresh();
   setInterval(renderClock, 1000);
   setInterval(() => {
