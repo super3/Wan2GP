@@ -31,6 +31,23 @@ describe('livePosition', () => {
     expect(Live.livePosition(clips, Live.EPOCH - 1000)).toMatchObject({ index: 2, offset: 14 });
   });
 
+  test('a channel with its own loop start plays from it in order, has nothing on before it, then loops', () => {
+    const start = Live.EPOCH + 5 * 86400000 + 1234;
+    expect(Live.livePosition(clips, start - 1, start)).toBeNull();
+    expect(Live.livePosition(clips, start, start)).toMatchObject({ index: 0, offset: 0 });
+    expect(Live.livePosition(clips, start + 12000, start)).toMatchObject({ index: 1, offset: 2 });
+    expect(Live.livePosition(clips, start + 30000 + 11000, start)).toMatchObject({ index: 1, offset: 1 });
+    for (const none of [null, undefined, 0]) expect(Live.livePosition(clips, Live.EPOCH + 12000, none)).toMatchObject({ index: 1, offset: 2 });
+  });
+
+  test('clips added after the one on now leave it on now (a channel growing live)', () => {
+    const start = Live.EPOCH + 1000;
+    const growing = clips.slice(0, 2);
+    const before = Live.livePosition(growing, start + 12000, start);
+    const after = Live.livePosition(clips, start + 12000, start);
+    expect(after).toMatchObject({ index: before.index, offset: before.offset, clip: before.clip });
+  });
+
   test('skips clips without a duration and returns null with nothing to play', () => {
     expect(Live.livePosition([{ id: 'x', duration: 0 }, { id: 'y', duration: 4 }], Live.EPOCH + 1000)).toMatchObject({ clip: { id: 'y' } });
     expect(Live.livePosition([], Live.EPOCH)).toBeNull();

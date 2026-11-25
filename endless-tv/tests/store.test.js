@@ -49,6 +49,16 @@ test('rejects a bad number or schedule and leaves the channel unchanged', async 
   expect(untitled.schedule[0].title).toBe('Untitled');
 });
 
+test('a channel loops from the shared epoch unless given its own loop start, which can be cleared', async () => {
+  const store = await fresh();
+  expect((await store.upsertChannel('news', {})).loopStart).toBeUndefined();
+  expect((await store.upsertChannel('news', { loopStart: 1795000000000 })).loopStart).toBe(1795000000000);
+  expect((await store.upsertChannel('news', { loopStart: '1795000000500' })).loopStart).toBe(1795000000500);
+  for (const bad of [-5, 0, 1.5, 'soon', {}]) await expect(store.upsertChannel('news', { loopStart: bad })).rejects.toMatchObject({ status: 400 });
+  expect(store.get('news').loopStart).toBe(1795000000500);
+  expect((await store.upsertChannel('news', { loopStart: null })).loopStart).toBeNull();
+});
+
 test('lists channels by number', async () => {
   const store = await fresh();
   await store.upsertChannel('b', { number: 2 });

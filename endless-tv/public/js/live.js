@@ -15,12 +15,16 @@
     return (clips || []).reduce((sum, clip) => sum + (clip.duration > 0 ? clip.duration : 0), 0);
   }
 
-  // The clip playing at `nowMs` and how far into it, or null when the channel has nothing to play.
-  function livePosition(clips, nowMs) {
+  // The clip playing at `nowMs` and how far into it, or null when the channel has nothing to play. A channel's loop counts
+  // from EPOCH, or from its own `loopStart` (ms) when it has one: a channel put on air live, its clips added as they are
+  // made, plays them in order from that moment while the newest clip is still ahead of the clock, then loops the whole
+  // segment. Before its loopStart a channel has nothing on yet.
+  function livePosition(clips, nowMs, loopStart) {
     const playable = (clips || []).filter((clip) => clip.duration > 0);
     const total = loopSeconds(playable);
-    if (!total) return null;
-    let t = (((nowMs - EPOCH) / 1000) % total + total) % total;
+    const start = loopStart > 0 ? loopStart : EPOCH;
+    if (!total || (loopStart > 0 && nowMs < loopStart)) return null;
+    let t = (((nowMs - start) / 1000) % total + total) % total;
     let index = 0;
     // the last clip also takes a floating-point remainder at the very end of the loop
     while (index < playable.length - 1 && t >= playable[index].duration) t -= playable[index++].duration;

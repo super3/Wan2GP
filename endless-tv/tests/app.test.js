@@ -96,6 +96,11 @@ describe('channels', () => {
     expect(res.body.channel).toMatchObject({ id: 'blank', name: 'blank', number: 0, live: false });
     const live = await request(app).put('/api/channels/blank').set(auth).send({ live: true }).expect(200);
     expect(live.body.channel.live).toBe(true);
+    expect(live.body.channel.loopStart).toBeNull();
+    const onAir = await request(app).put('/api/channels/blank').set(auth).send({ loopStart: 1795000000000 }).expect(200);
+    expect(onAir.body.channel.loopStart).toBe(1795000000000);
+    const listed = await request(app).get('/api/channels').expect(200);
+    expect(listed.body.channels.find((c) => c.id === 'blank').loopStart).toBe(1795000000000);
   });
 
   test('a bad body is refused', async () => {

@@ -110,6 +110,11 @@ class Store {
         channel.number = number;
       }
       if (fields.live !== undefined) channel.live = fields.live === true;  // runs live (a GPU making it now), not pre-generated
+      if (fields.loopStart !== undefined) {  // where the channel's loop starts (ms since 1970); null: the shared EPOCH
+        const loopStart = fields.loopStart === null ? null : Number(fields.loopStart);
+        if (loopStart !== null && !(Number.isInteger(loopStart) && loopStart > 0)) throw new HttpError(400, 'loopStart must be a time in ms, or null');
+        channel.loopStart = loopStart;
+      }
       for (const key of ['name', 'genre', 'blurb']) {
         if (fields[key] !== undefined) channel[key] = text(fields[key], TEXT_LIMITS[key]);
       }

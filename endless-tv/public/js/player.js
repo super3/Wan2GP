@@ -42,11 +42,21 @@
       return Date.now() + this.skew;
     }
 
+    // A channel's new data (the pages reload it every minute). The clip playing plays on when it is still the one on now,
+    // as when clips are added to a channel on air live: only the list it continues into changes.
     setChannel(channel) {
-      const same = this.channel && channel && this.channel.id === channel.id &&
-        this.channel.clips.map((c) => c.id).join() === channel.clips.map((c) => c.id).join();
+      const before = this.channel;
       this.channel = channel;
-      if (!same) this.sync();
+      if (this.position && before && channel && before.id === channel.id && before.loopStart === channel.loopStart) {
+        if (before.clips.map((c) => c.id).join() === channel.clips.map((c) => c.id).join()) return;
+        const expected = Live.livePosition(channel.clips, this.now(), channel.loopStart);
+        if (expected && expected.clip.id === this.position.clip.id) {
+          this.position = Object.assign({}, this.position, { index: expected.index, clips: expected.clips });
+          this.preloadNext();
+          return;
+        }
+      }
+      this.sync();  // another channel, another loop, or the clock has moved on (nothing was on, or a clip went)
     }
 
     setMuted(muted) {
@@ -57,7 +67,7 @@
     // Starts the clip that is on now, from where it is now.
     sync() {
       const generation = ++this.generation;
-      let position = this.channel && Live.livePosition(this.channel.clips, this.now());
+      let position = this.channel && Live.livePosition(this.channel.clips, this.now(), this.channel.loopStart);
       if (position && position.clip.duration - position.offset < 1) position = this.following(position);  // about to end: start the next one
       for (const video of this.videos) {
         video.pause();
@@ -65,6 +75,12 @@
       }
       if (!position) {
         this.showPoster();
+        const wait = this.channel && this.channel.loopStart - this.now();
+        if (wait > 0) {  // a channel going on air live: start at its loop start
+          setTimeout(() => {
+            if (generation === this.generation) this.sync();
+          }, Math.min(wait + 50, 3600000));
+        }
         return;
       }
       this.poster.hidden = true;
@@ -128,7 +144,7 @@
     // TVs among them, then replayed that whole clip from its start.)
     advance() {
       const next = this.following(this.position);
-      const expected = Live.livePosition(this.channel.clips, this.now());
+      const expected = Live.livePosition(this.channel.clips, this.now(), this.channel.loopStart);
       const onTime = expected && (expected.clip.id === this.position.clip.id || (expected.clip.id === next.clip.id && expected.offset <= 3));
       if (!onTime) {
         this.sync();

@@ -184,7 +184,7 @@
     const t = now();
     const clips = channel.clips.filter((clip) => clip.duration > 0);
     const playerOnIt = state.player.channel && state.player.channel.id === channel.id && state.player.position;
-    const playing = playerOnIt ? state.player.position : Live.livePosition(clips, t);
+    const playing = playerOnIt ? state.player.position : Live.livePosition(clips, t, channel.loopStart);
     const showNow = Boolean(playing) && !channel.live && airing.start <= t && t < airing.end;
     $('selEpisode').textContent = showNow ? `Now playing: ${Live.clipName(playing.clip)}` : (airing.program.episode || '');
   }
