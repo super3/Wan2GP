@@ -6,6 +6,12 @@ The sources behind the Endless TV channels' clips: scripts, prompts, the code th
 
 `riverside_news_2026-11-25_script.md` is a 10-minute Riverside News script on five of the day's top stories. It airs as Riverside Today (7 am to 7 pm Eastern) or Riverside Tonight: only the opening and the sign-off differ. It's a draft for review, not yet rendered. It is split into 40 clips of 15 seconds, each read by the anchor on the channel's first frame, and has sources and review notes at the end.
 
+`live/` is that script as it renders live, in real time, with the H3 Live plugin (MiniMax H3 FL2VA Pruned pi-H3 DWD 2-Step, 832x480, 124-frame clips of 5.17 seconds that start and end on the anchor still):
+
+- `split_lines.py` splits the script into lines of at most 13 words, one per clip; `news_lines.json` is its output, with a few breaks fixed by hand (133 clips an airing, about 11.5 minutes, plus the Tonight opening and sign-off).
+- `news_anchor_832x480.png` is the anchor still every clip starts and ends on.
+- `news_live_box.py` is the GPU box script: it encodes every line's prompt before the session, then renders them all in one live session and publishes each clip as soon as it is ready.
+
 ## laugh-track/
 
 `comic_sets.py` holds the stand-up sets: each comic's look and eight 15-second bits. Each bit is rendered as one clip that starts and ends on the comic's still, and `tools/make_set.py` joins a comic's eight clips into a 2-minute set.
