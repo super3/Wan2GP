@@ -50,6 +50,7 @@ class Store {
     this.keepClips = keepClips;  // clips kept per channel (oldest dropped first); 0 keeps them all
     this.channels = new Map();
     this.queue = Promise.resolve();
+    this.runsCache = new Map();  // limit -> the listing, until the next run arrives
   }
 
   static validId(id) {
@@ -197,12 +198,30 @@ class Store {
     const id = Store.validId(run.id) ? run.id : newId('r');
     const record = { ...run, id, receivedAt: new Date().toISOString() };
     await fs.writeFile(path.join(this.runsDir, `${id}.json`), JSON.stringify(record, null, 1));
+    this.runsCache.clear();
     return record;
   }
 
-  async listRuns(limit = 50) {
+  // The newest runs first. A run can be large (key frames for the GPU boxes), and reading every run on every poll once ran
+  // the app out of memory, so polls between two new runs share one listing (kept until the next run arrives), and a
+  // listing reads only the newest files (by modification time, with a few spare for files written in the same instant).
+  listRuns(limit = 50) {
+    if (!this.runsCache.has(limit)) {
+      const listing = this.readRuns(limit);
+      listing.catch(() => this.runsCache.delete(limit));  // a failed read is not kept
+      this.runsCache.set(limit, listing);
+    }
+    return this.runsCache.get(limit);
+  }
+
+  async readRuns(limit) {
     const names = (await fs.readdir(this.runsDir)).filter((name) => name.endsWith('.json'));
-    const runs = await Promise.all(names.map(async (name) => JSON.parse(await fs.readFile(path.join(this.runsDir, name), 'utf8'))));
+    const files = await Promise.all(names.map(async (name) => {
+      const file = path.join(this.runsDir, name);
+      return { file, mtime: (await fs.stat(file)).mtimeMs };
+    }));
+    const newest = files.sort((a, b) => b.mtime - a.mtime).slice(0, limit + 10);
+    const runs = await Promise.all(newest.map(async ({ file }) => JSON.parse(await fs.readFile(file, 'utf8'))));
     return runs.sort((a, b) => b.receivedAt.localeCompare(a.receivedAt)).slice(0, limit);
   }
 

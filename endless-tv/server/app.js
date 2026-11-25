@@ -97,9 +97,13 @@ function createApp({ store, token = '', maxUploadBytes = 300e6, persistent = fal
     res.json({ now: Date.now(), channel: publicChannel(store.require(channelParam(req))) });
   });
 
+  // Polls between two new runs share one listing (store.listRuns) and so one JSON body: listings can be tens of MB.
+  const runsBodies = new WeakMap();
   app.get('/api/runs', async (req, res) => {
     res.set('Cache-Control', 'no-cache');
-    res.json({ runs: await store.listRuns() });
+    const runs = await store.listRuns();
+    if (!runsBodies.has(runs)) runsBodies.set(runs, Buffer.from(JSON.stringify({ runs })));  // bytes, so no response copies them
+    res.type('json').send(runsBodies.get(runs));
   });
 
   // --- upload API (token) ------------------------------------------------------------------------------------------

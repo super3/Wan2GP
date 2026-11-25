@@ -144,6 +144,31 @@ test('runs are saved as sent, newest first', async () => {
   expect(await store.listRuns(1)).toHaveLength(1);
 });
 
+test('listing runs reads only the newest files, however many old ones there are', async () => {
+  const store = await fresh();
+  const old = path.join(store.runsDir, 'old.json');
+  fs.writeFileSync(old, 'not JSON: reading it would throw');
+  fs.utimesSync(old, new Date(2026, 0, 1), new Date(2026, 0, 1));
+  for (let i = 0; i < 12; i++) await store.addRun({ id: `run-${i}` });
+  const runs = await store.listRuns(2);
+  expect(runs).toHaveLength(2);
+  expect(runs.map((r) => r.id)).not.toContain('old');
+});
+
+test('polls between two new runs share one listing; a failed listing is not kept', async () => {
+  const store = await fresh();
+  await store.addRun({ id: 'one' });
+  const first = await store.listRuns();
+  expect(await store.listRuns()).toBe(first);  // the same listing, not read again
+  await store.addRun({ id: 'two' });
+  expect((await store.listRuns()).map((r) => r.id)).toEqual(['two', 'one']);
+  const moved = `${store.runsDir}-away`;
+  fs.renameSync(store.runsDir, moved);
+  await expect(store.listRuns(5)).rejects.toThrow();  // the folder is gone
+  fs.renameSync(moved, store.runsDir);
+  expect((await store.listRuns(5)).map((r) => r.id)).toEqual(['two', 'one']);  // read again, not the failure
+});
+
 test('init clears uploads a restart cut short, and fails on an unreadable channels file', async () => {
   const store = await fresh();
   const leftover = upload(store, 'leftover');

@@ -176,6 +176,8 @@ describe('runs', () => {
     expect(res.body.run).toMatchObject({ id: 'preload-v2012', cycle_s: 4.83 });
     const list = await request(app).get('/api/runs').expect(200);
     expect(list.body.runs.map((r) => r.id)).toEqual(['preload-v2012']);
+    const again = await request(app).get('/api/runs').expect('Content-Type', /json/).expect(200);  // the same body, from the cache
+    expect(again.text).toBe(list.text);
     await request(app).post('/api/runs').set(auth).send([1, 2]).expect(400);
     await request(app).post('/api/runs').set(auth).set('Content-Type', 'text/plain').send('x').expect(400);
   });
