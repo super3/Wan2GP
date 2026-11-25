@@ -6,7 +6,7 @@
   "main": "server/index.js",
   "type": "commonjs",
   "scripts": {
-    "start": "node server/index.js",
+    "start": "exec node server/index.js",
     "dev": "node --watch server/index.js",
     "test": "jest --coverage",
     "check:railway": "tsc -p tsconfig.railway.json"

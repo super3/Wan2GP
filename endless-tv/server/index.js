@@ -29,7 +29,19 @@ async function start(env) {
 
 /* istanbul ignore next -- the entry point when run as `node server/index.js`; start() itself is tested */
 if (require.main === module) {
-  start(process.env).catch((error) => {
+  start(process.env).then((server) => {
+    // Railway stops the old container with SIGTERM on every deploy. Without a handler Node dies of the signal, npm start
+    // reports that as a failed command and the deployment shows as crashed. So: stop taking requests, end idle
+    // connections, give open ones (a clip being streamed) a few seconds, and exit cleanly.
+    const stop = (signal) => {
+      console.log(`${signal}: shutting down`);
+      server.close(() => process.exit(0));
+      server.closeIdleConnections();
+      setTimeout(() => process.exit(0), 3000).unref();
+    };
+    process.on('SIGTERM', stop);
+    process.on('SIGINT', stop);
+  }).catch((error) => {
     console.error(error);
     process.exit(1);
   });
