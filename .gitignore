@@ -25,6 +25,10 @@ samples/
 !.gitignore
 !requirements.txt
 !/profiles/prism/.gitkeep
+# The leading `.*` rule above hides every dotted path, which would silently
+# drop the Docker build context file and the CI definitions.
+!.dockerignore
+!.github/
 .DS_Store
 *DS_Store
 google/
