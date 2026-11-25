@@ -23,6 +23,8 @@ describe('read API', () => {
     const { app } = await setup();
     const res = await request(app).get('/health').expect(200);
     expect(res.body).toMatchObject({ status: 'ok', persistent: true, uploads: true, channels: 0, clips: 0 });
+    expect(res.body.uptimeS).toBeGreaterThanOrEqual(0);
+    expect(res.body.memoryMB).toBeGreaterThan(0);
   });
 
   test('lists channels with the server clock, and returns one channel', async () => {

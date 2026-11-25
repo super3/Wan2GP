@@ -57,7 +57,8 @@
     // Starts the clip that is on now, from where it is now.
     sync() {
       const generation = ++this.generation;
-      const position = this.channel && Live.livePosition(this.channel.clips, this.now());
+      let position = this.channel && Live.livePosition(this.channel.clips, this.now());
+      if (position && position.clip.duration - position.offset < 1) position = this.following(position);  // about to end: start the next one
       for (const video of this.videos) {
         video.pause();
         video.classList.remove('on');
@@ -114,23 +115,45 @@
       }
     }
 
-    // The clip ended: the preloaded one takes over, unless the loop has moved on meanwhile (a background tab).
-    advance() {
-      const { clips, index } = this.position;
-      const expected = Live.livePosition(this.channel.clips, this.now());
+    // The clip after `position`, from its start.
+    following(position) {
+      const { clips, index } = position;
       const nextIndex = (index + 1) % clips.length;
-      if (this.videos.length < 2 || !expected || expected.clip.id !== clips[nextIndex].id || expected.offset > 3) {
+      return { index: nextIndex, clip: clips[nextIndex], offset: 0, clips };
+    }
+
+    // The clip ended: the next one plays from its start. The loop clock can be a moment behind the video (still in the
+    // clip that ended) or just into the next clip; only when it is well past that (a tab or a TV that slept) does the
+    // player jump to the clock. (Re-reading the clock while it lagged picked the ended clip again, and some browsers,
+    // TVs among them, then replayed that whole clip from its start.)
+    advance() {
+      const next = this.following(this.position);
+      const expected = Live.livePosition(this.channel.clips, this.now());
+      const onTime = expected && (expected.clip.id === this.position.clip.id || (expected.clip.id === next.clip.id && expected.offset <= 3));
+      if (!onTime) {
         this.sync();
         return;
       }
-      this.active = 1 - this.active;
+      if (this.videos.length < 2) {  // one video (TVs): load the next clip into it
+        const generation = ++this.generation;
+        const video = this.videos[this.active];
+        this.position = next;
+        this.load(video, next.clip.url, () => {
+          if (generation !== this.generation) return;
+          video.currentTime = 0;
+          this.show(video);
+        });
+        this.onClip(next);
+        return;
+      }
+      this.active = 1 - this.active;  // two videos: the preloaded one takes over
       const video = this.videos[this.active];
       video.currentTime = 0;
       this.show(video);
       this.videos[1 - this.active].pause();
-      this.position = Object.assign({}, expected, { index: nextIndex, clip: clips[nextIndex] });  // (object spread needs Chromium 60)
+      this.position = next;
       this.preloadNext();
-      this.onClip(this.position);
+      this.onClip(next);
     }
 
     showPoster() {

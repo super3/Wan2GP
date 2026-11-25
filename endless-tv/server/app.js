@@ -83,7 +83,9 @@ function createApp({ store, token = '', maxUploadBytes = 300e6, persistent = fal
   };
 
   app.get('/health', async (req, res) => {
-    res.json({ status: 'ok', persistent, uploads: Boolean(token), ...(await store.usage()), timestamp: new Date().toISOString() });
+    // uptime and memory show restarts and memory pressure from outside (Railway restarts the app when it crashes)
+    res.json({ status: 'ok', persistent, uploads: Boolean(token), ...(await store.usage()), uptimeS: Math.round(process.uptime()),
+      memoryMB: Math.round(process.memoryUsage().rss / 1e6), timestamp: new Date().toISOString() });
   });
 
   // --- read API (public) -------------------------------------------------------------------------------------------
