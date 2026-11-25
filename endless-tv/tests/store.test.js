@@ -160,6 +160,7 @@ test('polls between two new runs share one listing; a failed listing is not kept
   await store.addRun({ id: 'one' });
   const first = await store.listRuns();
   expect(await store.listRuns()).toBe(first);  // the same listing, not read again
+  await new Promise((resolve) => setTimeout(resolve, 5));  // two runs in the same millisecond have no order
   await store.addRun({ id: 'two' });
   expect((await store.listRuns()).map((r) => r.id)).toEqual(['two', 'one']);
   const moved = `${store.runsDir}-away`;
