@@ -181,7 +181,9 @@ function createApp({ store, token = '', maxUploadBytes = 300e6, persistent = fal
     res.sendFile(path.join(PUBLIC_DIR, 'watch.html'));
   });
 
-  app.use(express.static(PUBLIC_DIR, { extensions: ['html'], maxAge: '5m' }));
+  // The pages, scripts and styles: browsers check for a newer copy on every load (a cheap 304 when nothing changed), so a
+  // deploy reaches everyone at once. A TV that kept a 5-minute copy of one old script broke on a new page.
+  app.use(express.static(PUBLIC_DIR, { extensions: ['html'], maxAge: 0 }));
 
   app.use((req, res) => res.status(404).json({ error: 'not found' }));
 

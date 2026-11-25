@@ -55,6 +55,16 @@ describe('read API', () => {
     expect(res.headers['content-security-policy']).toContain("default-src 'self'");
     expect(res.headers['x-powered-by']).toBeUndefined();
   });
+
+  test('the pages, scripts and styles are checked for a newer copy on every load', async () => {
+    const { app } = await setup();
+    for (const url of ['/', '/js/guide.js', '/css/app.css']) {
+      const res = await request(app).get(url);
+      expect(res.status).toBe(200);
+      expect(res.headers['cache-control']).toBe('public, max-age=0');
+      expect(res.headers.etag).toBeTruthy();  // so the check is a 304 when nothing changed
+    }
+  });
 });
 
 describe('upload token', () => {
