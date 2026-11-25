@@ -175,22 +175,11 @@
     $('fs').setAttribute('aria-label', on ? 'Exit full screen' : 'Full screen');
   }
 
-  // A pre-generated channel's lineup (its clips, looping): what is playing now, the others, and what comes next. Shown
-  // while the selected program is on now; live channels (Riverside News) have no lineup.
-  // Labelled by the time of day on Eastern time (EST, as the schedules are): today from 7 am to 7 pm, tonight otherwise.
-  const LINEUP_NOUNS = { Comedy: 'comics', Cartoons: 'cartoons' };
-  const lineupLabel = (channel, t) => {
-    const noun = LINEUP_NOUNS[channel.genre];
-    const hour = (new Date(t).getUTCHours() + 19) % 24;
-    return noun ? `${hour >= 7 && hour < 19 ? 'Today’s' : 'Tonight’s'} ${noun}` : 'Lineup';
-  };
+  // On a pre-generated channel (its clips loop), the line under the title says what is playing, while the selected
+  // program is on now; live channels (Riverside News) keep their program's line.
   function renderNowPlaying() {
     const sel = selection();
-    const lineup = $('lineup');
-    if (!sel) {
-      lineup.hidden = true;
-      return;
-    }
+    if (!sel) return;
     const { channel, airing } = sel;
     const t = now();
     const clips = channel.clips.filter((clip) => clip.duration > 0);
@@ -198,11 +187,6 @@
     const playing = playerOnIt ? state.player.position : Live.livePosition(clips, t);
     const showNow = Boolean(playing) && !channel.live && airing.start <= t && t < airing.end;
     $('selEpisode').textContent = showNow ? `Now playing: ${Live.clipName(playing.clip)}` : (airing.program.episode || '');
-    lineup.hidden = !showNow || playing.clips.length < 2;
-    if (lineup.hidden) return;
-    $('lineupLabel').textContent = lineupLabel(channel, t);
-    fill($('lineupItems'), playing.clips.map((clip) => el('span', `lineup-item${clip.id === playing.clip.id ? ' on' : ''}`, Live.clipName(clip))));
-    $('lineupNext').textContent = `Up next: ${Live.clipName(playing.clips[(playing.index + 1) % playing.clips.length])}`;
   }
 
   function renderHero() {

@@ -27,8 +27,7 @@
     $('logo').hidden = !current.logo;
     $('chNum').textContent = String(current.number);
     $('livePill').hidden = !position || !current.live;  // only a channel that runs live says so
-    const next = position && position.clips.length > 1 && !current.live && position.clips[(position.index + 1) % position.clips.length];
-    $('clipInfo').textContent = !position ? 'No clips yet' : next ? `Up next: ${Live.clipName(next)}` : '';
+    $('clipInfo').textContent = position ? '' : 'No clips yet';
     document.title = `${current.name} · endless TV`;
   }
 
