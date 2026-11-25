@@ -8,14 +8,21 @@ image encodes cached, steady VRAM preload, NVENC.
 1. Warm-up: one clip whose prompt encoding also encodes every line of the segment with the anchor still, as the text encoder sees it:
    the session starts with all its text embeddings computed (no text encoder work between clips).
 2. The session: the airing (the Today opening, the body, the Today sign-off), then the Tonight opening and sign-off. As each clip is
-   ready it is copied to /root/report/<name>.mp4 and announced (RESULT clip.<name>), so it can be fetched and put on air at once.
-3. Timing: cycle per clip and speed against real time. The box then waits FINAL_WAIT_S for the last clips to be fetched.
+   ready it is copied to /root/report/<name>.mp4 and announced (RESULT clip.<name>); each airing clip is uploaded at once, in order,
+   to the Endless TV channel SITE/api/channels/CHANNEL with UPLOAD_KEY (a key that may only add clips to that channel, revoked after
+   the run), so it goes on air while the rest renders.
+3. Timing: cycle per clip and speed against real time. The Tonight clips are dumped through the log (clips_part_*.txt).
 Prints RESULT lines; writes /root/report/results.json.
 
     python news_live_box.py --attention sage2 --profile 1 --verbose 1"""
+import base64
 import json
 import os
+import queue
 import shutil
+import subprocess
+import urllib.parse
+import urllib.request
 import sys
 import threading
 import time
@@ -34,7 +41,10 @@ KEEP = ("Continue directly from <Picture 1>, preserving the news anchor, her sho
         "over a cream blouse, the small pearl earrings, the papers on the anchor desk and the studio behind her with the city skyline "
         "on the video wall.")
 SOUND = "overall_soundscape: Quiet television studio room tone and her clear, close-miked voice.\nnon_diegetic_music: N/A"
-RESULTS = {"clips": {}}
+RESULTS = {"clips": {}, "uploads": {}}
+SITE = os.environ.get("SITE", "https://wan2gp-production.up.railway.app")
+CHANNEL = os.environ.get("CHANNEL", "riverside-news")
+UPLOADS = queue.Queue()
 
 
 def prompt(line):
@@ -50,6 +60,9 @@ def plan():
     items += [(f"tonight_open_{i}", line) for i, line in enumerate(LINES["opening"]["Tonight"], 1)]
     items += [(f"tonight_close_{i}", line) for i, line in enumerate(LINES["signoff"]["Tonight"], 1)]
     return items
+
+
+LINES_BY_NAME = {}
 
 
 def r3(x):
@@ -69,6 +82,30 @@ def task(text, seed):
             "image_prompt_type": "SE", "image_start": IMAGE, "image_end": IMAGE, "video_prompt_type": "", "audio_prompt_type": ""}
 
 
+def uploader():
+    """Uploads the airing's clips to the channel in order, as they come."""
+    key = os.environ.get("UPLOAD_KEY", "")
+    while (item := UPLOADS.get()) is not None:
+        name, path, number, line, generate_s = item
+        query = urllib.parse.urlencode({"title": f"Riverside News {number:03d}: {line}", "sequence": number, "run": "riverside-live-1125",
+                                        "generate_s": generate_s if generate_s is not None else ""})
+        started, error = time.monotonic(), None
+        for attempt in range(5):
+            try:
+                request = urllib.request.Request(f"{SITE}/api/channels/{CHANNEL}/clips?{query}", data=open(path, "rb").read(), method="POST",
+                                                 headers={"Authorization": f"Bearer {key}", "Content-Type": "video/mp4",
+                                                          "X-Clip-Prompt": urllib.parse.quote(line, safe=""), "User-Agent": "riverside-live/1"})
+                with urllib.request.urlopen(request, timeout=120) as reply:
+                    reply.read()
+                error = None
+                break
+            except Exception as failure:  # noqa: BLE001 - retried, then reported
+                error = repr(failure)[:200]
+                time.sleep(3 * (attempt + 1))
+        RESULTS["uploads"][name] = {"ok": error is None, "s": r3(time.monotonic() - started), "error": error}
+        say(f"upload.{name}", RESULTS["uploads"][name])
+
+
 def publish(live, names, stop):
     """Copies each finished clip of the running session to the report folder as soon as it is ready."""
     done = set()
@@ -86,6 +123,8 @@ def publish(live, names, stop):
             shutil.copyfile(os.path.join(session.dir, record["mp4"]), os.path.join(REPORT, f"{name}.mp4"))
             RESULTS["clips"][name] = {k: record.get(k) for k in ("clip", "seed", "generate_s", "ready_at_s", "seconds", "encode_s")}
             say(f"clip.{name}", {"ok": True, **RESULTS["clips"][name]})
+            if name.startswith("news_"):
+                UPLOADS.put((name, os.path.join(REPORT, f"{name}.mp4"), int(name[5:]), LINES_BY_NAME[name], record.get("generate_s")))
         if stop.is_set() and (session is None or len(done) >= len(getattr(session, "records", []) or [])):
             return
         time.sleep(0.5)
@@ -105,6 +144,9 @@ def main():
     RESULTS["install_problems"] = live.install(MiniMaxH3Pipeline)
     items = plan()
     names, prompts = [n for n, _ in items], [prompt(line) for _, line in items]
+    LINES_BY_NAME.update(items)
+    sender = threading.Thread(target=uploader, daemon=True)
+    sender.start()
     RESULTS["plan"] = [{"name": n, "line": line} for n, line in items]
     say("plan", {"clips": len(items), "airing": sum(n.startswith("news_") for n in names)})
 
@@ -156,7 +198,22 @@ def main():
                           **{k: summary.get(k) for k in ("clips", "errors", "cycle_s", "realtime_x", "generate_s", "generation_x",
                                                          "first_clip_ready_s", "encoder", "dir")}}
     say("session", RESULTS["session"])
+    UPLOADS.put(None)
+    sender.join(timeout=600)
     save()
+
+    # the Tonight versions come back through the log: one dump part per clip (x264, lines of 480 characters)
+    outputs = []
+    for name in (n for n in names if n.startswith("tonight_") and os.path.exists(os.path.join(REPORT, f"{n}.mp4"))):
+        small = os.path.join(REPORT, f"{name}_x264.mp4")
+        subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", os.path.join(REPORT, f"{name}.mp4"), "-c:v", "libx264", "-crf", "18", "-preset", "slow",
+                        "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart", small], check=True)
+        outputs.append(f"{name}_x264.mp4")
+    for number, name in enumerate(outputs, 1):
+        with open(os.path.join(REPORT, f"clips_part_{number:02d}.txt"), "w") as dump:
+            data = base64.b64encode(open(os.path.join(REPORT, name), "rb").read()).decode()
+            dump.write(f"CLIP_BEGIN {name} {len(data)}\n" + "".join(data[i:i + 480] + "\n" for i in range(0, len(data), 480)) + f"CLIP_END {name}\n")
+    open(os.path.join(REPORT, "dump_manifest.txt"), "w").write(" ".join(outputs))
 
 
 if __name__ == "__main__":
@@ -167,4 +224,4 @@ if __name__ == "__main__":
         RESULTS["error"] = repr(error)[:400]
         save()
     print("RESULT DONE " + json.dumps({"error": RESULTS.get("error")}), flush=True)
-    time.sleep(float(os.environ.get("FINAL_WAIT_S", "300")))  # time to fetch the last clips before the box is destroyed
+    time.sleep(float(os.environ.get("FINAL_WAIT_S", "0")))
