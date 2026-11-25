@@ -3,6 +3,10 @@
 // the server's (skew), so every viewer sees the same moment of the loop.
 /* global Live */
 (function () {
+  // TV browsers (Samsung Tizen, LG webOS) decode one video at a time, so there one <video> plays the clips in turn, with a
+  // short load between clips, instead of two taking turns.
+  const ONE_VIDEO = /SMART-TV|SmartTV|Tizen|Web0S|webOS|NetCast|HbbTV/i.test(navigator.userAgent);
+
   class LivePlayer {
     constructor(container, { muted = true, skew = 0, onClip = () => {} } = {}) {
       this.container = container;
@@ -11,7 +15,7 @@
       this.onClip = onClip;
       this.channel = null;
       this.generation = 0;
-      this.videos = [this.makeVideo(), this.makeVideo()];
+      this.videos = ONE_VIDEO ? [this.makeVideo()] : [this.makeVideo(), this.makeVideo()];
       this.active = 0;
       this.poster = document.createElement('img');
       this.poster.alt = '';
@@ -99,6 +103,7 @@
     }
 
     preloadNext() {
+      if (this.videos.length < 2) return;
       const { clips, index } = this.position;
       const next = clips[(index + 1) % clips.length];
       const other = this.videos[1 - this.active];
@@ -114,7 +119,7 @@
       const { clips, index } = this.position;
       const expected = Live.livePosition(this.channel.clips, this.now());
       const nextIndex = (index + 1) % clips.length;
-      if (!expected || expected.clip.id !== clips[nextIndex].id || expected.offset > 3) {
+      if (this.videos.length < 2 || !expected || expected.clip.id !== clips[nextIndex].id || expected.offset > 3) {
         this.sync();
         return;
       }
@@ -123,7 +128,7 @@
       video.currentTime = 0;
       this.show(video);
       this.videos[1 - this.active].pause();
-      this.position = { ...expected, index: nextIndex, clip: clips[nextIndex] };
+      this.position = Object.assign({}, expected, { index: nextIndex, clip: clips[nextIndex] });  // (object spread needs Chromium 60)
       this.preloadNext();
       this.onClip(this.position);
     }

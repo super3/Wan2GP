@@ -10,6 +10,11 @@
     return node;
   };
   const fmt = (ms) => new Date(ms).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+  // A node's children replaced (Element.replaceChildren needs Chromium 86, newer than most TV browsers).
+  const fill = (node, children) => {
+    while (node.firstChild) node.removeChild(node.firstChild);
+    for (const child of children) node.appendChild(child);
+  };
 
   const state = { channels: [], skew: 0, filter: 'All', selected: null, player: null, muted: true };
   const now = () => Date.now() + state.skew;
@@ -45,7 +50,7 @@
 
   function renderFilters() {
     const box = $('filters');
-    box.replaceChildren(...genres().map((label) => {
+    fill(box, genres().map((label) => {
       const chip = el('button', 'chip', label);
       chip.type = 'button';
       chip.setAttribute('aria-pressed', String(state.filter === label));
@@ -113,7 +118,7 @@
       row.append(name, lane);
       return row;
     });
-    $('rows').replaceChildren(...rows);
+    fill($('rows'), rows);
     renderClock();
   }
 
@@ -164,7 +169,7 @@
     $('selTitle').textContent = program.title;
     $('selEpisode').textContent = program.episode || '';
     const meta = $('selMeta');
-    meta.replaceChildren(el('span', '', `${fmt(airing.start)} – ${fmt(airing.end)}`), ...(program.badges || []).map((b) => el('span', 'rating', b)));
+    fill(meta, [el('span', '', `${fmt(airing.start)} – ${fmt(airing.end)}`)].concat((program.badges || []).map((b) => el('span', 'rating', b))));
     $('selBlurb').textContent = program.blurb || channel.blurb || '';
     const watch = `/watch/${channel.id}`;
     $('screen').href = watch;
@@ -195,7 +200,7 @@
   async function refresh() {
     try {
       await load();
-    } catch {
+    } catch (error) {  // (a bare `catch {` needs Chromium 66)
       return;  // keep showing what we have
     }
     const empty = state.channels.length === 0;

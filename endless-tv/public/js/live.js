@@ -6,7 +6,7 @@
   /* istanbul ignore else -- the browser path, tested by running this file in a sandbox (live.test.js) */
   if (typeof module === 'object' && module.exports) module.exports = live;
   else root.Live = live;
-})(globalThis, function () {
+})(this, function () {  // a script's top-level `this` is the global object, in old browsers too
   const EPOCH = Date.UTC(2026, 0, 1);  // midnight UTC, Jan 1 2026: where every loop starts
   const DEFAULT_PROGRAM_MINUTES = 60;
 

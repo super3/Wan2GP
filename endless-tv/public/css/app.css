@@ -37,13 +37,17 @@ button:focus-visible, a:focus-visible { outline: 2px solid #FFFFFF; outline-offs
 .hero-media { flex: 3 1 760px; min-width: 300px; display: flex; flex-direction: column; }
 .screen-box { position: relative; }
 .screen { display: block; position: relative; width: 100%; border-radius: 8px; overflow: hidden; background: #000; aspect-ratio: 16 / 9; }
+@supports not (aspect-ratio: 16 / 9) {  /* Chromium < 88 (most TV browsers): the old padding trick */
+  .screen { height: 0; padding-top: 56.25%; }
+}
 .mute { position: absolute; right: 12px; bottom: 12px; z-index: 4; width: 44px; height: 44px; border-radius: 50%; border: none; background: rgba(14, 14, 16, 0.6); display: flex; align-items: center; justify-content: center; cursor: pointer; opacity: 0; transition: opacity 0.2s ease; }
-.screen-box:hover .mute, .mute:focus-visible { opacity: 1; }
+.screen-box:hover .mute { opacity: 1; }
+.mute:focus-visible { opacity: 1; }  /* its own rule: browsers without :focus-visible drop the whole rule it is in */
 .mute:hover { background: rgba(14, 14, 16, 0.85); }
 @media (hover: none) { .mute { opacity: 1; } }  /* touch screens have no hover */
-.screen-cover { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; display: block; }
+.screen-cover { position: absolute; top: 0; right: 0; bottom: 0; left: 0; width: 100%; height: 100%; object-fit: cover; display: block; }
 .badge-live { position: absolute; top: 12px; left: 12px; padding: 3px 7px; border-radius: 3px; background: var(--live); color: #FFFFFF; font-size: 12px; font-weight: 800; letter-spacing: 0.04em; z-index: 3; }
-.screen-note { position: absolute; inset: 0; background: rgba(14, 14, 16, 0.72); display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 18px; text-align: center; padding: 24px; z-index: 3; }
+.screen-note { position: absolute; top: 0; right: 0; bottom: 0; left: 0; background: rgba(14, 14, 16, 0.72); display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 18px; text-align: center; padding: 24px; z-index: 3; }
 .hero-info { flex: 2 1 380px; min-width: 280px; display: flex; flex-direction: column; gap: 10px; }
 .chan-line { display: flex; align-items: center; gap: 10px; min-height: 32px; }
 .chan-line img { height: 32px; width: auto; display: block; }
@@ -65,7 +69,9 @@ button:focus-visible, a:focus-visible { outline: 2px solid #FFFFFF; outline-offs
 .chip[aria-pressed="true"] { background: var(--text); color: var(--bg); }
 .grid-scroll { overflow-x: auto; }
 .grid { min-width: 960px; position: relative; }
-.row { display: grid; grid-template-columns: 200px minmax(0, 1fr); height: 72px; border-bottom: 1px solid var(--line); }
+.row { display: flex; height: 72px; border-bottom: 1px solid var(--line); }
+.row > :first-child { flex: 0 0 200px; }
+.row > :last-child { flex: 1 1 0; min-width: 0; }
 .row.head { height: 40px; align-items: center; border-bottom-color: rgba(255, 255, 255, 0.08); }
 .today { font-size: 14px; font-weight: 700; padding-left: 4px; }
 .timeline { position: relative; height: 40px; }
@@ -90,13 +96,13 @@ button:focus-visible, a:focus-visible { outline: 2px solid #FFFFFF; outline-offs
 .empty code { color: var(--text); }
 
 /* the live player: two stacked videos, the next clip loaded in the hidden one */
-.player { position: absolute; inset: 0; background: #000; }
-.player video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; display: block; opacity: 0; }
+.player { position: absolute; top: 0; right: 0; bottom: 0; left: 0; background: #000; }
+.player video { position: absolute; top: 0; right: 0; bottom: 0; left: 0; width: 100%; height: 100%; object-fit: cover; display: block; opacity: 0; }
 .player video.on { opacity: 1; }
-.player img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+.player img { position: absolute; top: 0; right: 0; bottom: 0; left: 0; width: 100%; height: 100%; object-fit: cover; }
 
 /* watch page */
-.watch { position: fixed; inset: 0; background: #000; overflow: hidden; }
+.watch { position: fixed; top: 0; right: 0; bottom: 0; left: 0; background: #000; overflow: hidden; }
 .watch .player video { object-fit: contain; }
 .bar { position: absolute; left: 0; right: 0; display: flex; align-items: center; gap: 14px; padding: 18px 24px; z-index: 4; transition: opacity 0.3s; }
 .bar.top-bar { top: 0; background: linear-gradient(rgba(0, 0, 0, 0.7), transparent); }
@@ -115,6 +121,19 @@ button:focus-visible, a:focus-visible { outline: 2px solid #FFFFFF; outline-offs
 .ch-num { min-width: 40px; text-align: center; font-weight: 700; font-variant-numeric: tabular-nums; }
 .unmute { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); z-index: 5; }
 .clip-info { font-size: 13px; color: var(--muted); }
+
+/* errors a script hit, shown on the page (compat.js): TV browsers have no developer tools */
+.compat-error { position: fixed; left: 16px; right: 16px; bottom: 16px; z-index: 10; padding: 12px 16px; border-radius: 6px; background: #3A1512; color: #FFFFFF; font-size: 14px; line-height: 1.4; }
+
+/* flexbox gap needs Chromium 84: older browsers (compat.js sets html.no-flexgap) get margins instead */
+.no-flexgap .top > * + *, .no-flexgap .bar > * + * { margin-left: 12px; }
+.no-flexgap .brand > * + * { margin-left: 6px; }
+.no-flexgap .hero > * + * { margin-left: 32px; }
+.no-flexgap .hero-info > * + * { margin-top: 10px; }
+.no-flexgap .chan-line > * + *, .no-flexgap .actions > * + * { margin-left: 10px; }
+.no-flexgap .meta > * + *, .no-flexgap .filters > * + *, .no-flexgap .solid > * + *, .no-flexgap .discord > * + * { margin-left: 8px; }
+.no-flexgap .chan > * + * { margin-left: 12px; }
+.no-flexgap .cell-title > * + *, .no-flexgap .cell-sub > * + *, .no-flexgap .live-pill > * + * { margin-left: 6px; }
 
 @media (max-width: 720px) {
   .top, .hero, .guide { padding-left: 16px; padding-right: 16px; }

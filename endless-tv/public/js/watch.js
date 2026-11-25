@@ -65,7 +65,7 @@
       const id = channel() && channel().id;
       try {
         await load();
-      } catch {
+      } catch (error) {  // (a bare `catch {` needs Chromium 66)
         return;
       }
       const index = state.channels.findIndex((c) => c.id === id);
@@ -79,9 +79,15 @@
   $('mute').addEventListener('click', () => setMuted(!state.muted));
   $('chUp').addEventListener('click', () => tune(state.index + 1));
   $('chDown').addEventListener('click', () => tune(state.index - 1));
-  $('fullscreen').addEventListener('click', () => {
-    if (document.fullscreenElement) document.exitFullscreen();
-    else $('watch').requestFullscreen().catch(() => {});
+  $('fullscreen').addEventListener('click', () => {  // older browsers have only the webkit-prefixed calls, without promises
+    const box = $('watch');
+    if (document.fullscreenElement || document.webkitFullscreenElement) {
+      (document.exitFullscreen || document.webkitExitFullscreen).call(document);
+      return;
+    }
+    const request = box.requestFullscreen || box.webkitRequestFullscreen;
+    const result = request && request.call(box);
+    if (result && result.catch) result.catch(() => {});
   });
   document.addEventListener('keydown', (event) => {
     if (event.key === 'ArrowUp') tune(state.index + 1);
