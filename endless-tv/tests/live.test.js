@@ -12,6 +12,13 @@ test('in a browser (no module), it defines the Live global', () => {
 const MIN = 60000;
 const clips = [{ id: 'a', duration: 10 }, { id: 'b', duration: 5 }, { id: 'c', duration: 15 }];
 
+test('a clip\'s short name is its title up to a colon', () => {
+  expect(Live.clipName({ title: 'Larry: stand-up set' })).toBe('Larry');
+  expect(Live.clipName({ title: 'Bertram Bigsby in The Littlest Crossing' })).toBe('Bertram Bigsby in The Littlest Crossing');
+  expect(Live.clipName({ title: '' })).toBe('Untitled');
+  expect(Live.clipName(null)).toBe('Untitled');
+});
+
 describe('livePosition', () => {
   test('finds the clip on now and the offset into it, the same for everyone', () => {
     expect(Live.livePosition(clips, Live.EPOCH)).toMatchObject({ index: 0, offset: 0 });

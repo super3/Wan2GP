@@ -17,7 +17,9 @@
     if (!current) return;
     const airing = Live.onNow(current, now());
     $('title').textContent = airing.program.title;
-    $('episode').textContent = [current.name, airing.program.episode].filter(Boolean).join(' · ');
+    // a pre-generated channel says what is playing, a live one its program's episode
+    const nowPlaying = position && !current.live ? `Now playing: ${Live.clipName(position.clip)}` : airing.program.episode;
+    $('episode').textContent = [current.name, nowPlaying].filter(Boolean).join(' · ');
     if (current.logo) {
       $('logo').src = current.logo;
       $('logo').alt = current.name;
@@ -25,9 +27,8 @@
     $('logo').hidden = !current.logo;
     $('chNum').textContent = String(current.number);
     $('livePill').hidden = !position || !current.live;  // only a channel that runs live says so
-    $('clipInfo').textContent = position
-      ? `Clip ${position.index + 1} of ${position.clips.length}${position.clip.title ? `: ${position.clip.title}` : ''}`
-      : 'No clips yet';
+    const next = position && position.clips.length > 1 && !current.live && position.clips[(position.index + 1) % position.clips.length];
+    $('clipInfo').textContent = !position ? 'No clips yet' : next ? `Up next: ${Live.clipName(next)}` : '';
     document.title = `${current.name} · endless TV`;
   }
 

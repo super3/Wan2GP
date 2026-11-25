@@ -62,5 +62,10 @@
     return date.getTime();
   }
 
-  return { EPOCH, loopSeconds, livePosition, scheduleOf, airings, onNow, halfHourStart };
+  // A clip's short name for "Now playing": its title up to a colon ("Larry: stand-up set" is Larry), or all of it.
+  function clipName(clip) {
+    return ((clip && clip.title) || '').split(':')[0].trim() || 'Untitled';
+  }
+
+  return { EPOCH, loopSeconds, livePosition, scheduleOf, airings, onNow, halfHourStart, clipName };
 });

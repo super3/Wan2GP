@@ -67,6 +67,12 @@ button:focus-visible, a:focus-visible { outline: 2px solid #FFFFFF; outline-offs
 .meta { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; font-size: 14px; color: var(--muted); }
 .rating { padding: 1px 5px; border: 1px solid rgba(255, 255, 255, 0.4); border-radius: 3px; font-size: 11px; font-weight: 700; color: var(--text); letter-spacing: 0.02em; }
 .blurb { margin: 2px 0 0; font-size: 15px; line-height: 1.55; color: var(--muted); max-width: 560px; text-wrap: pretty; }
+.lineup { display: flex; flex-direction: column; gap: 8px; margin-top: 6px; }
+.lineup-label { font-size: 13px; font-weight: 700; color: var(--muted); }
+.lineup-items { display: flex; flex-wrap: wrap; gap: 6px; }
+.lineup-item { padding: 6px 10px; border-radius: 6px; background: var(--chip); color: var(--text); font-size: 13px; font-weight: 700; }
+.lineup-item.on { background: var(--text); color: var(--bg); }
+.lineup-next { font-size: 14px; color: var(--muted); }
 .actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 8px; }
 .solid { display: inline-flex; align-items: center; gap: 8px; padding: 12px 20px; border-radius: 6px; background: #FFFFFF; color: var(--bg); font-weight: 700; font-size: 15px; text-decoration: none; border: none; cursor: pointer; }
 .solid:hover { background: #E4E4EA; color: var(--bg); }
@@ -139,6 +145,8 @@ button:focus-visible, a:focus-visible { outline: 2px solid #FFFFFF; outline-offs
 .no-flexgap .brand > * + * { margin-left: 6px; }
 .no-flexgap .hero > * + * { margin-left: 32px; }
 .no-flexgap .hero-info > * + * { margin-top: 10px; }
+.no-flexgap .lineup > * + * { margin-top: 8px; }
+.no-flexgap .lineup-items > * + * { margin-left: 6px; }
 .no-flexgap .chan-line > * + *, .no-flexgap .actions > * + * { margin-left: 10px; }
 .no-flexgap .meta > * + *, .no-flexgap .filters > * + *, .no-flexgap .solid > * + *, .no-flexgap .discord > * + * { margin-left: 8px; }
 .no-flexgap .chan > * + * { margin-left: 12px; }
