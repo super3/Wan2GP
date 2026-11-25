@@ -4,7 +4,7 @@ The sources behind the Endless TV channels' clips: scripts, prompts, the code th
 
 ## news/
 
-`riverside_tonight_2026-11-25_script.md` is a 10-minute Riverside Tonight script on five of the day's top stories. It's a draft for review, not yet rendered. It is split into 40 clips of 15 seconds, each read by the anchor on the channel's first frame, and has sources and review notes at the end.
+`riverside_news_2026-11-25_script.md` is a 10-minute Riverside News script on five of the day's top stories. It airs as Riverside Today (7 am to 7 pm Eastern) or Riverside Tonight: only the opening and the sign-off differ. It's a draft for review, not yet rendered. It is split into 40 clips of 15 seconds, each read by the anchor on the channel's first frame, and has sources and review notes at the end.
 
 ## laugh-track/
 

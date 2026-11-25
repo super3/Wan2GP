@@ -1,7 +1,9 @@
-# Riverside Tonight: Wednesday, November 25, 2026 (draft for review)
+# Riverside News: Wednesday, November 25, 2026 (draft for review)
+
+Airs as **Riverside Today** from 7 am to 7 pm Eastern and **Riverside Tonight** from 7 pm to 7 am. The 38 middle clips never say what time of day it is, so they're shared. Only the opening (clip 1) and the sign-off (clip 40) come in a Today and a Tonight version, and the player uses the pair that matches the clock.
 
 **Anchor:** Dana Reyes (the anchor still we use as every clip's first and last frame)
-**Runtime:** about 10 minutes: 40 clips of 15 seconds each, about 1,450 words at a broadcast pace of about 150 words a minute
+**Runtime:** about 10 minutes: 40 clips of 15 seconds each, about 1,350 words at a broadcast pace of about 150 words a minute. There are 42 clips to render: the 38 shared ones plus a Today and a Tonight version of the opening and the sign-off.
 **Facts current as of:** about 17:00 UTC on November 25. Several of these stories are still developing.
 
 Numbers are written out as words so the voice reads them correctly. Each numbered line is one 15-second clip, with its start time.
@@ -22,11 +24,13 @@ Numbers are written out as words so the voice reads them correctly. Each numbere
 
 ## 1. Open and headlines
 
-**1 · 0:00** Good evening. I'm Dana Reyes, and this is Riverside Tonight for Wednesday, November twenty-fifth. On the eve of Thanksgiving, tensions in the Gulf are rising again, and Washington is proposing a new wave of tariffs.
+**1 · 0:00 (Today)** Hello, and welcome. I'm Dana Reyes, and this is Riverside Today for Wednesday, November twenty-fifth. On the eve of Thanksgiving, tensions in the Gulf are rising again, and Washington is proposing a new wave of tariffs.
 
-**2 · 0:15** Also tonight: a federal jury convicts Chinese tech giant Huawei, Nvidia brings back the chief executive who resigned just last week, and millions of Americans are on the move for the holiday, with storms on both coasts.
+**1 · 0:00 (Tonight)** Good evening. I'm Dana Reyes, and this is Riverside Tonight for Wednesday, November twenty-fifth. On the eve of Thanksgiving, tensions in the Gulf are rising again, and Washington is proposing a new wave of tariffs.
 
-**3 · 0:30** We begin in the Strait of Hormuz, the narrow shipping lane between Iran and the Arabian Peninsula that carries a large share of the world's oil. Tonight, Iran says more tankers there have struck mines.
+**2 · 0:15** Also ahead: a federal jury convicts Chinese tech giant Huawei, Nvidia brings back the chief executive who resigned just last week, and millions of Americans are on the move for the holiday, with storms on both coasts.
+
+**3 · 0:30** We begin in the Strait of Hormuz, the narrow shipping lane between Iran and the Arabian Peninsula that carries a large share of the world's oil. Iran now says more tankers there have struck mines.
 
 ## 2. The Gulf
 
@@ -44,7 +48,7 @@ Numbers are written out as words so the voice reads them correctly. Each numbere
 
 **10 · 2:15** It was the second attack on that tower in less than a week, and Yemen's Houthi rebels say they carried it out. Today, the Houthis also claimed an attack on Saudi Arabia's Ras Tanura oil refinery, saying it started fires.
 
-**11 · 2:30** The Saudi-led coalition says its air defenses shot down four drones over Ras Tanura, but it has not said whether the refinery itself was hit. We'll keep following developments in the Gulf throughout the evening.
+**11 · 2:30** The Saudi-led coalition says its air defenses shot down four drones over Ras Tanura, but it has not said whether the refinery itself was hit. We'll keep following developments in the Gulf as the story unfolds.
 
 ## 3. Tariffs
 
@@ -92,7 +96,7 @@ Numbers are written out as words so the voice reads them correctly. Each numbere
 
 ## 6. Thanksgiving travel
 
-**31 · 7:30** Finally tonight, if you're heading somewhere for Thanksgiving, you have plenty of company. AAA expects about eighty-one and a half million Americans to travel between yesterday and next Monday.
+**31 · 7:30** Finally, if you're heading somewhere for Thanksgiving, you have plenty of company. AAA expects about eighty-one and a half million Americans to travel between yesterday and next Monday.
 
 **32 · 7:45** That's essentially flat from last year, down about a tenth of a percent, ending a three-year streak of record Thanksgiving travel. AAA points to record-high gas prices this fall as one reason fewer people are driving.
 
@@ -108,11 +112,13 @@ Numbers are written out as words so the voice reads them correctly. Each numbere
 
 ## 7. Recap and close
 
-**38 · 9:15** Once more, tonight's top stories: Iran says more tankers have struck mines in the Strait of Hormuz, Washington is proposing new tariffs on fourteen economies, and a federal jury has convicted Huawei on ten of twelve counts.
+**38 · 9:15** Once more, our top stories: Iran says more tankers have struck mines in the Strait of Hormuz, Washington is proposing new tariffs on fourteen economies, and a federal jury has convicted Huawei on ten of twelve counts.
 
 **39 · 9:30** Nvidia has brought back Jensen Huang as chief executive, and more than eighty million Americans are traveling for Thanksgiving, with storms on both coasts. These stories are still developing, and we'll bring you updates as they come in.
 
-**40 · 9:45** That's Riverside Tonight. From all of us here, have a safe and happy Thanksgiving. I'm Dana Reyes. Thank you for watching, and good night.
+**40 · 9:45 (Today)** That's Riverside Today. From all of us here, have a safe and happy Thanksgiving. I'm Dana Reyes. Thank you for watching.
+
+**40 · 9:45 (Tonight)** That's Riverside Tonight. From all of us here, have a safe and happy Thanksgiving. I'm Dana Reyes. Thank you for watching, and good night.
 
 ---
 
@@ -133,7 +139,7 @@ Numbers are written out as words so the voice reads them correctly. Each numbere
 **Production:**
 - Only the anchor appears on screen: no real people's faces are generated, just Dana at the desk on our first frame.
 - An on-screen "AI-generated news" label would be a good idea, since this is real news read by a fictional anchor.
-- If you approve it, I'll render all 40 clips with the settings you picked (Larry v4, 720p, Audio Refinement) and stitch them into one 10-minute program. At about 9 minutes per 15-second clip on one box, that's about 6 GPU-hours, roughly $3 on 5090s. That's more than the Clore balance has left after the cartoons finish, so it needs a top-up first.
+- If you approve it, I'll render all 42 clips with the settings you picked (Larry v4, 720p, Audio Refinement) and stitch two 10-minute versions, Today and Tonight, that share the middle 38 clips. At about 9 minutes per 15-second clip on one box, that's about 6.5 GPU-hours, roughly $3 on 5090s. That's more than the Clore balance has left after the cartoons finish, so it needs a top-up first.
 
 ## Sources
 
