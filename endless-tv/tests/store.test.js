@@ -59,6 +59,15 @@ test('a channel loops from the shared epoch unless given its own loop start, whi
   expect((await store.upsertChannel('news', { loopStart: null })).loopStart).toBeNull();
 });
 
+test('an upload key is kept only as its hash, and can be removed', async () => {
+  const store = await fresh();
+  const channel = await store.upsertChannel('news', { uploadKey: 'k'.repeat(32) });
+  expect(channel.uploadKeyHash).toMatch(/^[0-9a-f]{64}$/);
+  expect(JSON.stringify(channel)).not.toContain('k'.repeat(32));
+  for (const bad of ['short', 7, 'k'.repeat(201)]) await expect(store.upsertChannel('news', { uploadKey: bad })).rejects.toMatchObject({ status: 400 });
+  expect((await store.upsertChannel('news', { uploadKey: null })).uploadKeyHash).toBeNull();
+});
+
 test('lists channels by number', async () => {
   const store = await fresh();
   await store.upsertChannel('b', { number: 2 });

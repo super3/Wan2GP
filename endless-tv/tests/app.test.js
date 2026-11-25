@@ -155,6 +155,27 @@ describe('clips', () => {
     expect(plain.body.clip).toMatchObject({ prompt: 'short', seed: null });
   });
 
+  test('a channel upload key may add clips to its channel only, is never shown, and stops working once removed', async () => {
+    const { app } = await setup();
+    const key = 'k'.repeat(40);
+    const asKey = (value) => ({ Authorization: `Bearer ${value}` });
+    const send = (id, headers) => request(app).post(`/api/channels/${id}/clips?title=live`).set(headers).set('Content-Type', 'video/mp4').send(mp4());
+    await request(app).put('/api/channels/news').set(auth).send({ live: true }).expect(200);
+    await send('news', asKey(key)).expect(401);  // no key yet
+    const set = await request(app).put('/api/channels/news').set(auth).send({ uploadKey: key }).expect(200);
+    expect(JSON.stringify(set.body)).not.toMatch(/uploadKey|k{40}/);
+    await send('news', asKey(key)).expect(201);
+    await send('news', asKey('x'.repeat(40))).expect(401);
+    await send('news', {}).expect(401);  // no Authorization at all
+    await send('laugh-track', asKey(key)).expect(401);  // another channel
+    await request(app).put('/api/channels/news').set(asKey(key)).send({ name: 'Hijacked' }).expect(401);  // only clip uploads
+    await send('news', auth).expect(201);  // the token still works
+    await send('Bad!', asKey(key)).expect(400);
+    await request(app).put('/api/channels/news').set(auth).send({ uploadKey: null }).expect(200);
+    await send('news', asKey(key)).expect(401);
+    expect((await request(app).get('/api/channels/news').expect(200)).body.channel.clips).toHaveLength(2);
+  });
+
   test('anything but a readable MP4 is refused, and nothing is left behind', async () => {
     const { app, store } = await withChannel();
     await request(app).post('/api/channels/laugh-track/clips').set(auth).set('Content-Type', 'video/mp4').send(Buffer.from('not a video')).expect(415);

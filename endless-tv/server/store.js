@@ -110,6 +110,12 @@ class Store {
         channel.number = number;
       }
       if (fields.live !== undefined) channel.live = fields.live === true;  // runs live (a GPU making it now), not pre-generated
+      if (fields.uploadKey !== undefined) {  // a key that may upload clips to this channel only; kept as its hash; null removes it
+        if (fields.uploadKey !== null && !(typeof fields.uploadKey === 'string' && fields.uploadKey.length >= 32 && fields.uploadKey.length <= 200)) {
+          throw new HttpError(400, 'uploadKey must be 32 to 200 characters, or null');
+        }
+        channel.uploadKeyHash = fields.uploadKey === null ? null : crypto.createHash('sha256').update(fields.uploadKey).digest('hex');
+      }
       if (fields.loopStart !== undefined) {  // where the channel's loop starts (ms since 1970); null: the shared EPOCH
         const loopStart = fields.loopStart === null ? null : Number(fields.loopStart);
         if (loopStart !== null && !(Number.isInteger(loopStart) && loopStart > 0)) throw new HttpError(400, 'loopStart must be a time in ms, or null');

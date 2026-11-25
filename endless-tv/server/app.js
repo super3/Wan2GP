@@ -60,6 +60,20 @@ function requireToken(token) {
   };
 }
 
+// Clip uploads to one channel: the upload token, or that channel's own upload key (handed to a GPU box rendering it live,
+// so the box never holds the token, and revoked when the render is done).
+function requireTokenOrChannelKey(auth, store, channelParam) {
+  return (req, res, next) => {
+    const match = /^Bearer (.+)$/.exec(req.headers.authorization || '');
+    const channel = match && store.get(channelParam(req));
+    if (channel && channel.uploadKeyHash) {
+      const given = crypto.createHash('sha256').update(match[1]).digest();
+      if (crypto.timingSafeEqual(given, Buffer.from(channel.uploadKeyHash, 'hex'))) return next();
+    }
+    return auth(req, res, next);
+  };
+}
+
 // A link the site may show (the Discord invite): only an https URL, anything else shows nothing.
 function httpsUrl(value) {
   return typeof value === 'string' && /^https:\/\/[^\s"'<>]+$/.test(value) ? value : null;
@@ -136,7 +150,7 @@ function createApp({ store, token = '', maxUploadBytes = 300e6, persistent = fal
   });
 
   // A clip: the MP4 as the body, its details in the query string (and a long prompt in X-Clip-Prompt, URI-encoded).
-  app.post('/api/channels/:id/clips', auth, async (req, res) => {
+  app.post('/api/channels/:id/clips', requireTokenOrChannelKey(auth, store, channelParam), async (req, res) => {
     const id = channelParam(req);
     store.require(id);
     const upload = await receive(req, store.tmpDir, maxUploadBytes);
