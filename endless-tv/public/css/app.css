@@ -40,10 +40,19 @@ button:focus-visible, a:focus-visible { outline: 2px solid #FFFFFF; outline-offs
 @supports not (aspect-ratio: 16 / 9) {  /* Chromium < 88 (most TV browsers): the old padding trick */
   .screen { height: 0; padding-top: 56.25%; }
 }
-.mute { position: absolute; right: 12px; bottom: 12px; z-index: 4; width: 44px; height: 44px; border-radius: 50%; border: none; background: rgba(14, 14, 16, 0.6); display: flex; align-items: center; justify-content: center; cursor: pointer; opacity: 0; transition: opacity 0.2s ease; }
+.mute { position: absolute; right: 64px; bottom: 12px; z-index: 4; width: 44px; height: 44px; border-radius: 50%; border: none; background: rgba(14, 14, 16, 0.6); display: flex; align-items: center; justify-content: center; cursor: pointer; opacity: 0; transition: opacity 0.2s ease; }
 .screen-box:hover .mute { opacity: 1; }
 .mute:focus-visible { opacity: 1; }  /* its own rule: browsers without :focus-visible drop the whole rule it is in */
 .mute:hover { background: rgba(14, 14, 16, 0.85); }
+.mute.fs { right: 12px; }  /* the full-screen button, on the mute button's right */
+/* the guide's video full screen: the box fills the screen, the video fits inside it and is no longer a link. Prefixed and
+   unprefixed rules stay apart: a browser that lacks one drops a whole rule that names it. */
+.screen-box:fullscreen { width: 100%; height: 100%; background: #000; }
+.screen-box:-webkit-full-screen { width: 100%; height: 100%; background: #000; }
+.screen-box:fullscreen .screen { height: 100%; padding-top: 0; aspect-ratio: auto; border-radius: 0; pointer-events: none; }
+.screen-box:-webkit-full-screen .screen { height: 100%; padding-top: 0; aspect-ratio: auto; border-radius: 0; pointer-events: none; }
+.screen-box:fullscreen .player video, .screen-box:fullscreen .player img { object-fit: contain; }
+.screen-box:-webkit-full-screen .player video, .screen-box:-webkit-full-screen .player img { object-fit: contain; }
 @media (hover: none) { .mute { opacity: 1; } }  /* touch screens have no hover */
 .screen-cover { position: absolute; top: 0; right: 0; bottom: 0; left: 0; width: 100%; height: 100%; object-fit: cover; display: block; }
 .badge-live { position: absolute; top: 12px; left: 12px; padding: 3px 7px; border-radius: 3px; background: var(--live); color: #FFFFFF; font-size: 12px; font-weight: 800; letter-spacing: 0.04em; z-index: 3; }

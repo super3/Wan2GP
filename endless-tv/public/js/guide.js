@@ -155,6 +155,26 @@
     $('mute').setAttribute('aria-label', muted ? 'Turn on sound' : 'Turn off sound');
   }
 
+  // Full screen for the video (the button beside mute). Older browsers have only the webkit-prefixed calls, without promises.
+  const FS_ENTER = 'M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5';
+  const FS_EXIT = 'M9 4v5H4M15 4v5h5M9 20v-5H4M15 20v-5h5';
+  const fullscreenElement = () => document.fullscreenElement || document.webkitFullscreenElement;
+  const canFullscreen = () => Boolean($('screenBox').requestFullscreen || $('screenBox').webkitRequestFullscreen);
+  function toggleFullscreen() {
+    if (fullscreenElement()) {
+      (document.exitFullscreen || document.webkitExitFullscreen).call(document);
+      return;
+    }
+    const box = $('screenBox');
+    const result = (box.requestFullscreen || box.webkitRequestFullscreen).call(box);
+    if (result && result.catch) result.catch(() => {});
+  }
+  function renderFullscreen() {
+    const on = Boolean(fullscreenElement());
+    $('fsIcon').setAttribute('d', on ? FS_EXIT : FS_ENTER);
+    $('fs').setAttribute('aria-label', on ? 'Exit full screen' : 'Full screen');
+  }
+
   function renderHero() {
     const sel = selection();
     if (!sel) return;
@@ -181,6 +201,7 @@
     const cover = $('cover');
     const note = $('screenNote');
     $('mute').hidden = !(live && clips);
+    $('fs').hidden = !(live && clips) || !canFullscreen();
     if (live && clips) {
       cover.hidden = true;
       note.hidden = true;
@@ -215,6 +236,9 @@
 
   state.player = new LivePlayer($('player'), { muted: true });
   $('mute').addEventListener('click', () => setMuted(!state.muted));
+  $('fs').addEventListener('click', toggleFullscreen);
+  document.addEventListener('fullscreenchange', renderFullscreen);
+  document.addEventListener('webkitfullscreenchange', renderFullscreen);
   refresh();
   setInterval(renderClock, 1000);
   setInterval(() => {
