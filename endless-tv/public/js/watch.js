@@ -28,7 +28,7 @@
     $('chNum').textContent = String(current.number);
     $('livePill').hidden = !position || !current.live;  // only a channel that runs live says so
     $('clipInfo').textContent = position ? '' : 'No clips yet';
-    document.title = `${current.name} · endless TV`;
+    document.title = `${current.name} · AnyShow`;
   }
 
   function tune(index) {
