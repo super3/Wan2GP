@@ -1,0 +1,14 @@
+{
+  "name": "H3 Live",
+  "author": "super3",
+  "version": "0.1.0",
+  "description": "Generates MiniMax H3 clips back to back as one live stream, played in the tab while the next clips render. Real time with pi-H3 DWD 2-Step at 480p on 32 GB+ GPUs.",
+  "type": ["app"],
+  "date": "2026-11-22",
+  "wan2gp_version": "20.10",
+  "info_card": {
+    "tagline": "Real-Time MiniMax H3",
+    "description": "Turns one H3 generation into a live session: clips generated back to back with the model kept on the GPU, streamed to a player as HLS, saved as MP4s and joined into a film.",
+    "details": "MiniMax H3 · HLS Player · NVENC"
+  }
+}

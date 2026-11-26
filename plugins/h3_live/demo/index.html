@@ -1,0 +1,234 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>H3 Live</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #111110; --surface: #1a1a19; --surface-2: #242422; --border: #30302d;
+    --text: #f0efec; --text-2: #b9b7b0; --muted: #8c8a84; --live: #e5484d;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  main { max-width: 980px; margin: 0 auto; padding: 24px 16px 48px; }
+  header { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+  h1 { font-size: 22px; line-height: 1.2; margin: 0; font-weight: 600; letter-spacing: -0.01em; }
+  .pill { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase;
+          padding: 3px 10px; border-radius: 999px; background: var(--surface-2); color: var(--text-2); }
+  .pill .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+  .pill.live { color: var(--text); }
+  .pill.live .dot { background: var(--live); animation: pulse 1.6s ease-in-out infinite; }
+  @keyframes pulse { 50% { opacity: .35; } }
+  .sub { color: var(--text-2); margin: 6px 0 16px; }
+  .player { position: relative; aspect-ratio: 832 / 480; background: #000; border-radius: 12px; overflow: hidden; }
+  video { width: 100%; height: 100%; display: block; object-fit: contain; background: #000; }
+  .overlay { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px;
+             text-align: center; padding: 16px; background: rgba(0, 0, 0, .72); color: var(--text-2); }
+  .overlay[hidden] { display: none; }
+  .overlay strong { color: var(--text); font-size: 17px; font-weight: 600; }
+  .spinner { width: 28px; height: 28px; border: 3px solid var(--border); border-top-color: var(--text); border-radius: 50%; animation: spin 1s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  button { font: inherit; font-size: 14px; font-weight: 600; color: var(--text); background: rgba(36, 36, 34, .9); border: 1px solid var(--border);
+           border-radius: 8px; padding: 7px 14px; cursor: pointer; }
+  button:hover { background: #2e2e2b; }
+  button:focus-visible { outline: 2px solid var(--text); outline-offset: 2px; }
+  .sound { position: absolute; right: 12px; top: 12px; }
+  .below { display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; color: var(--muted); font-size: 13px; margin-top: 8px; }
+  .tiles { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin-top: 16px; }
+  @media (max-width: 720px) { .tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+  .tile { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; min-width: 0; }
+  .tile .label { color: var(--text-2); font-size: 13px; }
+  .tile .value { font-size: 28px; font-weight: 600; line-height: 1.25; margin-top: 2px; font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .tile .note { color: var(--muted); font-size: 12.5px; margin-top: 2px; font-variant-numeric: tabular-nums; }
+  .gpu { margin-top: 12px; color: var(--text-2); font-size: 13.5px; font-variant-numeric: tabular-nums; }
+  section { margin-top: 28px; }
+  h2 { font-size: 15px; font-weight: 600; margin: 0 0 8px; }
+  .prompt { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; color: var(--text-2);
+            font-size: 13.5px; white-space: pre-wrap; overflow-wrap: anywhere; margin: 0; }
+  .table-wrap { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; font-size: 13.5px; font-variant-numeric: tabular-nums; }
+  th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+  th { color: var(--text-2); font-weight: 500; }
+  td.num, th.num { text-align: right; }
+  tr.playing td { color: var(--text); font-weight: 600; }
+  tr.playing td:first-child::before { content: "▶ "; }
+  td { color: var(--text-2); }
+  footer { margin-top: 28px; color: var(--muted); font-size: 13px; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>H3 Live</h1>
+    <span class="pill" id="pill"><span class="dot"></span><span id="pill-text">Starting</span></span>
+  </header>
+  <p class="sub" id="sub">MiniMax H3 video and sound, generated on this GPU as you watch.</p>
+
+  <div class="player">
+    <video id="video" muted playsinline autoplay></video>
+    <button class="sound" id="sound" type="button" hidden>Sound on</button>
+    <div class="overlay" id="overlay">
+      <div class="spinner" id="spinner"></div>
+      <strong id="overlay-title">Starting WanGP</strong>
+      <span id="overlay-text">The first clip takes a few minutes after a fresh start (the model loads first).</span>
+      <button id="play" type="button" hidden>Play</button>
+    </div>
+  </div>
+  <div class="below"><span id="position"></span><span id="latency"></span></div>
+
+  <div class="tiles">
+    <div class="tile"><div class="label">Generation speed</div><div class="value" id="speed">–</div><div class="note" id="speed-note">real time = 1.00×</div></div>
+    <div class="tile"><div class="label">Clips generated</div><div class="value" id="clips">–</div><div class="note" id="clips-note">each with a new seed</div></div>
+    <div class="tile"><div class="label">Now playing</div><div class="value" id="now">–</div><div class="note" id="now-note">&nbsp;</div></div>
+    <div class="tile"><div class="label">Streaming for</div><div class="value" id="uptime">–</div><div class="note" id="uptime-note">without a break</div></div>
+  </div>
+  <div class="gpu" id="gpu">&nbsp;</div>
+
+  <section>
+    <h2>Prompt</h2>
+    <pre class="prompt" id="prompt"></pre>
+  </section>
+
+  <section>
+    <h2>Latest clips</h2>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Clip</th><th class="num">Seed</th><th class="num">Length</th><th class="num">Generated in</th><th class="num">Speed</th></tr></thead>
+        <tbody id="recent"><tr><td colspan="5">No clip yet.</td></tr></tbody>
+      </table>
+    </div>
+  </section>
+
+  <footer id="footer">Each clip is generated from the prompt with a new seed, encoded as soon as it lands and appended to a live HLS stream.
+    The GPU makes clips faster than they play, so the stream never waits for the next one.</footer>
+</main>
+
+<script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.20/dist/hls.min.js"></script>
+<script>
+(() => {
+  const $ = (id) => document.getElementById(id);
+  const video = $("video");
+  let hls = null, sessionId = null, playingSegment = null, stats = null, retryTimer = null;
+
+  const fmtClock = (s) => {
+    s = Math.max(0, Math.round(s || 0));
+    const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), r = s % 60;
+    return (h ? h + ":" + String(m).padStart(2, "0") : m) + ":" + String(r).padStart(2, "0");
+  };
+  const fmtSeconds = (s) => s == null ? "–" : (s >= 120 ? fmtClock(s) : s.toFixed(1) + " s");
+  const set = (id, text) => { const el = $(id); if (el.textContent !== text) el.textContent = text; };
+
+  function start(id) {
+    sessionId = id;
+    playingSegment = null;
+    const url = "/live/" + encodeURIComponent(id) + "/live.m3u8";
+    if (hls) { hls.destroy(); hls = null; }
+    if (window.Hls && Hls.isSupported()) {
+      hls = new Hls({ liveSyncDurationCount: 2, liveMaxLatencyDurationCount: 6, maxBufferLength: 20, backBufferLength: 20 });
+      hls.on(Hls.Events.FRAG_CHANGED, (_, data) => { playingSegment = data.frag.sn; render(); });
+      hls.on(Hls.Events.MANIFEST_PARSED, () => tryPlay());
+      hls.on(Hls.Events.ERROR, (_, data) => {
+        if (!data.fatal) return;
+        if (data.type === Hls.ErrorTypes.MEDIA_ERROR) { hls.recoverMediaError(); return; }
+        clearTimeout(retryTimer);
+        retryTimer = setTimeout(() => start(sessionId), 2000);
+      });
+      hls.loadSource(url);
+      hls.attachMedia(video);
+    } else if (video.canPlayType("application/vnd.apple.mpegurl")) {
+      video.src = url;
+      tryPlay();
+    } else {
+      showOverlay("This browser cannot play the stream", "Open it in a recent Chrome, Edge, Firefox or Safari.", false);
+    }
+  }
+
+  function tryPlay() {
+    const attempt = video.play();
+    if (attempt && attempt.catch) attempt.catch(() => { $("play").hidden = false; });
+  }
+
+  function showOverlay(title, text, busy) {
+    $("overlay").hidden = false;
+    $("spinner").hidden = !busy;
+    set("overlay-title", title);
+    set("overlay-text", text);
+  }
+
+  function render() {
+    if (!stats) return;
+    const s = stats.session, recent = stats.recent || [];
+    const live = stats.state === "live" && s && s.clips > 0;
+    $("pill").classList.toggle("live", live);
+    set("pill-text", live ? "Live" : ({ starting: "Starting", loading: "Loading", restarting: "Restarting", error: "Error", stopped: "Stopped" }[stats.state] || stats.state));
+    const [w, h] = (stats.resolution || "").split("x");
+    set("sub", "MiniMax H3 video and sound, generated on this GPU as you watch · " + (w && h ? w + "×" + h : "") + " · " + stats.frames + " frames per clip");
+    set("prompt", stats.prompt || "");
+
+    if (!live) {
+      const titles = { starting: "Starting WanGP", loading: stats.message || "Loading the model", restarting: "Restarting the stream", error: "The demo stopped on an error", stopped: "The demo is stopped" };
+      const texts = { starting: "The first clip takes a few minutes after a fresh start.", loading: "The first clip follows in a minute or two.", restarting: stats.message || "", error: stats.message || "", stopped: "" };
+      if (!video.currentTime || video.paused) showOverlay(titles[stats.state] || stats.state, texts[stats.state] || "", !["error", "stopped"].includes(stats.state));
+    } else if (!video.paused && video.currentTime > 0) {
+      $("overlay").hidden = true;
+      $("sound").hidden = false;
+    } else if ($("play").hidden) {
+      showOverlay("The first clips are ready", "Starting the player…", true);
+    } else {
+      showOverlay("Ready", "Press play to watch the stream.", false);
+    }
+
+    if (s) {
+      set("speed", s.generation_x ? s.generation_x.toFixed(2) + "×" : "–");
+      const last = recent[recent.length - 1];
+      set("speed-note", last ? "a " + last.seconds.toFixed(1) + " s clip in " + (s.generate_s || last.generate_s).toFixed(1) + " s" : "real time = 1.00×");
+      set("clips", String(s.clips));
+      set("clips-note", fmtSeconds(s.seconds_of_video) + " of video, each a new seed");
+      set("uptime", fmtClock(s.uptime_s));
+    }
+    const playing = recent.find((r) => r.segment === playingSegment);
+    set("now", playing ? "Clip " + (playing.clip + 1) : "–");
+    set("now-note", playing ? "seed " + playing.seed : " ");
+
+    const g = stats.gpu || {};
+    set("gpu", g.name ? g.name + " · " + g.util_pct + "% busy · " + g.memory_used_gb + " of " + g.memory_total_gb + " GB · " + g.power_w + " W" +
+        (s && s.encoder ? " · encoder " + (s.encoder === "nvenc" ? "NVENC" : s.encoder) : "") : " ");
+    if (hls && hls.latency != null && isFinite(hls.latency) && !video.paused) set("latency", "Playing " + hls.latency.toFixed(0) + " s behind the newest clip");
+    else set("latency", "");
+    set("position", playing ? "Clip " + (playing.clip + 1) + " · seed " + playing.seed : "");
+
+    const rows = recent.slice(-8).reverse().map((r) =>
+      "<tr" + (r.segment === playingSegment ? ' class="playing"' : "") + "><td>" + (r.clip + 1) + '</td><td class="num">' + r.seed +
+      '</td><td class="num">' + r.seconds.toFixed(2) + ' s</td><td class="num">' + r.generate_s.toFixed(2) + ' s</td><td class="num">' +
+      (r.seconds / r.generate_s).toFixed(2) + "×</td></tr>").join("");
+    const body = rows || '<tr><td colspan="5">No clip yet.</td></tr>';
+    if ($("recent").innerHTML !== body) $("recent").innerHTML = body;
+  }
+
+  async function poll() {
+    try {
+      const response = await fetch("/stats.json", { cache: "no-store" });
+      stats = await response.json();
+      const s = stats.session;
+      if (s && s.clips >= 2 && s.id !== sessionId) start(s.id);
+      render();
+    } catch (error) {
+      showOverlay("The demo server is not answering", "Retrying…", true);
+    }
+    setTimeout(poll, 2000);
+  }
+
+  $("play").addEventListener("click", () => { $("play").hidden = true; tryPlay(); });
+  $("sound").addEventListener("click", () => {
+    video.muted = !video.muted;
+    $("sound").textContent = video.muted ? "Sound on" : "Sound off";
+    if (!video.muted) tryPlay();
+  });
+  video.addEventListener("playing", render);
+  poll();
+})();
+</script>
+</body>
+</html>
